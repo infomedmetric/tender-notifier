@@ -1,11 +1,17 @@
 import requests
 import time
 from datetime import datetime
+import threading
+import os
+from flask import Flask
+
+# Initialize Flask for Render web port binding
+app = Flask(__name__)
 
 # ================== CONFIG ==================
 EVOLUTION_BASE = "https://medmetric-evolution.onrender.com"
 INSTANCE_TOKEN = "143EC4F4C954-4014-BCCD-FC294B1A5609"
-WHATSAPP_NUMBER = "251901748874"   # Your number
+WHATSAPP_NUMBER = "251901748874"
 
 KEYWORDS = [
     "ICB TENDER FOR MEDICAL EQUIPMENT", "medical equipment maintenance",
@@ -27,11 +33,7 @@ def send_whatsapp(message):
 
 def check_for_tenders():
     print(f"[{datetime.now()}] 🔍 Checking for tenders...")
-    
-    # TODO: Replace with real fetching (eGP aggregator or scraping)
-    # Example using a public aggregator API (add your choice)
     try:
-        # Placeholder - replace with real call
         response = requests.get("https://example-tender-api.com/search?keywords=medical+maintenance")
         data = response.json()
         
@@ -48,10 +50,24 @@ Link: {tender.get('link')}
 Check eGP and bid quickly!"""
                 send_whatsapp(msg)
     except:
-        # Fallback message
         send_whatsapp("🔍 No new matching tenders in this check.\nKeywords monitored: Medical maintenance, ICB, Hemodialysis.\nNext check in 4 hours.")
 
-# Main loop - every 4 hours
-while True:
-    check_for_tenders()
-    time.sleep(4 * 3600)   # 4 hours
+# Continuous monitoring loop running in a separate thread
+def monitoring_loop():
+    while True:
+        check_for_tenders()
+        time.sleep(4 * 3600)  # Sleep for 4 hours
+
+# Flask health check route for Render
+@app.route('/')
+def home():
+    return "Tender Notifier is running!", 200
+
+if __name__ == "__main__":
+    # Start the tender loop in the background
+    threading.Thread(target=monitoring_loop, daemon=True).start()
+    
+    # Get port assigned by Render or default to 5000 locally
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
+
