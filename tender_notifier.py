@@ -22,23 +22,34 @@ KEYWORDS = [
 ]
 
 def send_whatsapp(message):
-    # Fixed routing URL path: version endpoint structure uses /message/sendText/{instance_name}
-    url = f"{EVOLUTION_BASE}/message/sendText/{INSTANCE_NAME}"
+    # Base endpoint structure used by standard Evolution API deployments
+    url = f"{EVOLUTION_BASE}/message/sendText"
     
     payload = {
         "number": WHATSAPP_NUMBER,
         "textMessage": {"text": message}
     }
     
-    # Evolution API v2 requires the token passed as 'apikey' inside the headers
+    # Pass both API key and Instance Name into headers to satisfy authentication rules
     headers = {
         "Content-Type": "application/json",
-        "apikey": GLOBAL_API_KEY
+        "apikey": GLOBAL_API_KEY,
+        "Instance": INSTANCE_NAME
+    }
+    
+    # Secondary fallback using query parameters (?instance=Tender-Notifier.)
+    params = {
+        "instance": INSTANCE_NAME
     }
     
     try:
-        r = requests.post(url, json=payload, headers=headers, timeout=10)
-        print(f"✅ Message sent: {r.status_code}", flush=True)
+        r = requests.post(url, json=payload, headers=headers, params=params, timeout=10)
+        print(f"✅ Message sent status: {r.status_code}", flush=True)
+        
+        # If the server responds with an error, print the exact message text from it
+        if r.status_code != 200 and r.status_code != 201:
+            print(f"📄 Response Content from Evolution: {r.text}", flush=True)
+            
     except Exception as e:
         print(f"❌ Send error: {e}", flush=True)
 
@@ -46,7 +57,7 @@ def check_for_tenders():
     print(f"[{datetime.now()}] 🔍 Checking for tenders...", flush=True)
     
     try:
-        # Placeholder endpoint - change this to your actual source later
+        # Placeholder endpoint - change this to your true data source when ready
         response = requests.get("https://example-tender-api.com/search?keywords=medical+maintenance", timeout=10)
         data = response.json()
         
