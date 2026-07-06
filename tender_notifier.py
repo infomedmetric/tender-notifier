@@ -25,7 +25,7 @@ MERKATO_PASS = os.environ.get("MERKATO_PASS")
 KEYWORDS = [
     # --- Hemodialysis & Water Treatment ---
     "Hemodialysis", "Dialysis", "SWS-4000A", "B.Braun", "Dialog+",
-    "Water treatment", "Reverse Osmosis", "RO plant", "Water purification",
+    "Water treatment", "Reverse Osmosis", "RO plant", "Water purification",  "the", "supply", "Hemodialysis", "medical equipment maintenance"
     
     # --- Maintenance & Engineering Services ---
     "medical equipment maintenance", "preventive maintenance", "corrective maintenance",
