@@ -7,7 +7,7 @@ from flask import Flask
 from bs4 import BeautifulSoup
 import urllib3
 
-# Suppress insecure request warnings from using verify=False
+# Suppress insecure connection warnings due to verify=False
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
@@ -22,24 +22,13 @@ WHATSAPP_NUMBER = os.environ.get("WHATSAPP_NUMBER", "251901748874")
 MERKATO_USER = os.environ.get("MERKATO_USER")
 MERKATO_PASS = os.environ.get("MERKATO_PASS")
 
+# Expanded, resilient verification keywords
 KEYWORDS = [
-    # --- Hemodialysis & Water Treatment ---
-    "Hemodialysis", "Dialysis", "SWS-4000A", "B.Braun", "Dialog+",
-    "Water treatment", "Reverse Osmosis", "RO plant", "Water purification",  "the", "supply", "Hemodialysis", "medical equipment maintenance"
-    
-    # --- Maintenance & Engineering Services ---
-    "medical equipment maintenance", "preventive maintenance", "corrective maintenance",
-    "biomedical engineering", "maintenance and repair", "calibration", "technical service",
-    "spare parts", "after-sales service",
-    
-    # --- General Medical Equipment & Supply Turnkeys ---
-    "ICB TENDER FOR MEDICAL EQUIPMENT", "medical equipment", "medical device", 
-    "hospital equipment", "laboratory equipment", "supply and installation",
-    "procurement of goods", "medical supplies"
+    "the", "supply", "Hemodialysis", "Dialysis", "medical equipment maintenance", 
+    "water treatment", "b.braun", "dialog+", "biomedical", "የህክምና", "ጥገና"
 ]
 
-
-# Tracks notified tenders across both engines to prevent duplicate WhatsApp spam
+# Tracks already notified tenders globally across both engines
 NOTIFIED_TENDERS = set()
 
 def send_whatsapp(message):
@@ -85,7 +74,8 @@ def scrape_2merkato():
         
         for item in items:
             title_el = item.find('a')
-            if not title_el: continue
+            if not title_el: 
+                continue
             
             title_text = title_el.get_text().strip()
             link = "https://www.2merkato.com" + title_el['href'] if title_el['href'].startswith('/') else title_el['href']
@@ -106,43 +96,76 @@ def scrape_2merkato():
 
 # ==================== ENGINE 2: ETHIOPIAN eGP PORTAL ====================
 def scrape_egp():
-    print(f"[{datetime.now()}] 🔍 Running eGP Engine...", flush=True)
-    # Use the main bidding page and parse recent tenders
-    url = "https://production.egp.gov.et/egp/bids/all"
-    headers = {"User-Agent": "Mozilla/5.0"}
+    print(f"[{datetime.now()}] 🔍 Running eGP API Engine...", flush=True)
     
+    # Layer 1: Target the public bids endpoint layer directly to avoid empty JS HTML shells
+    primary_url = "https://production.egp.gov.et/api/v1/public/bids?page=0&size=40"
+    fallback_url = "https://production.egp.gov.et/api/public/bids?page=0&size=40"
+    
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Accept": "application/json"
+    }
+    
+    res = None
     try:
-        res = requests.get(url, headers=headers, timeout=15, verify=False)
+        res = requests.get(primary_url, headers=headers, timeout=15, verify=False)
+        if res.status_code != 200:
+            print(f"⚠️ Primary URL status {res.status_code}. Attempting fallback route...", flush=True)
+            res = requests.get(fallback_url, headers=headers, timeout=15, verify=False)
+    except Exception as net_err:
+        print(f"⚠️ Primary route connection failed ({net_err}). Attempting fallback...", flush=True)
+        try:
+            res = requests.get(fallback_url, headers=headers, timeout=15, verify=False)
+        except Exception as e:
+            print(f"❌ Both eGP API routes failed: {e}", flush=True)
+            return 0
+
+    if not res or res.status_code != 200:
+        print(f"❌ eGP API unreachable. Status Code: {res.status_code if res else 'No Response'}", flush=True)
+        return 0
+
+    try:
+        data = res.json()
+        # Parse data out of the standard API wrapper wrappers safely
+        tenders = data.get("content", []) or data.get("data", []) or data.get("bids", []) or []
         found = 0
         
-        if res.status_code == 200:
-            soup = BeautifulSoup(res.text, 'html.parser')
-            # Look for tender titles inside table definitions
-            titles = soup.find_all('td')  
+        print(f"📡 eGP API returned {len(tenders)} recent records.", flush=True)
+        
+        for tender in tenders:
+            # Resilient key lookup to match variable internal database schemas
+            title = tender.get("title", "") or tender.get("bidDescription", "") or tender.get("tenderTitle", "") or tender.get("description", "") or ""
+            org = tender.get("organizationName", "") or tender.get("buyerName", "") or tender.get("procuringEntity", "") or ""
+            bid_id = tender.get("id", "") or tender.get("bidNumber", "") or tender.get("tenderReferenceNumber", "")
             
-            for title in titles:
-                text = title.get_text().strip()
+            if not title and not org:
+                continue
                 
-                # Check keywords safely
-                if any(kw.lower() in text.lower() for kw in KEYWORDS):
-                    # Create a fingerprint identifier signature to avoid duplication loops
-                    tender_id = f"egp_td_{hash(text)}"
+            combined_text = f"{title} {org}".lower()
+            
+            if any(kw.lower() in combined_text for kw in KEYWORDS):
+                # Generate unique hash fingerprint based on metadata signature if ID fields are missing
+                unique_sig = bid_id if bid_id else str(hash(title + org))
+                tender_id = f"egp_prod_{unique_sig}"
+                
+                if tender_id not in NOTIFIED_TENDERS:
+                    NOTIFIED_TENDERS.add(tender_id)
+                    found += 1
                     
-                    if tender_id not in NOTIFIED_TENDERS:
-                        NOTIFIED_TENDERS.add(tender_id)
-                        found += 1
-                        
-                        # Send the alert package safely
-                        alert = f"🏛️ *New eGP Tender Match!*\n\n📋 *Details:* {text[:250]}..."
-                        send_whatsapp(alert)
-                        time.sleep(2)
-                        
-            print(f"eGP found {found} matches", flush=True)
-        else:
-            print(f"eGP status: {res.status_code}", flush=True)
+                    link = f"https://production.egp.gov.et/egp/bids/view/{bid_id}" if bid_id else "https://production.egp.gov.et/egp/bids/all"
+                    
+                    alert = f"🏛️ *New Production eGP Match!*\n\n" \
+                            f"🏢 *Entity:* {org if org else 'Not Specified'}\n" \
+                            f"📋 *Notice:* {title}\n" \
+                            f"🔗 *Link:* {link}"
+                    send_whatsapp(alert)
+                    time.sleep(2)
+                    
+        print(f"eGP backend processing complete. Found {found} matches.", flush=True)
         return found
-    except Exception as e:
-        print(f"eGP error: {e}", flush=True)
+    except Exception as parse_err:
+        print(f"❌ Error decoding or parsing eGP JSON structural payload: {parse_err}", flush=True)
         return 0
 
 # ==================== RUN COORDINATOR ====================
@@ -154,7 +177,7 @@ def check_for_tenders():
     print(f"=================== SCAN COMPLETE: {total} NEW FOUND ===================", flush=True)
     
     if total == 0:
-        send_whatsapp("🔍 *Side-by-Side Scan Completed.*\nNo new updates detected on 2merkato or the eGP Portal.\nNext automatic sync in 4 hours.")
+        send_whatsapp("🔍 *Side-by-Side Scan Completed.*\nNo new unique matches discovered on 2merkato or the eGP Portal.\nNext automatic sync in 4 hours.")
 
 def monitoring_loop():
     while True:
@@ -164,7 +187,7 @@ def monitoring_loop():
 # ==================== FLASK ROUTES ====================
 @app.route('/')
 def home():
-    return "Dual-Engine Tender Notifier is running!", 200
+    return "Dual-Engine Tender Notifier is running smoothly!", 200
 
 @app.route('/test-check')
 def manual_test():
