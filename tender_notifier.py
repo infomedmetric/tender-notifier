@@ -7,7 +7,7 @@ from flask import Flask
 from bs4 import BeautifulSoup
 import urllib3
 
-# Suppress the insecure request warnings in logs when verify=False is used
+# Suppress insecure request warnings
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
@@ -28,7 +28,6 @@ KEYWORDS = [
     "water treatment Hemodialysis", "biomedical", "maintenance and repair"
 ]
 
-# Track notified tenders across both engines to avoid duplicates
 NOTIFIED_TENDERS = set()
 
 def send_whatsapp(message):
@@ -95,54 +94,55 @@ def scrape_2merkato():
 
 # ==================== ENGINE 2: ETHIOPIAN eGP PORTAL ====================
 def scrape_egp():
-    print(f"[{datetime.now()}] 🔍 Running eGP Portal Engine...", flush=True)
+    print(f"[{datetime.now()}] 🔍 Running eGP Portal Web Layout Engine...", flush=True)
     
-    url = "https://egp.ppa.gov.et/egp/bidding/tender/tendering-notices/open-data"
+    # 🌟 CHANGED: Scraping the main public notice board page directly to prevent API path 404 errors
+    url = "https://egp.ppa.gov.et/egp/bidding/tender/notices/published"
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-        "Accept": "application/json"
-    }
-    
-    params = {
-        "page": 0,
-        "size": 40,  # Bumped up slightly to cast a wider net per check
-        "procurementMethod": "OPEN",
-        "tenderCategory": "GOODS"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml"
     }
     
     try:
-        # 🌟 FIXED: Added verify=False to bypass the SSL self-signed certificate error
-        res = requests.get(url, headers=headers, params=params, verify=False, timeout=15)
+        res = requests.get(url, headers=headers, verify=False, timeout=15)
         found = 0
         
         if res.status_code == 200:
-            data = res.json()
-            for tender in data.get("content", []):
-                title_text = tender.get("tenderTitle", "") or tender.get("description", "") or ""
-                bid_number = tender.get("tenderReferenceNumber", "")
+            soup = BeautifulSoup(res.text, 'html.parser')
+            
+            # Target standard table row data items on the public dashboard board
+            rows = soup.find_all('tr')
+            
+            for row in rows:
+                row_text = row.get_text()
                 
-                if any(kw.lower() in title_text.lower() for kw in KEYWORDS):
-                    tender_id = f"egp_{tender.get('id', bid_number)}"
+                # Check if this tender row matches your monitored keywords
+                if any(kw.lower() in row_text.lower() for kw in KEYWORDS):
+                    link_el = row.find('a', href=True)
+                    if not link_el: continue
+                    
+                    title_text = link_el.get_text().strip()
+                    raw_href = link_el['href']
+                    full_link = "https://egp.ppa.gov.et" + raw_href if raw_href.startswith('/') else raw_href
+                    
+                    # Generate a clean signature identifier string
+                    tender_id = f"egp_{raw_href.split('/')[-1]}"
                     
                     if tender_id not in NOTIFIED_TENDERS:
                         found += 1
                         NOTIFIED_TENDERS.add(tender_id)
                         
-                        link = f"https://egp.ppa.gov.et/egp/bidding/tender/notices/published/{tender.get('id')}"
-                        
                         alert = f"🏛️ *New Government eGP Tender!*\n\n" \
-                                f"📋 *Procurement:* {title_text}\n" \
-                                f"🔢 *Ref:* {bid_number}\n" \
-                                f"⏳ *Closing Date:* {tender.get('closingDate', 'N/A')}\n" \
-                                f"🔗 *Portal Link:* {link}"
+                                f"📋 *Procurement Detail:* {title_text}\n" \
+                                f"🔗 *Portal Link:* {full_link}"
                         
                         send_whatsapp(alert)
                         time.sleep(2)
         else:
-            print(f"⚠️ eGP returned status code: {res.status_code}", flush=True)
+            print(f"⚠️ eGP layout engine returned status code: {res.status_code}", flush=True)
         return found
     except Exception as e:
-        print(f"❌ eGP portal engine error: {e}", flush=True)
+        print(f"❌ eGP HTML layout scraper error: {e}", flush=True)
         return 0
 
 # ==================== RUN COORDINATOR ====================
