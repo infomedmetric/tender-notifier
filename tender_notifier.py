@@ -7,7 +7,7 @@ from flask import Flask
 from bs4 import BeautifulSoup
 import urllib3
 
-# Suppress insecure request warnings
+# Suppress insecure connection warnings
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
@@ -94,55 +94,66 @@ def scrape_2merkato():
 
 # ==================== ENGINE 2: ETHIOPIAN eGP PORTAL ====================
 def scrape_egp():
-    print(f"[{datetime.now()}] 🔍 Running eGP Portal Web Layout Engine...", flush=True)
+    print(f"[{datetime.now()}] 🔍 Running eGP Internal Search Engine...", flush=True)
     
-    # 🌟 CHANGED: Scraping the main public notice board page directly to prevent API path 404 errors
-    url = "https://egp.ppa.gov.et/egp/bidding/tender/notices/published"
+    # 🌟 NEW INTERACTION: Mimicking a real frontend search POST payload request
+    url = "https://egp.ppa.gov.et/egp/bidding/tender/tendering-notices/published"
+    
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml"
+        "Accept": "application/json, text/plain, */*",
+        "Content-Type": "application/json"
+    }
+    
+    # Payload targeting raw data lines from the eGP internal system pipeline 
+    payload = {
+        "page": 0,
+        "size": 30,
+        "procurementMethod": "OPEN",
+        "tenderCategory": "GOODS",
+        "sort": "publishedDate,desc"  # Prioritize newest published procurement items
     }
     
     try:
-        res = requests.get(url, headers=headers, verify=False, timeout=15)
+        # Utilizing POST instead of GET to request backend data matrices
+        res = requests.post(url, json=payload, headers=headers, verify=False, timeout=15)
         found = 0
         
-        if res.status_code == 200:
-            soup = BeautifulSoup(res.text, 'html.parser')
+        if res.status_code == 200 or res.status_code == 201:
+            data = res.json()
+            tenders = data.get("content", [])
             
-            # Target standard table row data items on the public dashboard board
-            rows = soup.find_all('tr')
-            
-            for row in rows:
-                row_text = row.get_text()
+            for tender in tenders:
+                title_text = tender.get("tenderTitle", "") or tender.get("description", "") or ""
+                bid_number = tender.get("tenderReferenceNumber", "")
+                tender_db_id = tender.get("id", "")
                 
-                # Check if this tender row matches your monitored keywords
-                if any(kw.lower() in row_text.lower() for kw in KEYWORDS):
-                    link_el = row.find('a', href=True)
-                    if not link_el: continue
-                    
-                    title_text = link_el.get_text().strip()
-                    raw_href = link_el['href']
-                    full_link = "https://egp.ppa.gov.et" + raw_href if raw_href.startswith('/') else raw_href
-                    
-                    # Generate a clean signature identifier string
-                    tender_id = f"egp_{raw_href.split('/')[-1]}"
+                # Filter titles against your medical equipment & maintenance phrases
+                if any(kw.lower() in title_text.lower() for kw in KEYWORDS):
+                    tender_id = f"egp_{tender_db_id or bid_number}"
                     
                     if tender_id not in NOTIFIED_TENDERS:
                         found += 1
                         NOTIFIED_TENDERS.add(tender_id)
                         
+                        link = f"https://egp.ppa.gov.et/egp/bidding/tender/notices/published/{tender_db_id}"
+                        closing_date = tender.get("closingDate", "N/A")
+                        org_name = tender.get("organizationName", "Public Body")
+                        
                         alert = f"🏛️ *New Government eGP Tender!*\n\n" \
-                                f"📋 *Procurement Detail:* {title_text}\n" \
-                                f"🔗 *Portal Link:* {full_link}"
+                                f"🏢 *Entity:* {org_name}\n" \
+                                f"📋 *Procurement:* {title_text}\n" \
+                                f"🔢 *Ref:* {bid_number}\n" \
+                                f"⏳ *Closing Date:* {closing_date}\n" \
+                                f"🔗 *Portal Link:* {link}"
                         
                         send_whatsapp(alert)
                         time.sleep(2)
         else:
-            print(f"⚠️ eGP layout engine returned status code: {res.status_code}", flush=True)
+            print(f"⚠️ eGP pipeline interface returned status code: {res.status_code}", flush=True)
         return found
     except Exception as e:
-        print(f"❌ eGP HTML layout scraper error: {e}", flush=True)
+        print(f"❌ eGP API payload channel tracking failure: {e}", flush=True)
         return 0
 
 # ==================== RUN COORDINATOR ====================
