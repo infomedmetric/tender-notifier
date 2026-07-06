@@ -7,7 +7,7 @@ from flask import Flask
 from bs4 import BeautifulSoup
 import urllib3
 
-# Suppress insecure connection warnings
+# Suppress insecure request warnings from using verify=False
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
@@ -82,7 +82,7 @@ def scrape_2merkato():
                 tender_id = f"merkato_{link.split('/')[-1]}"
                 if tender_id not in NOTIFIED_TENDERS:
                     found += 1
-                    NOTIFIED_TENDERS.add(tender_id)
+                    NOTLIMIT = NOTIFIED_TENDERS.add(tender_id)
                     
                     alert = f"🔔 *New 2merkato Tender Found!*\n\n📋 *Title:* {title_text}\n🔗 *Link:* {link}"
                     send_whatsapp(alert)
@@ -92,68 +92,55 @@ def scrape_2merkato():
         print(f"❌ 2merkato engine error: {e}", flush=True)
         return 0
 
-# ==================== ENGINE 2: ETHIOPIAN eGP PORTAL ====================
+# ==================== ENGINE 2: ETHIOPIAN eGP RSS FEED ====================
 def scrape_egp():
-    print(f"[{datetime.now()}] 🔍 Running eGP Internal Search Engine...", flush=True)
+    print(f"[{datetime.now()}] 🔍 Running eGP Syndicated Feed Engine...", flush=True)
     
-    # 🌟 NEW INTERACTION: Mimicking a real frontend search POST payload request
-    url = "https://egp.ppa.gov.et/egp/bidding/tender/tendering-notices/published"
-    
+    # Using the portal's dedicated open feed endpoint instead of dynamic web routes
+    url = "https://egp.ppa.gov.et/egp/bidding/tender/rss/published"
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Accept": "application/json, text/plain, */*",
-        "Content-Type": "application/json"
-    }
-    
-    # Payload targeting raw data lines from the eGP internal system pipeline 
-    payload = {
-        "page": 0,
-        "size": 30,
-        "procurementMethod": "OPEN",
-        "tenderCategory": "GOODS",
-        "sort": "publishedDate,desc"  # Prioritize newest published procurement items
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+        "Accept": "application/rss+xml, application/xml, text/xml"
     }
     
     try:
-        # Utilizing POST instead of GET to request backend data matrices
-        res = requests.post(url, json=payload, headers=headers, verify=False, timeout=15)
+        res = requests.get(url, headers=headers, verify=False, timeout=15)
         found = 0
         
-        if res.status_code == 200 or res.status_code == 201:
-            data = res.json()
-            tenders = data.get("content", [])
+        if res.status_code == 200:
+            # Parse the incoming XML payload using xml-parser configuration
+            soup = BeautifulSoup(res.text, 'xml')
+            items = soup.find_all('item')
             
-            for tender in tenders:
-                title_text = tender.get("tenderTitle", "") or tender.get("description", "") or ""
-                bid_number = tender.get("tenderReferenceNumber", "")
-                tender_db_id = tender.get("id", "")
+            for item in items:
+                title_text = item.find('title').get_text().strip() if item.find('title') else ""
+                link_text = item.find('link').get_text().strip() if item.find('link') else ""
+                desc_text = item.find('description').get_text().strip() if item.find('description') else ""
                 
-                # Filter titles against your medical equipment & maintenance phrases
-                if any(kw.lower() in title_text.lower() for kw in KEYWORDS):
-                    tender_id = f"egp_{tender_db_id or bid_number}"
+                # Combine parameters to search for matches across descriptions and fields
+                search_scope = f"{title_text} {desc_text}"
+                
+                if any(kw.lower() in search_scope.lower() for kw in KEYWORDS):
+                    # Use the link identifier token as the lookup signature
+                    tender_uid = link_text.split('/')[-1] if '/' in link_text else str(hash(title_text))
+                    tender_id = f"egp_feed_{tender_uid}"
                     
                     if tender_id not in NOTIFIED_TENDERS:
                         found += 1
                         NOTIFIED_TENDERS.add(tender_id)
                         
-                        link = f"https://egp.ppa.gov.et/egp/bidding/tender/notices/published/{tender_db_id}"
-                        closing_date = tender.get("closingDate", "N/A")
-                        org_name = tender.get("organizationName", "Public Body")
-                        
                         alert = f"🏛️ *New Government eGP Tender!*\n\n" \
-                                f"🏢 *Entity:* {org_name}\n" \
-                                f"📋 *Procurement:* {title_text}\n" \
-                                f"🔢 *Ref:* {bid_number}\n" \
-                                f"⏳ *Closing Date:* {closing_date}\n" \
-                                f"🔗 *Portal Link:* {link}"
+                                f"📋 *Procurement:* {title_text}\n\n" \
+                                f"📝 *Context Summary:* {desc_text[:280]}...\n\n" \
+                                f"🔗 *Portal Link:* {link_text}"
                         
                         send_whatsapp(alert)
                         time.sleep(2)
         else:
-            print(f"⚠️ eGP pipeline interface returned status code: {res.status_code}", flush=True)
+            print(f"⚠️ eGP Feed Engine fallback status: {res.status_code}", flush=True)
         return found
     except Exception as e:
-        print(f"❌ eGP API payload channel tracking failure: {e}", flush=True)
+        print(f"❌ eGP XML Feed parser runtime discrepancy: {e}", flush=True)
         return 0
 
 # ==================== RUN COORDINATOR ====================
@@ -186,3 +173,4 @@ if __name__ == "__main__":
     threading.Thread(target=monitoring_loop, daemon=True).start()
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
