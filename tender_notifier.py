@@ -70,4 +70,9 @@ if __name__ == "__main__":
     # Get port assigned by Render or default to 5000 locally
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+    
+@app.route('/test-check')
+def manual_test():
+    check_for_tenders()
+    return "Manual tender check triggered! Check your WhatsApp and Render logs.", 200
 
