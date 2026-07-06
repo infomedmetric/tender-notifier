@@ -75,4 +75,3 @@ if __name__ == "__main__":
 def manual_test():
     check_for_tenders()
     return "Manual tender check triggered! Check your WhatsApp and Render logs.", 200
-
