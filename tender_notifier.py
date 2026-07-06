@@ -22,13 +22,12 @@ WHATSAPP_NUMBER = os.environ.get("WHATSAPP_NUMBER", "251901748874")
 MERKATO_USER = os.environ.get("MERKATO_USER")
 MERKATO_PASS = os.environ.get("MERKATO_PASS")
 
-# Expanded, resilient verification keywords
+# Direct testing keywords alongside targeted medical keywords
 KEYWORDS = [
     "the", "supply", "Hemodialysis", "Dialysis", "medical equipment maintenance", 
     "water treatment", "b.braun", "dialog+", "biomedical", "የህክምና", "ጥገና"
 ]
 
-# Tracks already notified tenders globally across both engines
 NOTIFIED_TENDERS = set()
 
 def send_whatsapp(message):
@@ -96,76 +95,50 @@ def scrape_2merkato():
 
 # ==================== ENGINE 2: ETHIOPIAN eGP PORTAL ====================
 def scrape_egp():
-    print(f"[{datetime.now()}] 🔍 Running eGP API Engine...", flush=True)
+    print(f"[{datetime.now()}] 🔍 Running eGP Public Portal Web Directory Scraper...", flush=True)
     
-    # Layer 1: Target the public bids endpoint layer directly to avoid empty JS HTML shells
-    primary_url = "https://production.egp.gov.et/api/v1/public/bids?page=0&size=40"
-    fallback_url = "https://production.egp.gov.et/api/public/bids?page=0&size=40"
-    
+    # Scrapes the static web archives meant for public lookups instead of protected JSON endpoints
+    url = "https://production.egp.gov.et/egp/bids/all"
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Accept": "application/json"
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
     }
     
-    res = None
     try:
-        res = requests.get(primary_url, headers=headers, timeout=15, verify=False)
+        res = requests.get(url, headers=headers, timeout=15, verify=False)
         if res.status_code != 200:
-            print(f"⚠️ Primary URL status {res.status_code}. Attempting fallback route...", flush=True)
-            res = requests.get(fallback_url, headers=headers, timeout=15, verify=False)
-    except Exception as net_err:
-        print(f"⚠️ Primary route connection failed ({net_err}). Attempting fallback...", flush=True)
-        try:
-            res = requests.get(fallback_url, headers=headers, timeout=15, verify=False)
-        except Exception as e:
-            print(f"❌ Both eGP API routes failed: {e}", flush=True)
+            print(f"❌ eGP Server returned non-200 status block: {res.status_code}", flush=True)
             return 0
-
-    if not res or res.status_code != 200:
-        print(f"❌ eGP API unreachable. Status Code: {res.status_code if res else 'No Response'}", flush=True)
-        return 0
-
-    try:
-        data = res.json()
-        # Parse data out of the standard API wrapper wrappers safely
-        tenders = data.get("content", []) or data.get("data", []) or data.get("bids", []) or []
+            
+        soup = BeautifulSoup(res.text, 'html.parser')
         found = 0
         
-        print(f"📡 eGP API returned {len(tenders)} recent records.", flush=True)
+        # Scrape rows, table elements, lists, or blocks that hold raw display layout strings
+        elements = soup.find_all(['td', 'tr', 'div', 'p', 'a'])
         
-        for tender in tenders:
-            # Resilient key lookup to match variable internal database schemas
-            title = tender.get("title", "") or tender.get("bidDescription", "") or tender.get("tenderTitle", "") or tender.get("description", "") or ""
-            org = tender.get("organizationName", "") or tender.get("buyerName", "") or tender.get("procuringEntity", "") or ""
-            bid_id = tender.get("id", "") or tender.get("bidNumber", "") or tender.get("tenderReferenceNumber", "")
-            
-            if not title and not org:
+        for element in elements:
+            text = element.get_text().strip()
+            # Avoid processing short strings or empty styling blocks
+            if len(text) < 15 or len(text) > 400:
                 continue
                 
-            combined_text = f"{title} {org}".lower()
-            
-            if any(kw.lower() in combined_text for kw in KEYWORDS):
-                # Generate unique hash fingerprint based on metadata signature if ID fields are missing
-                unique_sig = bid_id if bid_id else str(hash(title + org))
-                tender_id = f"egp_prod_{unique_sig}"
+            if any(kw.lower() in text.lower() for kw in KEYWORDS):
+                # Hash the visible string snippet to uniquely trace notifications
+                tender_uid = str(hash(text))
+                tender_id = f"egp_web_{tender_uid}"
                 
                 if tender_id not in NOTIFIED_TENDERS:
                     NOTIFIED_TENDERS.add(tender_id)
                     found += 1
                     
-                    link = f"https://production.egp.gov.et/egp/bids/view/{bid_id}" if bid_id else "https://production.egp.gov.et/egp/bids/all"
-                    
-                    alert = f"🏛️ *New Production eGP Match!*\n\n" \
-                            f"🏢 *Entity:* {org if org else 'Not Specified'}\n" \
-                            f"📋 *Notice:* {title}\n" \
-                            f"🔗 *Link:* {link}"
+                    alert = f"🏛️ *New eGP Portal Match!*\n\n📋 *Details Extracted:*\n{text[:300]}...\n\n🔗 *Link:* {url}"
                     send_whatsapp(alert)
                     time.sleep(2)
                     
-        print(f"eGP backend processing complete. Found {found} matches.", flush=True)
+        print(f"eGP Web processing complete. Found {found} matches.", flush=True)
         return found
-    except Exception as parse_err:
-        print(f"❌ Error decoding or parsing eGP JSON structural payload: {parse_err}", flush=True)
+    except Exception as e:
+        print(f"❌ eGP Web processing failure channel exception: {e}", flush=True)
         return 0
 
 # ==================== RUN COORDINATOR ====================
@@ -198,3 +171,4 @@ if __name__ == "__main__":
     threading.Thread(target=monitoring_loop, daemon=True).start()
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
