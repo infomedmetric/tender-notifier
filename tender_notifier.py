@@ -14,7 +14,7 @@ INSTANCE_NAME = os.environ.get("INSTANCE_NAME", "Tender-Notifier.")
 GLOBAL_API_KEY = os.environ.get("GLOBAL_API_KEY", "143EC4F4C954-4014-BCCD-FC294B1A5609")
 WHATSAPP_NUMBER = os.environ.get("WHATSAPP_NUMBER", "251901748874")
 
-# Secure 2merkato Logins pulled from your environment variables
+# Secure 2merkato Logins
 MERKATO_USER = os.environ.get("MERKATO_USER")
 MERKATO_PASS = os.environ.get("MERKATO_PASS")
 
@@ -24,7 +24,7 @@ KEYWORDS = [
     "water treatment Hemodialysis", "biomedical", "maintenance and repair"
 ]
 
-# Keeps track of already notified tenders to prevent spamming your WhatsApp
+# Track notified tenders across both engines to avoid duplicates
 NOTIFIED_TENDERS = set()
 
 def send_whatsapp(message):
@@ -43,97 +43,129 @@ def send_whatsapp(message):
     except Exception as e:
         print(f"❌ Send error: {e}", flush=True)
 
-def check_for_tenders():
-    print(f"[{datetime.now()}] 🔍 Initiating 2merkato Scraper Engine...", flush=True)
-    
+# ==================== ENGINE 1: 2MERKATO ====================
+def scrape_2merkato():
+    print(f"[{datetime.now()}] 🔍 Running 2merkato Engine...", flush=True)
     if not MERKATO_USER or not MERKATO_PASS:
-        print("⚠️ Missing 2merkato credentials in environment variables!", flush=True)
-        return
+        print("⚠️ Missing 2merkato credentials!", flush=True)
+        return 0
 
     session = requests.Session()
-    
-    # 2merkato standard login endpoints and payload headers
     login_url = "https://www.2merkato.com/index.php?option=com_users&task=user.login"
     login_data = {
         "username": MERKATO_USER,
         "password": MERKATO_PASS,
-        "return": "aHR0cHM6Ly93d3cuMm1lcmthdG8uY29tL3RlbmRlcnM=" # Redirect to tenders board base
+        "return": "aHR0cHM6Ly93d3cuMm1lcmthdG8uY29tL3RlbmRlcnM="
     }
-    
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-    }
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
 
     try:
-        # Step 1: Login to establish authenticated session cookie
-        login_res = session.post(login_url, data=login_data, headers=headers, timeout=15)
-        print(f"🔑 Login Session Handshake: {login_res.status_code}", flush=True)
-        
-        # Step 2: Fetch the latest medical & operational tender notice categories
-        # This points to the specialized medical/hospital supplies categories list
+        session.post(login_url, data=login_data, headers=headers, timeout=15)
         tenders_url = "https://www.2merkato.com/tenders/category/25-medical-equipment-and-supplies"
         res = session.get(tenders_url, headers=headers, timeout=15)
-        
         soup = BeautifulSoup(res.text, 'html.parser')
         
-        # Find all tender list item blocks (common layout class selector for 2merkato listings)
         items = soup.find_all('div', class_='tender-block') or soup.find_all('tr', class_='tender-row')
-        
-        found_matches = 0
+        found = 0
         
         for item in items:
-            # Extract Text Details safely
             title_el = item.find('a')
-            if not title_el:
-                continue
-                
+            if not title_el: continue
+            
             title_text = title_el.get_text().strip()
             link = "https://www.2merkato.com" + title_el['href'] if title_el['href'].startswith('/') else title_el['href']
             
-            # Extract closing details/entity if available in sub-elements
-            meta_text = item.get_text()
-            
-            # Match keywords against text patterns
             if any(kw.lower() in title_text.lower() for kw in KEYWORDS):
-                tender_id = link.split('/')[-1] # Unique slug to identify item uniqueness
-                
+                tender_id = f"merkato_{link.split('/')[-1]}"
                 if tender_id not in NOTIFIED_TENDERS:
-                    found_matches += 1
+                    found += 1
                     NOTIFIED_TENDERS.add(tender_id)
                     
-                    alert_msg = f"""🔔 *New Biomedical Tender Scraped!*
-
-📋 *Title:* {title_text}
-🔗 *Source Link:* {link}
-
-_Please log in to your 2merkato portal panel to view full bid bonds and documentation specifications._"""
-                    
-                    send_whatsapp(alert_msg)
-                    time.sleep(2) # Avoid aggressive rapid API firing
-                    
-        print(f"🎯 Scan Complete. Discovered {found_matches} new relevant listings.", flush=True)
-        
-        if found_matches == 0:
-            send_whatsapp("🔍 Live 2merkato scan complete. No new medical or hemodialysis maintenance tenders found matching your keywords right now.\nNext auto-check in 4 hours.")
-
+                    alert = f"🔔 *New 2merkato Tender Found!*\n\n📋 *Title:* {title_text}\n🔗 *Link:* {link}"
+                    send_whatsapp(alert)
+                    time.sleep(2)
+        return found
     except Exception as e:
-        print(f"❌ Scraper loop encountered an exception: {e}", flush=True)
-        send_whatsapp(f"⚠️ Scraper Engine Error: System failed to fetch data from source ({e}). Check server logs.")
+        print(f"❌ 2merkato engine error: {e}", flush=True)
+        return 0
+
+# ==================== ENGINE 2: ETHIOPIAN eGP PORTAL ====================
+def scrape_egp():
+    print(f"[{datetime.now()}] 🔍 Running eGP Portal Engine...", flush=True)
+    
+    # Targeting the public notice board endpoint of the federal procurement system
+    url = "https://egp.ppa.gov.et/egp/bidding/tender/tendering-notices/open-data"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+        "Accept": "application/json"
+    }
+    
+    # Searching parameters targeting medical procurement
+    params = {
+        "page": 0,
+        "size": 20,
+        "procurementMethod": "OPEN",
+        "tenderCategory": "GOODS"
+    }
+    
+    try:
+        res = requests.get(url, headers=headers, params=params, timeout=15)
+        found = 0
+        
+        if res.status_code == 200:
+            data = res.json()
+            # Iterating through active bidding publications
+            for tender in data.get("content", []):
+                title_text = tender.get("tenderTitle", "") or tender.get("description", "")
+                bid_number = tender.get("tenderReferenceNumber", "")
+                
+                if any(kw.lower() in title_text.lower() for kw in KEYWORDS):
+                    tender_id = f"egp_{tender.get('id', bid_number)}"
+                    
+                    if tender_id not in NOTIFIED_TENDERS:
+                        found += 1
+                        NOTIFIED_TENDERS.add(tender_id)
+                        
+                        link = f"https://egp.ppa.gov.et/egp/bidding/tender/notices/published/{tender.get('id')}"
+                        
+                        alert = f"🏛️ *New Government eGP Tender!*\n\n" \
+                                f"📋 *Procurement:* {title_text}\n" \
+                                f"🔢 *Ref:* {bid_number}\n" \
+                                f"⏳ *Closing Date:* {tender.get('closingDate', 'N/A')}\n" \
+                                f"🔗 *Portal Link:* {link}"
+                        
+                        send_whatsapp(alert)
+                        time.sleep(2)
+        return found
+    except Exception as e:
+        print(f"❌ eGP portal engine error: {e}", flush=True)
+        return 0
+
+# ==================== RUN COORDINATOR ====================
+def check_for_tenders():
+    print(f"=================== STARTING SCAN CYCLE ===================", flush=True)
+    m_count = scrape_2merkato()
+    e_count = scrape_egp()
+    total = m_count + e_count
+    print(f"=================== SCAN COMPLETE: {total} NEW FOUND ===================", flush=True)
+    
+    if total == 0:
+        send_whatsapp("🔍 *Side-by-Side Scan Completed.*\nNo new updates detected on 2merkato or the eGP Portal.\nNext automatic sync in 4 hours.")
 
 def monitoring_loop():
     while True:
         check_for_tenders()
-        time.sleep(4 * 3600) # Check every 4 hours
+        time.sleep(4 * 3600)
 
 # ==================== FLASK ROUTES ====================
 @app.route('/')
 def home():
-    return "Tender Notifier Live Engine running!", 200
+    return "Dual-Engine Tender Notifier is running!", 200
 
 @app.route('/test-check')
 def manual_test():
     threading.Thread(target=check_for_tenders).start()
-    return "Manual live 2merkato scraper sequence triggered! Check WhatsApp and logs.", 200
+    return "Side-by-side dynamic scraper check initiated! Watch WhatsApp and logs.", 200
 
 if __name__ == "__main__":
     threading.Thread(target=monitoring_loop, daemon=True).start()
