@@ -22,15 +22,16 @@ KEYWORDS = [
 ]
 
 def send_whatsapp(message):
-    # 🌟 FIXED PATH: Explicitly includes the instance name in the main URL path
     url = f"{EVOLUTION_BASE}/message/sendText/{INSTANCE_NAME}"
     
+    # 🌟 FIXED PAYLOAD: Formatted strictly to provide the "text" property the API is asking for
     payload = {
         "number": WHATSAPP_NUMBER,
-        "textMessage": {"text": message}
+        "textMessage": {
+            "text": message
+        }
     }
     
-    # Passing the global API Key inside headers for Evolution v2 authentication
     headers = {
         "Content-Type": "application/json",
         "apikey": GLOBAL_API_KEY
@@ -50,7 +51,7 @@ def check_for_tenders():
     print(f"[{datetime.now()}] 🔍 Checking for tenders...", flush=True)
     
     try:
-        # Placeholder endpoint - change this to your true data source when ready
+        # Placeholder endpoint
         response = requests.get("https://example-tender-api.com/search?keywords=medical+maintenance", timeout=10)
         data = response.json()
         
