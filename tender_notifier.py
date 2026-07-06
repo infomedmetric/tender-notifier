@@ -9,7 +9,6 @@ from flask import Flask
 app = Flask(__name__)
 
 # ================== CONFIGURATION ==================
-# Pulls variables safely from Render's Environment Variables.
 EVOLUTION_BASE = os.environ.get("EVOLUTION_BASE", "https://medmetric-evolution.onrender.com")
 INSTANCE_NAME = os.environ.get("INSTANCE_NAME", "Tender-Notifier.")
 GLOBAL_API_KEY = os.environ.get("GLOBAL_API_KEY", "143EC4F4C954-4014-BCCD-FC294B1A5609")
@@ -24,12 +23,10 @@ KEYWORDS = [
 def send_whatsapp(message):
     url = f"{EVOLUTION_BASE}/message/sendText/{INSTANCE_NAME}"
     
-    # 🌟 FIXED PAYLOAD: Formatted strictly to provide the "text" property the API is asking for
+    # 🌟 FIXED FLAT PAYLOAD: Evolution API v2 flat structure
     payload = {
         "number": WHATSAPP_NUMBER,
-        "textMessage": {
-            "text": message
-        }
+        "text": message
     }
     
     headers = {
