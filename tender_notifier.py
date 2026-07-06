@@ -22,31 +22,24 @@ KEYWORDS = [
 ]
 
 def send_whatsapp(message):
-    # Base endpoint structure used by standard Evolution API deployments
-    url = f"{EVOLUTION_BASE}/message/sendText"
+    # 🌟 FIXED PATH: Explicitly includes the instance name in the main URL path
+    url = f"{EVOLUTION_BASE}/message/sendText/{INSTANCE_NAME}"
     
     payload = {
         "number": WHATSAPP_NUMBER,
         "textMessage": {"text": message}
     }
     
-    # Pass both API key and Instance Name into headers to satisfy authentication rules
+    # Passing the global API Key inside headers for Evolution v2 authentication
     headers = {
         "Content-Type": "application/json",
-        "apikey": GLOBAL_API_KEY,
-        "Instance": INSTANCE_NAME
-    }
-    
-    # Secondary fallback using query parameters (?instance=Tender-Notifier.)
-    params = {
-        "instance": INSTANCE_NAME
+        "apikey": GLOBAL_API_KEY
     }
     
     try:
-        r = requests.post(url, json=payload, headers=headers, params=params, timeout=10)
+        r = requests.post(url, json=payload, headers=headers, timeout=10)
         print(f"✅ Message sent status: {r.status_code}", flush=True)
         
-        # If the server responds with an error, print the exact message text from it
         if r.status_code != 200 and r.status_code != 201:
             print(f"📄 Response Content from Evolution: {r.text}", flush=True)
             
