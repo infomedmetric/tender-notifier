@@ -23,10 +23,21 @@ MERKATO_USER = os.environ.get("MERKATO_USER")
 MERKATO_PASS = os.environ.get("MERKATO_PASS")
 
 KEYWORDS = [
-    "ICB TENDER FOR MEDICAL EQUIPMENT", "medical equipment maintenance",
-    "preventive and Corrective Maintenance", "Hemodialysis", 
-    "water treatment Hemodialysis", "biomedical", "maintenance and repair"
+    # --- Hemodialysis & Water Treatment ---
+    "Hemodialysis", "Dialysis", "SWS-4000A", "B.Braun", "Dialog+",
+    "Water treatment", "Reverse Osmosis", "RO plant", "Water purification",
+    
+    # --- Maintenance & Engineering Services ---
+    "medical equipment maintenance", "preventive maintenance", "corrective maintenance",
+    "biomedical engineering", "maintenance and repair", "calibration", "technical service",
+    "spare parts", "after-sales service",
+    
+    # --- General Medical Equipment & Supply Turnkeys ---
+    "ICB TENDER FOR MEDICAL EQUIPMENT", "medical equipment", "medical device", 
+    "hospital equipment", "laboratory equipment", "supply and installation",
+    "procurement of goods", "medical supplies"
 ]
+
 
 # Tracks notified tenders across both engines to prevent duplicate WhatsApp spam
 NOTIFIED_TENDERS = set()
