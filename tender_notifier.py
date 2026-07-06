@@ -5,6 +5,10 @@ import threading
 from datetime import datetime
 from flask import Flask
 from bs4 import BeautifulSoup
+import urllib3
+
+# Suppress the insecure request warnings in logs when verify=False is used
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
@@ -93,30 +97,28 @@ def scrape_2merkato():
 def scrape_egp():
     print(f"[{datetime.now()}] 🔍 Running eGP Portal Engine...", flush=True)
     
-    # Targeting the public notice board endpoint of the federal procurement system
     url = "https://egp.ppa.gov.et/egp/bidding/tender/tendering-notices/open-data"
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
         "Accept": "application/json"
     }
     
-    # Searching parameters targeting medical procurement
     params = {
         "page": 0,
-        "size": 20,
+        "size": 40,  # Bumped up slightly to cast a wider net per check
         "procurementMethod": "OPEN",
         "tenderCategory": "GOODS"
     }
     
     try:
-        res = requests.get(url, headers=headers, params=params, timeout=15)
+        # 🌟 FIXED: Added verify=False to bypass the SSL self-signed certificate error
+        res = requests.get(url, headers=headers, params=params, verify=False, timeout=15)
         found = 0
         
         if res.status_code == 200:
             data = res.json()
-            # Iterating through active bidding publications
             for tender in data.get("content", []):
-                title_text = tender.get("tenderTitle", "") or tender.get("description", "")
+                title_text = tender.get("tenderTitle", "") or tender.get("description", "") or ""
                 bid_number = tender.get("tenderReferenceNumber", "")
                 
                 if any(kw.lower() in title_text.lower() for kw in KEYWORDS):
@@ -136,6 +138,8 @@ def scrape_egp():
                         
                         send_whatsapp(alert)
                         time.sleep(2)
+        else:
+            print(f"⚠️ eGP returned status code: {res.status_code}", flush=True)
         return found
     except Exception as e:
         print(f"❌ eGP portal engine error: {e}", flush=True)
