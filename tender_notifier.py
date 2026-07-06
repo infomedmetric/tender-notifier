@@ -28,6 +28,7 @@ KEYWORDS = [
     "water treatment Hemodialysis", "biomedical", "maintenance and repair"
 ]
 
+# Tracks notified tenders across both engines to prevent duplicate WhatsApp spam
 NOTIFIED_TENDERS = set()
 
 def send_whatsapp(message):
@@ -82,7 +83,7 @@ def scrape_2merkato():
                 tender_id = f"merkato_{link.split('/')[-1]}"
                 if tender_id not in NOTIFIED_TENDERS:
                     found += 1
-                    NOTLIMIT = NOTIFIED_TENDERS.add(tender_id)
+                    NOTIFIED_TENDERS.add(tender_id)
                     
                     alert = f"🔔 *New 2merkato Tender Found!*\n\n📋 *Title:* {title_text}\n🔗 *Link:* {link}"
                     send_whatsapp(alert)
@@ -92,55 +93,45 @@ def scrape_2merkato():
         print(f"❌ 2merkato engine error: {e}", flush=True)
         return 0
 
-# ==================== ENGINE 2: ETHIOPIAN eGP RSS FEED ====================
+# ==================== ENGINE 2: ETHIOPIAN eGP PORTAL ====================
 def scrape_egp():
-    print(f"[{datetime.now()}] 🔍 Running eGP Syndicated Feed Engine...", flush=True)
-    
-    # Using the portal's dedicated open feed endpoint instead of dynamic web routes
-    url = "https://egp.ppa.gov.et/egp/bidding/tender/rss/published"
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-        "Accept": "application/rss+xml, application/xml, text/xml"
-    }
+    print(f"[{datetime.now()}] 🔍 Running eGP Engine...", flush=True)
+    # Use the main bidding page and parse recent tenders
+    url = "https://production.egp.gov.et/egp/bids/all"
+    headers = {"User-Agent": "Mozilla/5.0"}
     
     try:
-        res = requests.get(url, headers=headers, verify=False, timeout=15)
+        res = requests.get(url, headers=headers, timeout=15, verify=False)
         found = 0
         
         if res.status_code == 200:
-            # Parse the incoming XML payload using xml-parser configuration
-            soup = BeautifulSoup(res.text, 'xml')
-            items = soup.find_all('item')
+            soup = BeautifulSoup(res.text, 'html.parser')
+            # Look for tender titles inside table definitions
+            titles = soup.find_all('td')  
             
-            for item in items:
-                title_text = item.find('title').get_text().strip() if item.find('title') else ""
-                link_text = item.find('link').get_text().strip() if item.find('link') else ""
-                desc_text = item.find('description').get_text().strip() if item.find('description') else ""
+            for title in titles:
+                text = title.get_text().strip()
                 
-                # Combine parameters to search for matches across descriptions and fields
-                search_scope = f"{title_text} {desc_text}"
-                
-                if any(kw.lower() in search_scope.lower() for kw in KEYWORDS):
-                    # Use the link identifier token as the lookup signature
-                    tender_uid = link_text.split('/')[-1] if '/' in link_text else str(hash(title_text))
-                    tender_id = f"egp_feed_{tender_uid}"
+                # Check keywords safely
+                if any(kw.lower() in text.lower() for kw in KEYWORDS):
+                    # Create a fingerprint identifier signature to avoid duplication loops
+                    tender_id = f"egp_td_{hash(text)}"
                     
                     if tender_id not in NOTIFIED_TENDERS:
-                        found += 1
                         NOTIFIED_TENDERS.add(tender_id)
+                        found += 1
                         
-                        alert = f"🏛️ *New Government eGP Tender!*\n\n" \
-                                f"📋 *Procurement:* {title_text}\n\n" \
-                                f"📝 *Context Summary:* {desc_text[:280]}...\n\n" \
-                                f"🔗 *Portal Link:* {link_text}"
-                        
+                        # Send the alert package safely
+                        alert = f"🏛️ *New eGP Tender Match!*\n\n📋 *Details:* {text[:250]}..."
                         send_whatsapp(alert)
                         time.sleep(2)
+                        
+            print(f"eGP found {found} matches", flush=True)
         else:
-            print(f"⚠️ eGP Feed Engine fallback status: {res.status_code}", flush=True)
+            print(f"eGP status: {res.status_code}", flush=True)
         return found
     except Exception as e:
-        print(f"❌ eGP XML Feed parser runtime discrepancy: {e}", flush=True)
+        print(f"eGP error: {e}", flush=True)
         return 0
 
 # ==================== RUN COORDINATOR ====================
@@ -173,4 +164,3 @@ if __name__ == "__main__":
     threading.Thread(target=monitoring_loop, daemon=True).start()
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
-
