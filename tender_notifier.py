@@ -64,23 +64,44 @@ def scrape_2merkato():
             # --- Login (optional — only if credentials provided) ---
             if MERKATO_USER and MERKATO_PASS:
                 try:
-                    page.goto(MERKATO_LOGIN_URL, timeout=30000)
-                    page.wait_for_load_state("networkidle", timeout=15000)
+                    # domcontentloaded instead of networkidle — SPA sites with
+                    # ads/analytics often never go fully idle, causing false timeouts
+                    page.goto(MERKATO_LOGIN_URL, timeout=30000, wait_until="domcontentloaded")
 
-                    # Try common field patterns since exact markup is unknown
+                    # Wait specifically for a password field to render, rather than
+                    # waiting for the whole network to go quiet
+                    page.wait_for_selector("input[type='password']", timeout=20000)
+
+                    # Diagnostic dump — logs every input field's actual attributes so we
+                    # can see the real markup if selectors below don't match
+                    field_info = page.eval_on_selector_all(
+                        "input",
+                        "els => els.map(e => ({type: e.type, name: e.name, id: e.id, placeholder: e.placeholder}))"
+                    )
+                    print(f"🔎 Login page input fields detected: {field_info}", flush=True)
+
                     email_field = page.locator(
-                        "input[type='email'], input[name='email'], input[name='username']"
+                        "input[type='email'], input[name*='email' i], input[name*='user' i], "
+                        "input[id*='email' i], input[id*='user' i], input[placeholder*='email' i]"
                     ).first
                     pass_field = page.locator("input[type='password']").first
 
                     if email_field.count() > 0 and pass_field.count() > 0:
                         email_field.fill(MERKATO_USER)
                         pass_field.fill(MERKATO_PASS)
-                        page.locator("button[type='submit'], button:has-text('Login'), button:has-text('Sign in')").first.click()
-                        page.wait_for_load_state("networkidle", timeout=15000)
-                        print("✅ Logged into tender.2merkato.com", flush=True)
+
+                        submit_btn = page.locator(
+                            "button[type='submit'], button:has-text('Login'), button:has-text('Sign in'), "
+                            "button:has-text('Log in'), input[type='submit']"
+                        ).first
+                        submit_btn.click()
+
+                        # Give the SPA a moment to process login + redirect
+                        page.wait_for_timeout(4000)
+                        current_url = page.url
+                        print(f"✅ Submitted login, current URL: {current_url}", flush=True)
                     else:
-                        print("⚠️ Login form fields not found — continuing without auth", flush=True)
+                        print(f"⚠️ Could not confidently identify email/username field among: {field_info}", flush=True)
                 except Exception as e:
                     print(f"⚠️ Login attempt failed, continuing without auth: {e}", flush=True)
 
