@@ -34,6 +34,7 @@ EGP_BIDS_URL = f"{EGP_BASE}/egp/bids/all"
 EGP_MAX_PAGES = int(os.environ.get("EGP_MAX_PAGES", "3"))
 EGP_USER = os.environ.get("EGP_USER")
 EGP_PASS = os.environ.get("EGP_PASS")
+EGP_ORG_NAME = os.environ.get("EGP_ORG_NAME", "Medmetric")
 
 # Any ONE of these alone is specific enough to trigger a match
 STRONG_KEYWORDS = [
@@ -151,10 +152,8 @@ def scrape_2merkato():
             seen_this_scan = set()
             for page_num in range(1, MERKATO_MAX_PAGES + 1):
                 page_url = MERKATO_TENDERS_URL if page_num == 1 else f"{MERKATO_TENDERS_URL}?page={page_num}"
-                page.goto(page_url, timeout=30000)
-                page.wait_for_load_state("networkidle", timeout=20000)
-                # Give the SPA a moment to hydrate/render the list
-                page.wait_for_timeout(2000)
+                page.goto(page_url, timeout=30000, wait_until="domcontentloaded")
+                page.wait_for_timeout(3000)
 
                 links = page.locator("a[href*='/tenders/']").all()
                 print(f"Page {page_num}: found {len(links)} raw tender links", flush=True)
@@ -239,7 +238,41 @@ def scrape_egp():
                         submit_btn.click()
 
                         page.wait_for_timeout(4000)
-                        print(f"✅ eGP login submitted, current URL: {page.url}", flush=True)
+                        current_url = page.url
+                        print(f"✅ eGP login submitted, current URL: {current_url}", flush=True)
+
+                        if "organization-selector" in current_url:
+                            try:
+                                # Log every clickable element so we can see the real
+                                # options if the heuristic click below doesn't work
+                                clickable_info = page.eval_on_selector_all(
+                                    "button, a, li, [role='button']",
+                                    "els => els.slice(0, 30).map(e => ({tag: e.tagName, text: e.innerText.trim().slice(0,60), class: e.className}))"
+                                )
+                                print(f"🔎 Organization-selector clickable elements: {clickable_info}", flush=True)
+
+                                # Click the specific organization by name rather than
+                                # guessing at the first clickable element — more reliable
+                                # if the account has more than one linked organization
+                                org_option = page.locator(
+                                    f"text=/{EGP_ORG_NAME}/i"
+                                ).first
+                                if org_option.count() == 0:
+                                    # Fallback to generic heuristic if name match fails
+                                    org_option = page.locator(
+                                        "button:has-text('Continue'), button:has-text('Select'), "
+                                        "li:has-text('Continue'), a:has-text('Continue'), "
+                                        "[class*='organization' i], [class*='org-card' i], li, button"
+                                    ).first
+
+                                if org_option.count() > 0:
+                                    org_option.click()
+                                    page.wait_for_timeout(3000)
+                                    print(f"✅ Clicked organization option, now at: {page.url}", flush=True)
+                                else:
+                                    print("⚠️ No clickable organization option found", flush=True)
+                            except Exception as e:
+                                print(f"⚠️ Organization-selector handling failed: {e}", flush=True)
                     else:
                         print(f"⚠️ Could not confidently identify eGP username/password field among: {field_info}", flush=True)
                 except Exception as e:
