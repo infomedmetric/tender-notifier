@@ -316,12 +316,22 @@ def scrape_egp():
             seen_this_scan = set()
             for term in EGP_SEARCH_TERMS:
                 try:
+                    search_box.click()
                     search_box.fill("")
+                    page.wait_for_timeout(300)
                     search_box.fill(term)
+                    search_box.press("Enter")
                     page.wait_for_timeout(2500)  # let the table filter update
 
+                    actual_value = search_box.input_value()
                     rows = page.locator("table tbody tr").all()
-                    print(f"eGP search '{term}': {len(rows)} rows", flush=True)
+                    first_row_preview = ""
+                    if rows:
+                        try:
+                            first_row_preview = rows[0].inner_text().replace("\n", " | ")[:100]
+                        except Exception:
+                            pass
+                    print(f"eGP search '{term}' | input value now: '{actual_value}' | {len(rows)} rows | first row: {first_row_preview!r}", flush=True)
 
                     for row in rows:
                         try:
