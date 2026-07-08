@@ -31,10 +31,16 @@ MERKATO_MAX_PAGES = int(os.environ.get("MERKATO_MAX_PAGES", "3"))
 EGP_BASE = "https://production.egp.gov.et"
 EGP_LOGIN_URL = f"{EGP_BASE}/egp/login"
 EGP_BIDS_URL = f"{EGP_BASE}/egp/bids/all"
-EGP_MAX_PAGES = int(os.environ.get("EGP_MAX_PAGES", "3"))
 EGP_USER = os.environ.get("EGP_USER")
 EGP_PASS = os.environ.get("EGP_PASS")
 EGP_ORG_NAME = os.environ.get("EGP_ORG_NAME", "Medmetric")
+
+# Search terms fed one at a time into eGP's own built-in table search box —
+# far more reliable than scraping every row across 13+ pages
+EGP_SEARCH_TERMS = [
+    "medical", "biomedical", "hemodialysis", "dialysis",
+    "laboratory equipment", "hospital equipment", "x-ray", "ultrasound"
+]
 
 # Any ONE of these alone is specific enough to trigger a match
 STRONG_KEYWORDS = [
@@ -277,51 +283,61 @@ def scrape_egp():
                 except Exception as e:
                     print(f"⚠️ eGP login attempt failed, continuing without auth: {e}", flush=True)
 
+            # --- Navigate to Bidding List via the Tenders nav link (client-side
+            # routing — direct URL navigation to /egp/bids/all doesn't load the
+            # real table, it just bounces back to the dashboard) ---
+            try:
+                page.locator("text=Tenders").first.click(timeout=15000)
+                page.wait_for_selector("text=/Bidding List/i", timeout=15000)
+                print("✅ Reached Bidding List view", flush=True)
+            except Exception as e:
+                print(f"❌ Could not reach Bidding List view: {e}", flush=True)
+                browser.close()
+                return 0
+
+            search_box = page.locator("input[placeholder*='Search' i]").first
+
             seen_this_scan = set()
-            for page_num in range(1, EGP_MAX_PAGES + 1):
-                page_url = EGP_BIDS_URL if page_num == 1 else f"{EGP_BIDS_URL}?page={page_num}"
-                page.goto(page_url, timeout=30000, wait_until="domcontentloaded")
-                page.wait_for_timeout(4000)
+            for term in EGP_SEARCH_TERMS:
+                try:
+                    search_box.fill("")
+                    search_box.fill(term)
+                    page.wait_for_timeout(2500)  # let the table filter update
 
-                # Some procurement portals actively detect automation/devtools —
-                # log the page title so we can tell if we got blocked instead of
-                # silently returning 0 with no explanation
-                page_title = page.title()
-                body_snippet = page.inner_text("body")[:200]
-                print(f"eGP page {page_num} title: '{page_title}' | body starts: {body_snippet!r}", flush=True)
+                    rows = page.locator("table tbody tr").all()
+                    print(f"eGP search '{term}': {len(rows)} rows", flush=True)
 
-                if "devtools" in body_snippet.lower() or "developer tools" in body_snippet.lower():
-                    print("⚠️ eGP appears to be blocking automated browser access — aborting eGP scan", flush=True)
-                    break
+                    for row in rows:
+                        try:
+                            cells = row.locator("td").all_inner_texts()
+                            if not cells:
+                                continue
+                            ref_no = cells[0].strip() if len(cells) > 0 else ""
+                            title_text = cells[2].strip() if len(cells) > 2 else " | ".join(cells)
 
-                # Grab every link on the page — eGP's markup is unknown to us,
-                # so cast a wide net and rely on is_relevant_tender() to filter
-                links = page.locator("a").all()
-                print(f"eGP page {page_num}: found {len(links)} raw links", flush=True)
+                            row_key = ref_no or title_text
+                            if row_key in seen_this_scan:
+                                continue
+                            seen_this_scan.add(row_key)
 
-                for link in links:
-                    try:
-                        title_text = link.inner_text().strip()
-                        href = link.get_attribute("href")
-                        if not title_text or not href or len(title_text) < 8:
+                            if is_relevant_tender(title_text):
+                                tender_id = f"egp_{ref_no or title_text}"
+                                if tender_id not in NOTIFIED_TENDERS:
+                                    found += 1
+                                    NOTIFIED_TENDERS.add(tender_id)
+                                    alert = (
+                                        f"🔔 *New Medical Tender Found (eGP)!*\n\n"
+                                        f"📋 *Title:* {title_text}\n"
+                                        f"🧾 *Ref No:* {ref_no}\n"
+                                        f"🔗 *Portal:* {EGP_BIDS_URL}"
+                                    )
+                                    send_whatsapp(alert)
+                                    time.sleep(2)
+                        except Exception:
                             continue
-
-                        full_link = href if href.startswith("http") else f"{EGP_BASE}{href}"
-
-                        if full_link in seen_this_scan:
-                            continue
-                        seen_this_scan.add(full_link)
-
-                        if is_relevant_tender(title_text):
-                            tender_id = f"egp_{full_link.rstrip('/').split('/')[-1]}"
-                            if tender_id not in NOTIFIED_TENDERS:
-                                found += 1
-                                NOTIFIED_TENDERS.add(tender_id)
-                                alert = f"🔔 *New Medical Tender Found (eGP)!*\n\n📋 *Title:* {title_text}\n🔗 *Link:* {full_link}"
-                                send_whatsapp(alert)
-                                time.sleep(2)
-                    except Exception:
-                        continue
+                except Exception as e:
+                    print(f"⚠️ eGP search for '{term}' failed: {e}", flush=True)
+                    continue
 
             browser.close()
 
