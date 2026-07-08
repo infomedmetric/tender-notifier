@@ -303,7 +303,7 @@ def scrape_egp():
             # routing — direct URL navigation to /egp/bids/all doesn't load the
             # real table, it just bounces back to the dashboard) ---
             try:
-                page.locator("text=Tenders").first.click(timeout=8000, force=True)
+                page.locator("text=Tenders").first.click(timeout=15000)
                 page.wait_for_selector("text=/Bidding List/i", timeout=15000)
                 print("✅ Reached Bidding List view", flush=True)
             except Exception as e:
@@ -321,37 +321,25 @@ def scrape_egp():
                     page.wait_for_timeout(300)
                     search_box.fill(term)
                     search_box.press("Enter")
-                    page.wait_for_timeout(3000)
-
-                    def _read_rows():
-                        rows_ = page.locator("table tbody tr").all()
-                        parsed_ = []
-                        for r in rows_:
-                            try:
-                                parsed_.append(r.locator("td").all_inner_texts())
-                            except Exception:
-                                parsed_.append([])
-                        return rows_, parsed_
-
-                    rows, parsed_rows = _read_rows()
-                    # If cell text hasn't populated yet (rows exist but all cells are
-                    # blank/whitespace), give it one more moment and re-read once
-                    if rows and all(not "".join(c).strip() for c in parsed_rows):
-                        page.wait_for_timeout(2000)
-                        rows, parsed_rows = _read_rows()
+                    page.wait_for_timeout(2500)  # let the table filter update
 
                     actual_value = search_box.input_value()
-                    first_row_preview = parsed_rows[0] if parsed_rows else []
-                    print(f"eGP search '{term}' | input value now: '{actual_value}' | {len(rows)} rows | first row cells: {first_row_preview!r}", flush=True)
-
-                    for cells in parsed_rows:
+                    rows = page.locator("table tbody tr").all()
+                    first_row_preview = ""
+                    if rows:
                         try:
-                            if not cells or not "".join(cells).strip():
+                            first_row_preview = rows[0].inner_text().replace("\n", " | ")[:100]
+                        except Exception:
+                            pass
+                    print(f"eGP search '{term}' | input value now: '{actual_value}' | {len(rows)} rows | first row: {first_row_preview!r}", flush=True)
+
+                    for row in rows:
+                        try:
+                            cells = row.locator("td").all_inner_texts()
+                            if not cells:
                                 continue
                             ref_no = cells[0].strip() if len(cells) > 0 else ""
                             title_text = cells[2].strip() if len(cells) > 2 else " | ".join(cells)
-                            if not title_text:
-                                continue
 
                             row_key = ref_no or title_text
                             if row_key in seen_this_scan:
