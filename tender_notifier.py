@@ -283,6 +283,22 @@ def scrape_egp():
                 except Exception as e:
                     print(f"⚠️ eGP login attempt failed, continuing without auth: {e}", flush=True)
 
+            # --- Dismiss any blocking modal (this app uses Ant Design/ng-zorro
+            # modals — one may pop up after org selection and intercept clicks) ---
+            try:
+                modal_close = page.locator(
+                    ".ant-modal-close, button:has-text('Close'), button:has-text('OK'), "
+                    "button:has-text('Got it'), button:has-text('Dismiss')"
+                ).first
+                if modal_close.count() > 0:
+                    modal_close.click(timeout=5000)
+                    page.wait_for_timeout(1000)
+                    print("✅ Closed a blocking modal dialog", flush=True)
+            except Exception:
+                pass
+            page.keyboard.press("Escape")
+            page.wait_for_timeout(500)
+
             # --- Navigate to Bidding List via the Tenders nav link (client-side
             # routing — direct URL navigation to /egp/bids/all doesn't load the
             # real table, it just bounces back to the dashboard) ---
