@@ -15,7 +15,9 @@ app = Flask(__name__)
 EVOLUTION_BASE = os.environ.get("EVOLUTION_BASE", "https://medmetric-evolution.onrender.com")
 INSTANCE_NAME = os.environ.get("INSTANCE_NAME", "Tender-Notifier.")
 GLOBAL_API_KEY = os.environ.get("GLOBAL_API_KEY", "143EC4F4C954-4014-BCCD-FC294B1A5609")
-WHATSAPP_NUMBER = os.environ.get("WHATSAPP_NUMBER", "251901748874")
+WHATSAPP_NUMBERS = [
+    n.strip() for n in os.environ.get("WHATSAPP_NUMBERS", "251901748874").split(",") if n.strip()
+]
 
 MERKATO_USER = os.environ.get("MERKATO_USER")
 MERKATO_PASS = os.environ.get("MERKATO_PASS")
@@ -25,24 +27,56 @@ MERKATO_BASE = "https://tender.2merkato.com"
 MERKATO_LOGIN_URL = f"{MERKATO_BASE}/login"
 MERKATO_TENDERS_URL = f"{MERKATO_BASE}/tenders"
 
-KEYWORDS = [
-    "medical", "equipment", "maintenance", "hemodialysis", "dialysis",
-    "water treatment", "b.braun", "dialog+", "biomedical", "hospital",
-    "health", "የህክምና", "ጥገና"
+# Any ONE of these alone is specific enough to trigger a match
+STRONG_KEYWORDS = [
+    "biomedical", "hemodialysis", "dialysis", "b.braun", "dialog+",
+    "x-ray", "xray", "ultrasound", "ventilator", "autoclave", "sterilizer",
+    "diagnostic equipment", "medical equipment", "hospital equipment",
+    "laboratory equipment", "medical device", "የህክምና", "ጥገና"
 ]
+
+# Generic medical-adjacent words — only count if paired with an equipment/
+# procurement-type word in the same title (avoids matching HR/insurance/
+# consulting tenders that merely mention "health")
+MEDICAL_CONTEXT = ["medical", "health", "hospital", "biomedical", "clinical", "laboratory"]
+EQUIPMENT_CONTEXT = ["equipment", "supplies", "supply", "device", "machine",
+                     "instrument", "apparatus", "maintenance", "repair", "procurement"]
+
+# If any of these appear, skip regardless of other matches — these are the
+# recurring false-positive categories (vehicle maintenance, insurance, consulting)
+EXCLUDE_TERMS = [
+    "vehicle", "toyota", "car ", "motorbike", "insurance", "life insurance",
+    "term life", "gpa", "consultancy services", "consulting firm"
+]
+
+
+def is_relevant_tender(title):
+    title_lower = title.lower()
+
+    if any(term in title_lower for term in EXCLUDE_TERMS):
+        return False
+
+    if any(term in title_lower for term in STRONG_KEYWORDS):
+        return True
+
+    has_medical_context = any(term in title_lower for term in MEDICAL_CONTEXT)
+    has_equipment_context = any(term in title_lower for term in EQUIPMENT_CONTEXT)
+
+    return has_medical_context and has_equipment_context
 
 NOTIFIED_TENDERS = set()
 
 
 def send_whatsapp(message):
     url = f"{EVOLUTION_BASE}/message/sendText/{INSTANCE_NAME}"
-    payload = {"number": WHATSAPP_NUMBER, "text": message}
     headers = {"Content-Type": "application/json", "apikey": GLOBAL_API_KEY}
-    try:
-        r = requests.post(url, json=payload, headers=headers, timeout=10)
-        print(f"✅ WhatsApp Status: {r.status_code}", flush=True)
-    except Exception as e:
-        print(f"❌ Send error: {e}", flush=True)
+    for number in WHATSAPP_NUMBERS:
+        payload = {"number": number, "text": message}
+        try:
+            r = requests.post(url, json=payload, headers=headers, timeout=10)
+            print(f"✅ WhatsApp Status ({number}): {r.status_code}", flush=True)
+        except Exception as e:
+            print(f"❌ Send error ({number}): {e}", flush=True)
 
 
 # ==================== ENGINE: 2MERKATO (Playwright) ====================
@@ -129,7 +163,7 @@ def scrape_2merkato():
                         continue
                     seen_this_scan.add(full_link)
 
-                    if any(kw.lower() in title_text.lower() for kw in KEYWORDS):
+                    if is_relevant_tender(title_text):
                         tender_id = f"merkato_{full_link.rstrip('/').split('/')[-1]}"
                         if tender_id not in NOTIFIED_TENDERS:
                             found += 1
