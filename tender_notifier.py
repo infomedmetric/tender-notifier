@@ -243,20 +243,19 @@ def scrape_egp():
 
                         if "organization-selector" in current_url:
                             try:
-                                # Log every clickable element so we can see the real
-                                # options if the heuristic click below doesn't work
+                                # Wait specifically for the org card to render — the
+                                # selector page loads the org list asynchronously, and
+                                # querying too early only finds the static Logout button
+                                page.wait_for_selector(f"text=/{EGP_ORG_NAME}/i", timeout=15000)
+
                                 clickable_info = page.eval_on_selector_all(
                                     "button, a, li, [role='button']",
                                     "els => els.slice(0, 30).map(e => ({tag: e.tagName, text: e.innerText.trim().slice(0,60), class: e.className}))"
                                 )
                                 print(f"🔎 Organization-selector clickable elements: {clickable_info}", flush=True)
 
-                                # Click the specific organization by name rather than
-                                # guessing at the first clickable element — more reliable
-                                # if the account has more than one linked organization
-                                org_option = page.locator(
-                                    f"text=/{EGP_ORG_NAME}/i"
-                                ).first
+                                org_option = page.locator(f"text=/{EGP_ORG_NAME}/i").first
+                                print(f"🔎 Org name match count: {org_option.count()}", flush=True)
                                 if org_option.count() == 0:
                                     # Fallback to generic heuristic if name match fails
                                     org_option = page.locator(
