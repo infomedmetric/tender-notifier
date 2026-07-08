@@ -303,7 +303,7 @@ def scrape_egp():
             # routing — direct URL navigation to /egp/bids/all doesn't load the
             # real table, it just bounces back to the dashboard) ---
             try:
-                page.locator("text=Tenders").first.click(timeout=15000)
+                page.locator("text=Tenders").first.click(timeout=8000, force=True)
                 page.wait_for_selector("text=/Bidding List/i", timeout=15000)
                 print("✅ Reached Bidding List view", flush=True)
             except Exception as e:
