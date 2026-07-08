@@ -321,25 +321,37 @@ def scrape_egp():
                     page.wait_for_timeout(300)
                     search_box.fill(term)
                     search_box.press("Enter")
-                    page.wait_for_timeout(2500)  # let the table filter update
+                    page.wait_for_timeout(3000)
+
+                    def _read_rows():
+                        rows_ = page.locator("table tbody tr").all()
+                        parsed_ = []
+                        for r in rows_:
+                            try:
+                                parsed_.append(r.locator("td").all_inner_texts())
+                            except Exception:
+                                parsed_.append([])
+                        return rows_, parsed_
+
+                    rows, parsed_rows = _read_rows()
+                    # If cell text hasn't populated yet (rows exist but all cells are
+                    # blank/whitespace), give it one more moment and re-read once
+                    if rows and all(not "".join(c).strip() for c in parsed_rows):
+                        page.wait_for_timeout(2000)
+                        rows, parsed_rows = _read_rows()
 
                     actual_value = search_box.input_value()
-                    rows = page.locator("table tbody tr").all()
-                    first_row_preview = ""
-                    if rows:
-                        try:
-                            first_row_preview = rows[0].inner_text().replace("\n", " | ")[:100]
-                        except Exception:
-                            pass
-                    print(f"eGP search '{term}' | input value now: '{actual_value}' | {len(rows)} rows | first row: {first_row_preview!r}", flush=True)
+                    first_row_preview = parsed_rows[0] if parsed_rows else []
+                    print(f"eGP search '{term}' | input value now: '{actual_value}' | {len(rows)} rows | first row cells: {first_row_preview!r}", flush=True)
 
-                    for row in rows:
+                    for cells in parsed_rows:
                         try:
-                            cells = row.locator("td").all_inner_texts()
-                            if not cells:
+                            if not cells or not "".join(cells).strip():
                                 continue
                             ref_no = cells[0].strip() if len(cells) > 0 else ""
                             title_text = cells[2].strip() if len(cells) > 2 else " | ".join(cells)
+                            if not title_text:
+                                continue
 
                             row_key = ref_no or title_text
                             if row_key in seen_this_scan:
