@@ -351,11 +351,47 @@ def scrape_egp():
                                 if tender_id not in NOTIFIED_TENDERS:
                                     found += 1
                                     NOTIFIED_TENDERS.add(tender_id)
+
+                                    # Try a plain anchor href inside the row first —
+                                    # cheap, no navigation needed
+                                    detail_link = EGP_BIDS_URL
+                                    try:
+                                        row_anchor = row.locator("a").first
+                                        if row_anchor.count() > 0:
+                                            href = row_anchor.get_attribute("href")
+                                            if href:
+                                                detail_link = href if href.startswith("http") else f"{EGP_BASE}{href}"
+                                                print(f"🔗 Found row anchor href: {detail_link}", flush=True)
+                                    except Exception:
+                                        pass
+
+                                    # No plain href — click the row to capture the
+                                    # real URL the SPA navigates to, then go back and
+                                    # restore the search filter
+                                    if detail_link == EGP_BIDS_URL:
+                                        try:
+                                            row.click(timeout=8000)
+                                            page.wait_for_timeout(2500)
+                                            detail_link = page.url
+                                            print(f"🔗 Captured detail URL via click-through: {detail_link}", flush=True)
+                                            page.go_back(timeout=8000)
+                                            page.wait_for_timeout(1500)
+                                            search_box = page.locator("input[placeholder*='Search' i]").first
+                                            search_box.click()
+                                            search_box.fill("")
+                                            page.wait_for_timeout(200)
+                                            search_box.fill(term)
+                                            search_box.press("Enter")
+                                            page.wait_for_timeout(2500)
+                                        except Exception as e:
+                                            print(f"⚠️ Click-through for detail link failed: {e}", flush=True)
+                                            detail_link = EGP_BIDS_URL
+
                                     alert = (
                                         f"🔔 *New Medical Tender Found (eGP)!*\n\n"
                                         f"📋 *Title:* {title_text}\n"
                                         f"🧾 *Ref No:* {ref_no}\n"
-                                        f"🔗 *Portal:* {EGP_BIDS_URL}"
+                                        f"🔗 *Link:* {detail_link}"
                                     )
                                     send_whatsapp(alert)
                                     time.sleep(2)
