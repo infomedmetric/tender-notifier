@@ -2,6 +2,7 @@ import os
 import time
 import requests
 import threading
+import psycopg2
 from datetime import datetime
 from flask import Flask
 from playwright.sync_api import sync_playwright
@@ -79,7 +80,75 @@ def is_relevant_tender(title):
 
     return has_medical_context and has_equipment_context
 
-NOTIFIED_TENDERS = set()
+
+# ==================== PERSISTENT DEDUP (Postgres) ====================
+DATABASE_URL = os.environ.get("DATABASE_URL")
+
+
+def get_db_connection():
+    return psycopg2.connect(DATABASE_URL, sslmode="require")
+
+
+def init_db():
+    """Run once at startup to ensure the dedup table exists."""
+    if not DATABASE_URL:
+        print("⚠️ DATABASE_URL not set — falling back to in-memory dedup (will reset on restart)", flush=True)
+        return
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS notified_tenders (
+                tender_id TEXT PRIMARY KEY,
+                notified_at TIMESTAMP DEFAULT NOW()
+            )
+        """)
+        conn.commit()
+        cur.close()
+        conn.close()
+        print("✅ Connected to Postgres and verified notified_tenders table", flush=True)
+    except Exception as e:
+        print(f"❌ Postgres init failed, falling back to in-memory dedup: {e}", flush=True)
+
+
+# In-memory fallback used only if DATABASE_URL is missing or unreachable —
+# keeps the app functional (just without persistence) rather than crashing
+_MEMORY_FALLBACK = set()
+
+
+def is_already_notified(tender_id: str) -> bool:
+    if not DATABASE_URL:
+        return tender_id in _MEMORY_FALLBACK
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT 1 FROM notified_tenders WHERE tender_id = %s", (tender_id,))
+        result = cur.fetchone()
+        cur.close()
+        conn.close()
+        return result is not None
+    except Exception as e:
+        print(f"⚠️ DB check failed for {tender_id}, using memory fallback: {e}", flush=True)
+        return tender_id in _MEMORY_FALLBACK
+
+
+def mark_as_notified(tender_id: str):
+    if not DATABASE_URL:
+        _MEMORY_FALLBACK.add(tender_id)
+        return
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO notified_tenders (tender_id) VALUES (%s) ON CONFLICT DO NOTHING",
+            (tender_id,)
+        )
+        conn.commit()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        print(f"⚠️ DB insert failed for {tender_id}, using memory fallback: {e}", flush=True)
+        _MEMORY_FALLBACK.add(tender_id)
 
 
 def send_whatsapp(message):
@@ -179,9 +248,9 @@ def scrape_2merkato():
 
                         if is_relevant_tender(title_text):
                             tender_id = f"merkato_{full_link.rstrip('/').split('/')[-1]}"
-                            if tender_id not in NOTIFIED_TENDERS:
+                            if not is_already_notified(tender_id):
                                 found += 1
-                                NOTIFIED_TENDERS.add(tender_id)
+                                mark_as_notified(tender_id)
                                 alert = f"🔔 *New Medical Tender Found!*\n\n📋 *Title:* {title_text}\n🔗 *Link:* {full_link}"
                                 send_whatsapp(alert)
                                 time.sleep(2)
@@ -348,9 +417,9 @@ def scrape_egp():
 
                             if is_relevant_tender(title_text):
                                 tender_id = f"egp_{ref_no or title_text}"
-                                if tender_id not in NOTIFIED_TENDERS:
+                                if not is_already_notified(tender_id):
                                     found += 1
-                                    NOTIFIED_TENDERS.add(tender_id)
+                                    mark_as_notified(tender_id)
 
                                     # Try a plain anchor href inside the row first —
                                     # cheap, no navigation needed
@@ -440,6 +509,10 @@ def manual_test():
     threading.Thread(target=check_for_tenders).start()
     return "Scraper sync cycle triggered!", 200
 
+
+# Ensure the dedup table exists as soon as the module loads (covers both
+# `python app.py` local runs and gunicorn/production imports)
+init_db()
 
 if __name__ == "__main__":
     threading.Thread(target=monitoring_loop, daemon=True).start()
