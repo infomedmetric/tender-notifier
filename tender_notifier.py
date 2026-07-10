@@ -2,6 +2,7 @@ import os
 import time
 import requests
 import threading
+import traceback
 import psycopg2
 from datetime import datetime
 from flask import Flask
@@ -84,9 +85,31 @@ def is_relevant_tender(title):
 # ==================== PERSISTENT DEDUP (Postgres) ====================
 DATABASE_URL = os.environ.get("DATABASE_URL")
 
+# Reuse a single connection across the whole scan instead of opening/closing
+# a new one per tender — repeated SSL handshakes were adding real memory/CPU
+# overhead on Render's free tier and were the likely cause of the scan
+# stalling or getting silently killed partway through page 1.
+_db_conn = None
+
 
 def get_db_connection():
-    return psycopg2.connect(DATABASE_URL, sslmode="require")
+    global _db_conn
+    if _db_conn is not None:
+        try:
+            # Cheap liveness check — reuse the connection if it's still good
+            cur = _db_conn.cursor()
+            cur.execute("SELECT 1")
+            cur.close()
+            return _db_conn
+        except Exception:
+            try:
+                _db_conn.close()
+            except Exception:
+                pass
+            _db_conn = None
+
+    _db_conn = psycopg2.connect(DATABASE_URL, sslmode="require", connect_timeout=10)
+    return _db_conn
 
 
 def init_db():
@@ -105,7 +128,6 @@ def init_db():
         """)
         conn.commit()
         cur.close()
-        conn.close()
         print("✅ Connected to Postgres and verified notified_tenders table", flush=True)
     except Exception as e:
         print(f"❌ Postgres init failed, falling back to in-memory dedup: {e}", flush=True)
@@ -125,7 +147,6 @@ def is_already_notified(tender_id: str) -> bool:
         cur.execute("SELECT 1 FROM notified_tenders WHERE tender_id = %s", (tender_id,))
         result = cur.fetchone()
         cur.close()
-        conn.close()
         return result is not None
     except Exception as e:
         print(f"⚠️ DB check failed for {tender_id}, using memory fallback: {e}", flush=True)
@@ -145,7 +166,6 @@ def mark_as_notified(tender_id: str):
         )
         conn.commit()
         cur.close()
-        conn.close()
     except Exception as e:
         print(f"⚠️ DB insert failed for {tender_id}, using memory fallback: {e}", flush=True)
         _MEMORY_FALLBACK.add(tender_id)
@@ -227,6 +247,7 @@ def scrape_2merkato():
             seen_this_scan = set()
             for page_num in range(1, MERKATO_MAX_PAGES + 1):
                 page_url = MERKATO_TENDERS_URL if page_num == 1 else f"{MERKATO_TENDERS_URL}?page={page_num}"
+                print(f"➡️ Loading 2merkato page {page_num}: {page_url}", flush=True)
                 page.goto(page_url, timeout=30000, wait_until="domcontentloaded")
                 page.wait_for_timeout(3000)
 
@@ -483,8 +504,20 @@ def scrape_egp():
 # ==================== RUN COORDINATOR ====================
 def check_for_tenders():
     print("=================== STARTING SCAN CYCLE ===================", flush=True)
-    merkato_total = scrape_2merkato()
-    egp_total = scrape_egp()
+    try:
+        merkato_total = scrape_2merkato()
+    except Exception:
+        print("❌ 2merkato engine crashed with an unhandled exception:", flush=True)
+        print(traceback.format_exc(), flush=True)
+        merkato_total = 0
+
+    try:
+        egp_total = scrape_egp()
+    except Exception:
+        print("❌ eGP engine crashed with an unhandled exception:", flush=True)
+        print(traceback.format_exc(), flush=True)
+        egp_total = 0
+
     total = merkato_total + egp_total
     print(f"=================== SCAN COMPLETE: {total} NEW FOUND ({merkato_total} 2merkato, {egp_total} eGP) ===================", flush=True)
 
@@ -494,7 +527,11 @@ def check_for_tenders():
 
 def monitoring_loop():
     while True:
-        check_for_tenders()
+        try:
+            check_for_tenders()
+        except Exception:
+            print("❌ check_for_tenders crashed at the top level:", flush=True)
+            print(traceback.format_exc(), flush=True)
         time.sleep(4 * 3600)
 
 
