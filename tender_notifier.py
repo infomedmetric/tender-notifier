@@ -374,26 +374,56 @@ def scrape_egp():
                     print(f"⚠️ eGP login attempt failed, continuing without auth: {e}", flush=True)
 
             # --- Dismiss any blocking modal (this app uses Ant Design/ng-zorro
-            # modals — one may pop up after org selection and intercept clicks) ---
-            try:
-                modal_close = page.locator(
-                    ".ant-modal-close, button:has-text('Close'), button:has-text('OK'), "
-                    "button:has-text('Got it'), button:has-text('Dismiss')"
-                ).first
-                if modal_close.count() > 0:
-                    modal_close.click(timeout=5000)
-                    page.wait_for_timeout(1000)
-                    print("✅ Closed a blocking modal dialog", flush=True)
-            except Exception:
-                pass
-            page.keyboard.press("Escape")
-            page.wait_for_timeout(500)
+            # modals — one may pop up after org selection and intercept clicks).
+            # Logs showed an nz-modal-container sitting inside a
+            # cdk-overlay-container that our old .ant-modal-close selector
+            # didn't match, so we now target that structure directly too and
+            # retry Escape a few times since one press isn't always enough. ---
+            for attempt in range(3):
+                try:
+                    modal_close = page.locator(
+                        ".ant-modal-close, .nz-modal-close, [class*='modal-close' i], "
+                        "button:has-text('Close'), button:has-text('OK'), "
+                        "button:has-text('Got it'), button:has-text('Dismiss')"
+                    ).first
+                    if modal_close.count() > 0:
+                        modal_close.click(timeout=3000)
+                        page.wait_for_timeout(800)
+                        print(f"✅ Closed a blocking modal dialog (attempt {attempt + 1})", flush=True)
+                except Exception:
+                    pass
+
+                page.keyboard.press("Escape")
+                page.wait_for_timeout(500)
+
+                # If an overlay/modal container is still present, click its
+                # backdrop to force it closed rather than waiting on a
+                # specific button that may not exist for this modal type
+                try:
+                    overlay = page.locator(".cdk-overlay-backdrop, nz-modal-container").first
+                    if overlay.count() == 0:
+                        break  # nothing left blocking — stop retrying
+                    backdrop = page.locator(".cdk-overlay-backdrop").first
+                    if backdrop.count() > 0:
+                        backdrop.click(timeout=2000, force=True)
+                        page.wait_for_timeout(500)
+                        print(f"✅ Clicked overlay backdrop to dismiss modal (attempt {attempt + 1})", flush=True)
+                except Exception:
+                    pass
 
             # --- Navigate to Bidding List via the Tenders nav link (client-side
             # routing — direct URL navigation to /egp/bids/all doesn't load the
             # real table, it just bounces back to the dashboard) ---
             try:
-                page.locator("text=Tenders").first.click(timeout=15000)
+                tenders_link = page.locator("text=Tenders").first
+                try:
+                    tenders_link.click(timeout=15000)
+                except Exception as click_err:
+                    # A leftover overlay can still intercept the click even
+                    # after the dismissal attempts above — force it through
+                    # rather than giving up the whole scan
+                    print(f"⚠️ Normal click on Tenders failed ({click_err}), forcing click", flush=True)
+                    tenders_link.click(timeout=10000, force=True)
                 page.wait_for_selector("text=/Bidding List/i", timeout=15000)
                 print("✅ Reached Bidding List view", flush=True)
             except Exception as e:
