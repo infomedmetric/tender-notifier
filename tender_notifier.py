@@ -8,7 +8,6 @@ from datetime import datetime
 from flask import Flask
 from playwright.sync_api import sync_playwright
 import urllib3
-import os
 from google import genai
 from google.genai import types
 
@@ -64,6 +63,7 @@ def analyze_tender_with_ai(raw_tender_text: str) -> str:
     except Exception as e:
         print(f"AI Generation failed: {e}")
         return fallback_text
+
 
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
