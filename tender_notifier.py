@@ -545,6 +545,9 @@ def scrape_egp():
                                     # No plain href — click the row to capture the
                                     # real URL the SPA navigates to, then go back and
                                     # restore the search filter
+                                                                        # No plain href — click the row to capture the
+                                    # real URL the SPA navigates to, then go back and
+                                    # restore the search filter
                                     if detail_link == EGP_BIDS_URL:
                                         try:
                                             row.click(timeout=8000)
@@ -565,24 +568,24 @@ def scrape_egp():
                                             detail_link = EGP_BIDS_URL
 
                                     # 1. Run the AI analysis using the function we built (passing the tender details)
-raw_text_payload = f"{title_text} {ref_no}"
-ai_summary = analyze_tender_with_ai(raw_text_payload)
+                                    raw_text_payload = f"{title_text} {ref_no}"
+                                    ai_summary = analyze_tender_with_ai(raw_text_payload)
 
-# 2. Construct the properly formatted multi-line WhatsApp alert string
-alert = (
-    f"🔔 *New Medical Tender Found (eGP)!*\n\n"
-    f"📋 *Title:* {title_text}\n"
-    f"📄 *Ref No:* {ref_no}\n\n"
-    f"🤖 *AI Analysis:*\n"
-    f"{ai_summary}\n\n"
-    f"🔗 *Link:* {detail_link}"
-)
-
+                                    # 2. Construct the properly formatted multi-line WhatsApp alert string
+                                    alert = (
+                                        f"🔔 *New Medical Tender Found (eGP)!*\n\n"
+                                        f"📋 *Title:* {title_text}\n"
+                                        f"📄 *Ref No:* {ref_no}\n\n"
+                                        f"🤖 *AI Analysis:*\n"
+                                        f"{ai_summary}\n\n"
+                                        f"🔗 *Link:* {detail_link}"
+                                    )
 
                                     send_whatsapp(alert)
                                     time.sleep(2)
                         except Exception:
                             continue
+
                 except Exception as e:
                     print(f"⚠️ eGP search for '{term}' failed: {e}", flush=True)
                     continue
