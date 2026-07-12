@@ -3,3 +3,4 @@ requests==2.34.2
 beautifulsoup4==4.15.0
 playwright==1.48.0
 psycopg2-binary
+google-genai
