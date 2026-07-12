@@ -8,6 +8,63 @@ from datetime import datetime
 from flask import Flask
 from playwright.sync_api import sync_playwright
 import urllib3
+import os
+from google import genai
+from google.genai import types
+
+def analyze_tender_with_ai(raw_tender_text: str) -> str:
+    """
+    Passes raw tender data to Gemini to handle translation, match scoring,
+    and constraint extraction in a single step.
+    """
+    # Fallback structure if the API call fails
+    fallback_text = "⚠️ [AI Analysis Unavailable due to a connection error]"
+    
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        print("Error: GEMINI_API_KEY environment variable is missing.")
+        return fallback_text
+
+    try:
+        # Initialize the official current client
+        client = genai.Client(api_key=api_key)
+        
+        # System instructions force the AI to behave like a strict procurement bot
+        system_instruction = (
+            "You are an expert procurement analyst specializing in Ethiopian medical and laboratory tenders. "
+            "Analyze the provided raw text and return a structured analysis matching the requested format. "
+            "Keep answers extremely concise so they fit perfectly on a mobile phone WhatsApp screen."
+        )
+        
+        prompt = f"""
+        Analyze this raw tender data and extract the details precisely. 
+        
+        Format your response exactly like this:
+        🌍 **Translation:** [If the text is in Amharic/Afan Oromo, translate the title & key scope to English. If already English, write "N/A (English)"]
+        🎯 **Match Score:** [X% - Provide a 1-sentence reason focusing on medical devices, laboratory reagents, CSSD, or water systems]
+        ⚠️ **Constraints:** [List any crucial requirements like bank guarantees/bid bonds, local agent rules, or specific manufacturer authorizations. If none, write "None identified"]
+        📅 **Closing Date:** [Extract deadline date and time. Keep it in East Africa Time (EAT)]
+        
+        Raw Tender Data:
+        {raw_tender_text}
+        """
+        
+        # Using gemini-2.5-flash as it is lightning fast, cheap, and has a huge context window for long texts
+        response = client.models.generate_content(
+            model='gemini-2.5-flash',
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                system_instruction=system_instruction,
+                temperature=0.2, # Low temperature ensures factual extraction instead of creative guessing
+            )
+        )
+        
+        return response.text if response.text else fallback_text
+
+    except Exception as e:
+        print(f"AI Generation failed: {e}")
+        return fallback_text
+
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -507,12 +564,21 @@ def scrape_egp():
                                             print(f"⚠️ Click-through for detail link failed: {e}", flush=True)
                                             detail_link = EGP_BIDS_URL
 
-                                    alert = (
-                                        f"🔔 *New Medical Tender Found (eGP)!*\n\n"
-                                        f"📋 *Title:* {title_text}\n"
-                                        f"🧾 *Ref No:* {ref_no}\n"
-                                        f"🔗 *Link:* {detail_link}"
-                                    )
+                                    # 1. Run the AI analysis using the function we built (passing the tender details)
+raw_text_payload = f"{title_text} {ref_no}"
+ai_summary = analyze_tender_with_ai(raw_text_payload)
+
+# 2. Construct the properly formatted multi-line WhatsApp alert string
+alert = (
+    f"🔔 *New Medical Tender Found (eGP)!*\n\n"
+    f"📋 *Title:* {title_text}\n"
+    f"📄 *Ref No:* {ref_no}\n\n"
+    f"🤖 *AI Analysis:*\n"
+    f"{ai_summary}\n\n"
+    f"🔗 *Link:* {detail_link}"
+)
+
+
                                     send_whatsapp(alert)
                                     time.sleep(2)
                         except Exception:
