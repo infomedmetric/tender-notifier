@@ -50,7 +50,7 @@ def analyze_tender_with_ai(raw_tender_text: str) -> str:
         
         # Using gemini-2.5-flash as it is lightning fast, cheap, and has a huge context window for long texts
         response = client.models.generate_content(
-            model='gemini-3.5-flash',
+            model='gemini-flash-latest',
             contents=prompt,
             config=types.GenerateContentConfig(
                 system_instruction=system_instruction,
