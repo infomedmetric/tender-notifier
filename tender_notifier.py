@@ -30,7 +30,7 @@ def analyze_tender_with_ai(raw_tender_text: str) -> str:
         
         # System instructions force the AI to behave like a strict procurement bot
         system_instruction = (
-            "You are an expert procurement analyst specializing in Ethiopian medical and laboratory tenders. "
+            "You are an expert procurement analyst specializing in Ethiopian medical equipment and medical equipment maintenance tenders. "
             "Analyze the provided raw text and return a structured analysis matching the requested format. "
             "Keep answers extremely concise so they fit perfectly on a mobile phone WhatsApp screen."
         )
@@ -39,8 +39,7 @@ def analyze_tender_with_ai(raw_tender_text: str) -> str:
         Analyze this raw tender data and extract the details precisely. 
         
         Format your response exactly like this:
-        🌍 **Translation:** [If the text is in Amharic/Afan Oromo, translate the title & key scope to English. If already English, write "N/A (English)"]
-        🎯 **Match Score:** [X% - Provide a 1-sentence reason focusing on medical devices, laboratory reagents, CSSD, or water systems]
+        🎯 **Match Score:** [X% - Provide a 1-sentence reason focusing on medical devices, medical equipment maintenance, Hemodialysis machines or water treatement systems]
         ⚠️ **Constraints:** [List any crucial requirements like bank guarantees/bid bonds, local agent rules, or specific manufacturer authorizations. If none, write "None identified"]
         📅 **Closing Date:** [Extract deadline date and time. Keep it in East Africa Time (EAT)]
         
