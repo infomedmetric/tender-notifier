@@ -16,7 +16,7 @@ EVOLUTION_BASE = os.environ.get("EVOLUTION_BASE", "https://medmetric-evolution.o
 INSTANCE_NAME = os.environ.get("INSTANCE_NAME", "Tender-Notifier.")
 GLOBAL_API_KEY = os.environ.get("GLOBAL_API_KEY", "143EC4F4C954-4014-BCCD-FC294B1A5609")
 WHATSAPP_NUMBERS = [
-    n.strip() for n in os.environ.get("WHATSAPP_NUMBERS", "251901748874").split(",") if n.strip()
+    n.strip() for n in os.environ.get("WHATSAPP_NUMBERS", "251711098777").split(",") if n.strip()
 ]
 
 MERKATO_USER = os.environ.get("MERKATO_USER")
