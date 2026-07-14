@@ -12,9 +12,9 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 app = Flask(__name__)
 
 # ================== CONFIGURATION ==================
-EVOLUTION_BASE = os.environ.get("EVOLUTION_BASE", "https://medmetric-evolution.onrender.com")
-INSTANCE_NAME = os.environ.get("INSTANCE_NAME", "Tender-Notifier.")
-GLOBAL_API_KEY = os.environ.get("GLOBAL_API_KEY", "143EC4F4C954-4014-BCCD-FC294B1A5609")
+EVOLUTION_BASE = os.environ.get("EVOLUTION_BASE")
+INSTANCE_NAME = os.environ.get("INSTANCE_NAME")
+GLOBAL_API_KEY = os.environ.get("GLOBAL_API_KEY")
 WHATSAPP_NUMBERS = [
     n.strip() for n in os.environ.get("WHATSAPP_NUMBERS", "251711098777").split(",") if n.strip()
 ]
