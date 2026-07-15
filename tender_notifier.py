@@ -72,7 +72,7 @@ app = Flask(__name__)
 # ================== CONFIGURATION ==================
 EVOLUTION_BASE = os.environ.get("EVOLUTION_BASE", "https://medmetric-evolution.onrender.com")
 INSTANCE_NAME = os.environ.get("INSTANCE_NAME", "Tender-Notifier.")
-GLOBAL_API_KEY = os.environ.get("GLOBAL_API_KEY", "143EC4F4C954-4014-BCCD-FC294B1A5609")
+GLOBAL_API_KEY = os.environ.get("GLOBAL_API_KEY", "3188E11B581D-4F13-AA7A-34B42BF995AA")
 WHATSAPP_NUMBERS = [
     n.strip() for n in os.environ.get("WHATSAPP_NUMBERS", "251901748874").split(",") if n.strip()
 ]
