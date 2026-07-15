@@ -16,7 +16,7 @@ EVOLUTION_BASE = os.environ.get("EVOLUTION_BASE")
 INSTANCE_NAME = os.environ.get("INSTANCE_NAME")
 GLOBAL_API_KEY = os.environ.get("GLOBAL_API_KEY")
 WHATSAPP_NUMBERS = [
-    n.strip() for n in os.environ.get("WHATSAPP_NUMBERS", "251711098777").split(",") if n.strip()
+    n.strip() for n in os.environ.get("WHATSAPP_NUMBERS", "251901748874").split(",") if n.strip()
 ]
 
 MERKATO_USER = os.environ.get("MERKATO_USER")
