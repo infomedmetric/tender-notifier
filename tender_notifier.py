@@ -130,9 +130,9 @@ def analyze_and_verify_tender_with_ai(title: str, context_details: str = "") -> 
             "closing_date": string (extracted closing date in East Africa Time, or "Unknown")
         }}
         """
-
+        # Update the model string to 'gemini-flash-latest' to automatically stay current
         response = client.models.generate_content(
-            model='gemini-2.5-flash',
+            model='gemini-flash-latest',
             contents=prompt,
             config=types.GenerateContentConfig(
                 system_instruction=system_instruction,
@@ -140,6 +140,7 @@ def analyze_and_verify_tender_with_ai(title: str, context_details: str = "") -> 
                 response_mime_type="application/json"
             )
         )
+
         
         if response.text:
             return json.loads(response.text)
