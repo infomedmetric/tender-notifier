@@ -3,9 +3,10 @@ import time
 import requests
 import threading
 import traceback
+import hmac
 import psycopg2
 from datetime import datetime
-from flask import Flask
+from flask import Flask, request
 from playwright.sync_api import sync_playwright
 import urllib3
 from google import genai
@@ -72,10 +73,26 @@ app = Flask(__name__)
 # ================== CONFIGURATION ==================
 EVOLUTION_BASE = os.environ.get("EVOLUTION_BASE", "https://medmetric-evolution.onrender.com")
 INSTANCE_NAME = os.environ.get("INSTANCE_NAME", "Tender-Notifier.")
-GLOBAL_API_KEY = os.environ.get("GLOBAL_API_KEY", "3188E11B581D-4F13-AA7A-34B42BF995AA")
+
+# SECURITY: no hardcoded fallback — a real API key must never live in source
+# code, especially in a public repo. If it's missing, we log a clear warning
+# at startup rather than silently sending requests with an empty key.
+GLOBAL_API_KEY = os.environ.get("GLOBAL_API_KEY")
+if not GLOBAL_API_KEY:
+    print("⚠️ GLOBAL_API_KEY is not set — WhatsApp sends will fail until it's configured in Render's environment variables.", flush=True)
+
+# SECURITY/PRIVACY: no hardcoded phone number — recipients must be supplied
+# via the WHATSAPP_NUMBERS env var (comma-separated).
 WHATSAPP_NUMBERS = [
-    n.strip() for n in os.environ.get("WHATSAPP_NUMBERS", "251901748874").split(",") if n.strip()
+    n.strip() for n in os.environ.get("WHATSAPP_NUMBERS", "").split(",") if n.strip()
 ]
+if not WHATSAPP_NUMBERS:
+    print("⚠️ WHATSAPP_NUMBERS is not set — no recipients configured.", flush=True)
+
+# Shared secret required to trigger a manual scan via /test-check. Without
+# this, anyone who discovers the public Render URL could trigger scans on
+# demand, burning your Gemini quota and spamming your WhatsApp numbers.
+TEST_CHECK_TOKEN = os.environ.get("TEST_CHECK_TOKEN")
 
 MERKATO_USER = os.environ.get("MERKATO_USER")
 MERKATO_PASS = os.environ.get("MERKATO_PASS")
@@ -228,15 +245,23 @@ def mark_as_notified(tender_id: str):
 
 
 def send_whatsapp(message):
+    if not GLOBAL_API_KEY or not WHATSAPP_NUMBERS:
+        print("❌ Cannot send WhatsApp message: GLOBAL_API_KEY or WHATSAPP_NUMBERS is not configured.", flush=True)
+        return
+
     url = f"{EVOLUTION_BASE}/message/sendText/{INSTANCE_NAME}"
     headers = {"Content-Type": "application/json", "apikey": GLOBAL_API_KEY}
     for number in WHATSAPP_NUMBERS:
         payload = {"number": number, "text": message}
         try:
             r = requests.post(url, json=payload, headers=headers, timeout=10)
-            print(f"✅ WhatsApp Status ({number}): {r.status_code}", flush=True)
+            # PRIVACY: mask most of the phone number in logs rather than
+            # printing it in full — logs can end up shared/exported more
+            # widely than intended
+            masked = number[:5] + "***" + number[-2:] if len(number) > 7 else "***"
+            print(f"✅ WhatsApp Status ({masked}): {r.status_code}", flush=True)
         except Exception as e:
-            print(f"❌ Send error ({number}): {e}", flush=True)
+            print(f"❌ Send error: {e}", flush=True)
 
 
 # ==================== ENGINE: 2MERKATO (Playwright) ====================
@@ -641,6 +666,16 @@ def home():
 
 @app.route('/test-check')
 def manual_test():
+    # SECURITY: without this check, anyone who finds the public Render URL
+    # could trigger a scan on demand — burning Gemini API quota and sending
+    # WhatsApp messages at will. Require a shared secret token to proceed.
+    if not TEST_CHECK_TOKEN:
+        return "Manual trigger is disabled: TEST_CHECK_TOKEN is not configured.", 503
+
+    provided_token = request.args.get("token", "")
+    if not hmac.compare_digest(provided_token, TEST_CHECK_TOKEN):
+        return "Unauthorized", 401
+
     threading.Thread(target=check_for_tenders).start()
     return "Scraper sync cycle triggered!", 200
 
