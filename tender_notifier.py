@@ -532,5 +532,5 @@ init_db()
 if __name__ == "__main__":
     # Standard Flask production loop setup without Gunicorn requirement
     threading.Thread(target=monitoring_loop, daemon=True).start()
-    port = int(os.environ.get("PORT", 10000))
+    port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, use_reloader=False)
