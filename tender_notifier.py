@@ -40,15 +40,15 @@ def analyze_tender_with_ai(raw_tender_text: str) -> str:
         Analyze this raw tender data and extract the details precisely. 
         
         Format your response exactly like this:
-        🎯 **Match Score:** [X% - Provide a 1-sentence reason focusing on medical devices, medical equipment maintenance, Hemodialysis machines or water treatement systems]
-        ⚠️ **Constraints:** [List any crucial requirements like bank guarantees/bid bonds, local agent rules, or specific manufacturer authorizations. If none, write "None identified"]
-        📅 **Closing Date:** [Extract deadline date and time. Keep it in East Africa Time (EAT)]
+        🎯 **Match Score:** [X% - Provide a 1 line-sentence reason focusing on medical devices, medical equipment maintenance, Hemodialysis machines maintenance or service or water treatement systems or any other related fields.]
+        ⚠️ **Constraints:** [List any crucial requirements like bid security amount or bank guarantees/bid bonds, Eligibility Documents, or specific manufacturer authorizations. If none, write "None"]
+        📅 **Closing Date:** [Extract Bid submission deadline date and time. Keep it in East Africa Time (EAT)]
         
         Raw Tender Data:
         {raw_tender_text}
         """
         
-        # Using gemini-2.5-flash as it is lightning fast, cheap, and has a huge context window for long texts
+        # Using gemini-latest-flash as it is lightning fast, cheap, and has a huge context window for long texts
         response = client.models.generate_content(
             model='gemini-flash-latest',
             contents=prompt,
@@ -79,7 +79,7 @@ INSTANCE_NAME = os.environ.get("INSTANCE_NAME", "Tender-Notifier.")
 # at startup rather than silently sending requests with an empty key.
 GLOBAL_API_KEY = os.environ.get("GLOBAL_API_KEY")
 if not GLOBAL_API_KEY:
-    print("⚠️ GLOBAL_API_KEY is not set — WhatsApp sends will fail until it's configured in Render's environment variables.", flush=True)
+    print("⚠️ GLOBAL_API_KEY is not set — WhatsApp sends will fail until it's configured in VPS environment variables.", flush=True)
 
 # SECURITY/PRIVACY: no hardcoded phone number — recipients must be supplied
 # via the WHATSAPP_NUMBERS env var (comma-separated).
@@ -101,7 +101,7 @@ MERKATO_PASS = os.environ.get("MERKATO_PASS")
 MERKATO_BASE = "https://tender.2merkato.com"
 MERKATO_LOGIN_URL = f"{MERKATO_BASE}/login"
 MERKATO_TENDERS_URL = f"{MERKATO_BASE}/tenders"
-MERKATO_MAX_PAGES = int(os.environ.get("MERKATO_MAX_PAGES", "3"))
+MERKATO_MAX_PAGES = int(os.environ.get("MERKATO_MAX_PAGES", "5"))
 
 EGP_BASE = "https://production.egp.gov.et"
 EGP_LOGIN_URL = f"{EGP_BASE}/egp/login"
@@ -113,22 +113,22 @@ EGP_ORG_NAME = os.environ.get("EGP_ORG_NAME", "Medmetric")
 # Search terms fed one at a time into eGP's own built-in table search box —
 # far more reliable than scraping every row across 13+ pages
 EGP_SEARCH_TERMS = [
-    "medical", "biomedical", "hemodialysis", "dialysis",
-    "laboratory equipment", "hospital equipment", "x-ray", "ultrasound"
+    "medical", "biomedical", "hemodialysis", "dialysis", "medical equipment maintenance",
+    "medical equipment", "hospital equipment", "x-ray", "ultrasound", "ICB", "water tratement" 
 ]
 
 # Any ONE of these alone is specific enough to trigger a match
 STRONG_KEYWORDS = [
-    "biomedical", "hemodialysis", "dialysis", "b.braun", "dialog+",
+    "biomedical", "hemodialysis", "dialysis", "bbraun", "dialog", "radiology","ICB", "Water Treatment",
     "x-ray", "xray", "ultrasound", "ventilator", "autoclave", "sterilizer",
     "diagnostic equipment", "medical equipment", "hospital equipment",
-    "laboratory equipment", "medical device", "የህክምና", "ጥገና"
+    "medical equipment maintenance", "medical device", "የህክምና", "ጥገና"
 ]
 
 # Generic medical-adjacent words — only count if paired with an equipment/
 # procurement-type word in the same title (avoids matching HR/insurance/
 # consulting tenders that merely mention "health")
-MEDICAL_CONTEXT = ["medical", "health", "hospital", "biomedical", "clinical", "laboratory"]
+MEDICAL_CONTEXT = ["medical", "health", "hospital", "biomedical", "clinical", "Corrective maintenance"]
 EQUIPMENT_CONTEXT = ["equipment", "supplies", "supply", "device", "machine",
                      "instrument", "apparatus", "maintenance", "repair", "procurement"]
 
@@ -136,7 +136,7 @@ EQUIPMENT_CONTEXT = ["equipment", "supplies", "supply", "device", "machine",
 # recurring false-positive categories (vehicle maintenance, insurance, consulting)
 EXCLUDE_TERMS = [
     "vehicle", "toyota", "car ", "motorbike", "insurance", "life insurance",
-    "term life", "gpa", "consultancy services", "consulting firm"
+    "term life", "gpa", "laboratory", "consulting firm"
 ]
 
 
