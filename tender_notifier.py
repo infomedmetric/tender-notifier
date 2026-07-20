@@ -71,7 +71,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 app = Flask(__name__)
 
 # ================== CONFIGURATION ==================
-EVOLUTION_BASE = os.environ.get("EVOLUTION_BASE", "https://medmetric-evolution.onrender.com")
+EVOLUTION_BASE = os.environ.get("EVOLUTION_BASE", "https://evolution-api-elhy.onrender.com")
 INSTANCE_NAME = os.environ.get("INSTANCE_NAME", "Tender-Notifier.")
 
 # SECURITY: no hardcoded fallback — a real API key must never live in source
