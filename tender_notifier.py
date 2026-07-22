@@ -40,15 +40,15 @@ def analyze_tender_with_ai(raw_tender_text: str) -> str:
         Analyze this raw tender data and extract the details precisely. 
         
         Format your response exactly like this:
-        🎯 Match Score: [X% - Provide a 1 line-sentence reason focusing on medical devices, medical equipment maintenance, Hemodialysis machines maintenance or service or water treatement systems or any other related fields.]
-        ⚠️ Constraints: [List any crucial requirements like bid security amount or bank guarantees/bid bonds, Eligibility Documents, or specific manufacturer authorizations from the page. If none, write "None"]
-        📅 Closing Date: [Extract Bid submission deadline date and time. Keep it in East Africa Time (EAT)]
+        🎯 **Match Score:** [X% - Provide a 1-sentence reason focusing on medical devices, medical equipment maintenance, Hemodialysis machines or water treatement systems]
+        ⚠️ **Constraints:** [List any crucial requirements like bank guarantees/bid bonds, local agent rules, or specific manufacturer authorizations. If none, write "None identified"]
+        📅 **Closing Date:** [Extract deadline date and time. Keep it in East Africa Time (EAT)]
         
         Raw Tender Data:
         {raw_tender_text}
         """
         
-        # Using gemini-latest-flash as it is lightning fast, cheap, and has a huge context window for long texts
+        # Using gemini-2.5-flash as it is lightning fast, cheap, and has a huge context window for long texts
         response = client.models.generate_content(
             model='gemini-flash-latest',
             contents=prompt,
@@ -66,12 +66,51 @@ def analyze_tender_with_ai(raw_tender_text: str) -> str:
 
 
 
+def ai_confirm_relevance(raw_tender_text: str) -> bool:
+    """
+    Second-stage check: even after keyword filtering, ask Gemini to confirm
+    a tender is genuinely relevant before we spend a WhatsApp message on it.
+    Defaults to trusting the keyword filter if the AI call fails, so a
+    Gemini outage never blocks legitimate notifications.
+    """
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        return True
+
+    try:
+        client = genai.Client(api_key=api_key)
+        prompt = f"""
+        You are a strict relevance filter for Medmetric Healthcare, an Ethiopian
+        medical equipment supplier and biomedical maintenance company.
+
+        Is this tender clearly relevant to ANY of: medical equipment supply,
+        medical equipment maintenance/repair, biomedical engineering,
+        hemodialysis machines or water treatment systems, medical equipment
+        consultancy, or a medical-related ICB (International Competitive Bid)
+        tender?
+
+        Reply with EXACTLY one word: YES or NO.
+
+        Tender: {raw_tender_text}
+        """
+        response = client.models.generate_content(
+            model='gemini-flash-latest',
+            contents=prompt,
+            config=types.GenerateContentConfig(temperature=0.0),
+        )
+        answer = (response.text or "").strip().upper()
+        return answer.startswith("Y")
+    except Exception as e:
+        print(f"⚠️ AI relevance check failed, defaulting to keyword match result: {e}", flush=True)
+        return True
+
+
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 app = Flask(__name__)
 
 # ================== CONFIGURATION ==================
-EVOLUTION_BASE = os.environ.get("EVOLUTION_BASE", "https://evolution-api-elhy.onrender.com")
+EVOLUTION_BASE = os.environ.get("EVOLUTION_BASE", "https://medmetric-evolution.onrender.com")
 INSTANCE_NAME = os.environ.get("INSTANCE_NAME", "Tender-Notifier.")
 
 # SECURITY: no hardcoded fallback — a real API key must never live in source
@@ -79,7 +118,7 @@ INSTANCE_NAME = os.environ.get("INSTANCE_NAME", "Tender-Notifier.")
 # at startup rather than silently sending requests with an empty key.
 GLOBAL_API_KEY = os.environ.get("GLOBAL_API_KEY")
 if not GLOBAL_API_KEY:
-    print("⚠️ GLOBAL_API_KEY is not set — WhatsApp sends will fail until it's configured in VPS environment variables.", flush=True)
+    print("⚠️ GLOBAL_API_KEY is not set — WhatsApp sends will fail until it's configured in Render's environment variables.", flush=True)
 
 # SECURITY/PRIVACY: no hardcoded phone number — recipients must be supplied
 # via the WHATSAPP_NUMBERS env var (comma-separated).
@@ -101,7 +140,7 @@ MERKATO_PASS = os.environ.get("MERKATO_PASS")
 MERKATO_BASE = "https://tender.2merkato.com"
 MERKATO_LOGIN_URL = f"{MERKATO_BASE}/login"
 MERKATO_TENDERS_URL = f"{MERKATO_BASE}/tenders"
-MERKATO_MAX_PAGES = int(os.environ.get("MERKATO_MAX_PAGES", "5"))
+MERKATO_MAX_PAGES = int(os.environ.get("MERKATO_MAX_PAGES", "4"))
 
 EGP_BASE = "https://production.egp.gov.et"
 EGP_LOGIN_URL = f"{EGP_BASE}/egp/login"
@@ -113,44 +152,56 @@ EGP_ORG_NAME = os.environ.get("EGP_ORG_NAME", "Medmetric")
 # Search terms fed one at a time into eGP's own built-in table search box —
 # far more reliable than scraping every row across 13+ pages
 EGP_SEARCH_TERMS = [
-    "medical", "biomedical", "hemodialysis", "dialysis", "medical equipment maintenance",
-    "medical equipment", "hospital equipment", "x-ray", "ultrasound", "ICB", "water tratement","CT Scan"
+    "medical", "biomedical", "hemodialysis", "dialysis",
+    "laboratory equipment", "hospital equipment", "x-ray", "ultrasound"
 ]
 
 # Any ONE of these alone is specific enough to trigger a match
 STRONG_KEYWORDS = [
-    "biomedical", "hemodialysis", "dialysis", "bbraun", "dialog", "radiology","ICB", "Water Treatment",
+    "biomedical", "hemodialysis", "dialysis", "b.braun", "dialog+",
     "x-ray", "xray", "ultrasound", "ventilator", "autoclave", "sterilizer",
-    "diagnostic equipment", "medical equipment", "hospital equipment", "ዲያሊሲስ", 
-    "medical equipment maintenance", "medical device", "የህክምና መሳሪያ ", "ህክምና መሳሪያ ጥገና"
+    "diagnostic equipment", "medical equipment", "hospital equipment",
+    "laboratory equipment", "medical device", "የህክምና", "ጥገና"
 ]
 
 # Generic medical-adjacent words — only count if paired with an equipment/
 # procurement-type word in the same title (avoids matching HR/insurance/
 # consulting tenders that merely mention "health")
-MEDICAL_CONTEXT = ["medical", "health", "hospital", "biomedical", "clinical", "Corrective maintenance"]
+MEDICAL_CONTEXT = ["medical", "health", "hospital", "biomedical", "clinical", "laboratory"]
 EQUIPMENT_CONTEXT = ["equipment", "supplies", "supply", "device", "machine",
-                     "instrument", "apparatus", "maintenance", "repair", "procurement"]
+                     "instrument", "apparatus", "maintenance", "repair", "procurement",
+                     "consulting", "consultancy", "icb"]
 
-# If any of these appear, skip regardless of other matches — these are the
-# recurring false-positive categories (vehicle maintenance, insurance, consulting)
-EXCLUDE_TERMS = [
+# Always excluded regardless of context — these categories are never
+# relevant to Medmetric no matter what else appears in the title
+HARD_EXCLUDE_TERMS = [
     "vehicle", "toyota", "car ", "motorbike", "insurance", "life insurance",
-    "term life", "gpa", "laboratory", "consulting firm", "building maintenance",
+    "term life", "gpa"
 ]
+
+# Excluded UNLESS the title also shows clear medical + equipment context —
+# generic "consultancy services" for HR/finance/etc. should be skipped, but
+# "medical equipment consultancy services" should NOT be, since Medmetric
+# offers exactly that
+CONTEXTUAL_EXCLUDE_TERMS = ["consultancy services", "consulting firm"]
 
 
 def is_relevant_tender(title):
     title_lower = title.lower()
 
-    if any(term in title_lower for term in EXCLUDE_TERMS):
+    if any(term in title_lower for term in HARD_EXCLUDE_TERMS):
         return False
-
-    if any(term in title_lower for term in STRONG_KEYWORDS):
-        return True
 
     has_medical_context = any(term in title_lower for term in MEDICAL_CONTEXT)
     has_equipment_context = any(term in title_lower for term in EQUIPMENT_CONTEXT)
+
+    if any(term in title_lower for term in CONTEXTUAL_EXCLUDE_TERMS):
+        if not (has_medical_context and has_equipment_context):
+            return False
+        # else: it's medical-equipment consultancy — fall through, don't exclude
+
+    if any(term in title_lower for term in STRONG_KEYWORDS):
+        return True
 
     return has_medical_context and has_equipment_context
 
@@ -351,9 +402,23 @@ def scrape_2merkato():
                         if is_relevant_tender(title_text):
                             tender_id = f"merkato_{full_link.rstrip('/').split('/')[-1]}"
                             if not is_already_notified(tender_id):
-                                found += 1
+                                # Mark as notified immediately regardless of the AI
+                                # verdict — prevents re-checking (and re-spending
+                                # Gemini quota on) the same tender every 4 hours
                                 mark_as_notified(tender_id)
-                                alert = f"🔔 *New Medical Tender Found!*\n\n📋 *Title:* {title_text}\n🔗 *Link:* {full_link}"
+
+                                if not ai_confirm_relevance(title_text):
+                                    print(f"🤖 AI rejected as not relevant, skipping alert: {title_text}", flush=True)
+                                    continue
+
+                                found += 1
+                                ai_summary = analyze_tender_with_ai(title_text)
+                                alert = (
+                                    f"🔔 *New Medical Tender Found!*\n\n"
+                                    f"📋 *Title:* {title_text}\n"
+                                    f"🤖 *AI Summary:* {ai_summary}\n"
+                                    f"🔗 *Link:* {full_link}"
+                                )
                                 send_whatsapp(alert)
                                 time.sleep(2)
                     except Exception:
@@ -417,6 +482,24 @@ def scrape_egp():
                         page.wait_for_timeout(4000)
                         current_url = page.url
                         print(f"✅ eGP login submitted, current URL: {current_url}", flush=True)
+
+                        if "/login" in current_url:
+                            # Still on the login page — the login itself
+                            # failed (bad credentials, site-side validation
+                            # error, etc). Surface whatever error message the
+                            # page is showing and abort this scan cleanly
+                            # rather than timing out repeatedly on a
+                            # "Tenders" link that will never appear.
+                            try:
+                                error_text = page.locator(
+                                    "[class*='error' i], [class*='alert' i], [role='alert'], "
+                                    "text=/invalid/i, text=/incorrect/i, text=/failed/i"
+                                ).first.inner_text(timeout=3000)
+                            except Exception:
+                                error_text = "(no visible error message found on page)"
+                            print(f"❌ eGP login failed — still on login page. On-page message: {error_text}", flush=True)
+                            browser.close()
+                            return 0
 
                         if "organization-selector" in current_url:
                             try:
@@ -550,8 +633,17 @@ def scrape_egp():
                             if is_relevant_tender(title_text):
                                 tender_id = f"egp_{ref_no or title_text}"
                                 if not is_already_notified(tender_id):
-                                    found += 1
+                                    # Mark as notified immediately regardless of the
+                                    # AI verdict — prevents re-checking (and
+                                    # re-spending Gemini quota on) the same tender
+                                    # every 4 hours
                                     mark_as_notified(tender_id)
+
+                                    if not ai_confirm_relevance(f"{title_text} {ref_no}"):
+                                        print(f"🤖 AI rejected as not relevant, skipping alert: {title_text}", flush=True)
+                                        continue
+
+                                    found += 1
 
                                     # Try a plain anchor href inside the row first —
                                     # cheap, no navigation needed
@@ -567,9 +659,6 @@ def scrape_egp():
                                         pass
 
                                     # No plain href — click the row to capture the
-                                    # real URL the SPA navigates to, then go back and
-                                    # restore the search filter
-                                                                        # No plain href — click the row to capture the
                                     # real URL the SPA navigates to, then go back and
                                     # restore the search filter
                                     if detail_link == EGP_BIDS_URL:
@@ -598,9 +687,9 @@ def scrape_egp():
                                     # 2. Construct the properly formatted multi-line WhatsApp alert string
                                     alert = (
                                         f"🔔 *New Medical Tender Found (eGP)!*\n\n"
-                                        f"📋 Title: {title_text}\n"
-                                        f"📄 Ref No: {ref_no}\n\n"
-                                        f"🤖 AI Analysis:\n"
+                                        f"📋 *Title:* {title_text}\n"
+                                        f"📄 *Ref No:* {ref_no}\n\n"
+                                        f"🤖 *AI Analysis:*\n"
                                         f"{ai_summary}\n\n"
                                         f"🔗 *Link:* {detail_link}"
                                     )
@@ -655,7 +744,7 @@ def monitoring_loop():
         except Exception:
             print("❌ check_for_tenders crashed at the top level:", flush=True)
             print(traceback.format_exc(), flush=True)
-        time.sleep(6 * 3600)
+        time.sleep(4 * 3600)
 
 
 # ==================== FLASK ROUTES ====================
