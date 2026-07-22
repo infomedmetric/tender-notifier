@@ -40,9 +40,9 @@ def analyze_tender_with_ai(raw_tender_text: str) -> str:
         Analyze this raw tender data and extract the details precisely. 
         
         Format your response exactly like this:
-        🎯 **Match Score:** [X% - Provide a 1 line-sentence reason focusing on medical devices, medical equipment maintenance, Hemodialysis machines maintenance or service or water treatement systems or any other related fields.]
-        ⚠️ **Constraints:** [List any crucial requirements like bid security amount or bank guarantees/bid bonds, Eligibility Documents, or specific manufacturer authorizations. If none, write "None"]
-        📅 **Closing Date:** [Extract Bid submission deadline date and time. Keep it in East Africa Time (EAT)]
+        🎯 Match Score: [X% - Provide a 1 line-sentence reason focusing on medical devices, medical equipment maintenance, Hemodialysis machines maintenance or service or water treatement systems or any other related fields.]
+        ⚠️ Constraints: [List any crucial requirements like bid security amount or bank guarantees/bid bonds, Eligibility Documents, or specific manufacturer authorizations from the page. If none, write "None"]
+        📅 Closing Date: [Extract Bid submission deadline date and time. Keep it in East Africa Time (EAT)]
         
         Raw Tender Data:
         {raw_tender_text}
@@ -114,15 +114,15 @@ EGP_ORG_NAME = os.environ.get("EGP_ORG_NAME", "Medmetric")
 # far more reliable than scraping every row across 13+ pages
 EGP_SEARCH_TERMS = [
     "medical", "biomedical", "hemodialysis", "dialysis", "medical equipment maintenance",
-    "medical equipment", "hospital equipment", "x-ray", "ultrasound", "ICB", "water tratement" 
+    "medical equipment", "hospital equipment", "x-ray", "ultrasound", "ICB", "water tratement","CT Scan"
 ]
 
 # Any ONE of these alone is specific enough to trigger a match
 STRONG_KEYWORDS = [
     "biomedical", "hemodialysis", "dialysis", "bbraun", "dialog", "radiology","ICB", "Water Treatment",
     "x-ray", "xray", "ultrasound", "ventilator", "autoclave", "sterilizer",
-    "diagnostic equipment", "medical equipment", "hospital equipment",
-    "medical equipment maintenance", "medical device", "የህክምና", "ጥገና"
+    "diagnostic equipment", "medical equipment", "hospital equipment", "ዲያሊሲስ", 
+    "medical equipment maintenance", "medical device", "የህክምና መሳሪያ ", "ህክምና መሳሪያ ጥገና"
 ]
 
 # Generic medical-adjacent words — only count if paired with an equipment/
@@ -136,7 +136,7 @@ EQUIPMENT_CONTEXT = ["equipment", "supplies", "supply", "device", "machine",
 # recurring false-positive categories (vehicle maintenance, insurance, consulting)
 EXCLUDE_TERMS = [
     "vehicle", "toyota", "car ", "motorbike", "insurance", "life insurance",
-    "term life", "gpa", "laboratory", "consulting firm"
+    "term life", "gpa", "laboratory", "consulting firm", "building maintenance",
 ]
 
 
@@ -598,9 +598,9 @@ def scrape_egp():
                                     # 2. Construct the properly formatted multi-line WhatsApp alert string
                                     alert = (
                                         f"🔔 *New Medical Tender Found (eGP)!*\n\n"
-                                        f"📋 *Title:* {title_text}\n"
-                                        f"📄 *Ref No:* {ref_no}\n\n"
-                                        f"🤖 *AI Analysis:*\n"
+                                        f"📋 Title: {title_text}\n"
+                                        f"📄 Ref No: {ref_no}\n\n"
+                                        f"🤖 AI Analysis:\n"
                                         f"{ai_summary}\n\n"
                                         f"🔗 *Link:* {detail_link}"
                                     )
@@ -655,7 +655,7 @@ def monitoring_loop():
         except Exception:
             print("❌ check_for_tenders crashed at the top level:", flush=True)
             print(traceback.format_exc(), flush=True)
-        time.sleep(4 * 3600)
+        time.sleep(6 * 3600)
 
 
 # ==================== FLASK ROUTES ====================
