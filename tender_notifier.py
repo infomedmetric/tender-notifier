@@ -680,11 +680,43 @@ def scrape_egp():
                                             print(f"⚠️ Click-through for detail link failed: {e}", flush=True)
                                             detail_link = EGP_BIDS_URL
 
-                                    # 1. Run the AI analysis using the function we built (passing the tender details)
-                                    raw_text_payload = f"{title_text} {ref_no}"
+                                    # 1. Fetch the actual detail page text — the title/ref_no
+                                    # alone never contain closing date, bid bond, or
+                                    # eligibility info, which is why those fields were
+                                    # always coming back "not specified." We open the
+                                    # detail page in a SEPARATE tab so we never disturb
+                                    # the main page's search box / filtered results.
+                                    detail_text = ""
+                                    if detail_link and detail_link != EGP_BIDS_URL:
+                                        detail_page = None
+                                        try:
+                                            detail_page = context.new_page()
+                                            detail_page.goto(detail_link, timeout=20000, wait_until="domcontentloaded")
+                                            # Angular SPA detail views render fields async —
+                                            # give it a moment before reading the DOM
+                                            detail_page.wait_for_timeout(3000)
+                                            detail_text = detail_page.locator("body").inner_text(timeout=5000)
+                                            # Trim to a sane size — some detail pages include
+                                            # long boilerplate/nav text we don't need to send
+                                            # to Gemini, and it wastes tokens/quota
+                                            detail_text = detail_text[:6000]
+                                            print(f"📄 Captured {len(detail_text)} chars from eGP detail page", flush=True)
+                                        except Exception as e:
+                                            print(f"⚠️ Could not read eGP detail page text: {e}", flush=True)
+                                        finally:
+                                            if detail_page is not None:
+                                                try:
+                                                    detail_page.close()
+                                                except Exception:
+                                                    pass
+
+                                    # 2. Run the AI analysis using the function we built,
+                                    # now backed by real detail-page content instead of
+                                    # just the title and ref number
+                                    raw_text_payload = f"{title_text} {ref_no}\n\n{detail_text}".strip()
                                     ai_summary = analyze_tender_with_ai(raw_text_payload)
 
-                                    # 2. Construct the properly formatted multi-line WhatsApp alert string
+                                    # 3. Construct the properly formatted multi-line WhatsApp alert string
                                     alert = (
                                         f"🔔 *New Medical Tender Found (eGP)!*\n\n"
                                         f"📋 *Title:* {title_text}\n"
