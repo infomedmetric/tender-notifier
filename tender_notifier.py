@@ -776,7 +776,7 @@ def monitoring_loop():
         except Exception:
             print("❌ check_for_tenders crashed at the top level:", flush=True)
             print(traceback.format_exc(), flush=True)
-        time.sleep(4 * 3600)
+        time.sleep(6 * 3600)
 
 
 # ==================== FLASK ROUTES ====================
