@@ -31,7 +31,14 @@ def analyze_tender_with_ai(raw_tender_text: str) -> str:
         
         # System instructions force the AI to behave like a strict procurement bot
         system_instruction = (
-            "You are an expert procurement analyst specializing in Ethiopian medical equipment and medical equipment maintenance tenders. "
+            "You are an expert procurement analyst for medMETRIC Healthcare Service PLC, "
+            "an Ethiopian biomedical engineering and technical-services company. Their scope "
+            "covers: medical equipment maintenance & service contracts (including hemodialysis "
+            "systems like B.Braun Dialog+ and SWS-4000A), RO/water treatment systems, CSSD & "
+            "sterilization equipment (e.g. Rivamed), calibration & compliance testing of "
+            "diagnostic/therapeutic equipment, medical imaging equipment, spare-parts sourcing, "
+            "and general medical equipment supply/consultancy. They do NOT supply medicines, "
+            "pharmaceuticals, vaccines, or laboratory-only equipment/reagents. "
             "Analyze the provided raw text and return a structured analysis matching the requested format. "
             "Keep answers extremely concise so they fit perfectly on a mobile phone WhatsApp screen."
         )
@@ -40,7 +47,7 @@ def analyze_tender_with_ai(raw_tender_text: str) -> str:
         Analyze this raw tender data and extract the details precisely. 
         
         Format your response exactly like this:
-        🎯 **Match Score:** [X% - Provide a 1-sentence reason focusing on medical devices, medical equipment maintenance, Hemodialysis machines or water treatement systems]
+        🎯 **Match Score:** [X% - Provide a 1-sentence reason judged against medMETRIC's full scope: equipment maintenance/service contracts, calibration, CSSD/sterilization, RO/water treatment, medical imaging, spare parts, or general medical equipment supply — not hemodialysis alone. If this is actually a pure medicine/pharmaceutical or laboratory-only tender, score it low and say so explicitly]
         ⚠️ **Constraints:** [List any crucial requirements like bank guarantees/bid bonds, local agent rules, or specific manufacturer authorizations. If none, write "None identified"]
         📅 **Closing Date:** [Extract deadline date and time. Keep it in East Africa Time (EAT)]
         
@@ -80,14 +87,20 @@ def ai_confirm_relevance(raw_tender_text: str) -> bool:
     try:
         client = genai.Client(api_key=api_key)
         prompt = f"""
-        You are a strict relevance filter for Medmetric Healthcare, an Ethiopian
-        medical equipment supplier and biomedical maintenance company.
+        You are a strict relevance filter for medMETRIC Healthcare, an Ethiopian
+        biomedical engineering and technical-services company.
 
         Is this tender clearly relevant to ANY of: medical equipment supply,
-        medical equipment maintenance/repair, biomedical engineering,
-        hemodialysis machines or water treatment systems, medical equipment
-        consultancy, or a medical-related ICB (International Competitive Bid)
-        tender?
+        medical equipment maintenance/repair/service contracts, biomedical
+        engineering, hemodialysis machines, RO/water treatment systems,
+        CSSD/sterilization equipment, calibration & compliance testing of
+        medical equipment, medical imaging equipment, spare parts for medical
+        equipment, medical equipment consultancy, or a medical-equipment-related
+        ICB (International Competitive Bid) tender?
+
+        Answer NO if the tender is primarily about: medicines, pharmaceuticals,
+        vaccines, or laboratory-only equipment/reagents/consumables — medMETRIC
+        does not supply those, even though they may mention "medical" in passing.
 
         Reply with EXACTLY one word: YES or NO.
 
@@ -150,33 +163,52 @@ EGP_PASS = os.environ.get("EGP_PASS")
 EGP_ORG_NAME = os.environ.get("EGP_ORG_NAME", "Medmetric")
 
 # Search terms fed one at a time into eGP's own built-in table search box —
-# far more reliable than scraping every row across 13+ pages
+# far more reliable than scraping every row across 13+ pages.
+# Rebuilt around medMETRIC's actual service lines (medmetrichealthcare.com):
+# maintenance/service contracts, RO water treatment, CSSD/sterilization,
+# and calibration — not just dialysis. "laboratory" intentionally dropped —
+# lab-only tenders are explicitly out of scope.
 EGP_SEARCH_TERMS = [
-    "medical", "biomedical", "hemodialysis", "dialysis",
-    "laboratory equipment", "hospital equipment", "x-ray", "ultrasound"
+    "medical equipment", "biomedical", "hemodialysis", "dialysis",
+    "calibration", "sterilization", "water treatment", "hospital equipment",
+    "x-ray", "ultrasound", "medical imaging", "spare parts"
 ]
 
-# Any ONE of these alone is specific enough to trigger a match
+# Any ONE of these alone is specific enough to trigger a match.
+# Includes medMETRIC's actual named service lines (CSSD, RO/water treatment,
+# calibration, spare parts, biomedical engineering) so tenders aren't
+# under-scored just because they're not dialysis-specific.
 STRONG_KEYWORDS = [
-    "biomedical", "hemodialysis", "dialysis", "b.braun", "dialog+",
+    "biomedical", "hemodialysis", "dialysis", "b.braun", "dialog+", "sws-4000a",
     "x-ray", "xray", "ultrasound", "ventilator", "autoclave", "sterilizer",
+    "sterilization", "sterile processing", "cssd", "rivamed",
+    "reverse osmosis", "ro system", "water treatment", "spare parts",
+    "biomedical engineering", "medical imaging", "calibration",
     "diagnostic equipment", "medical equipment", "hospital equipment",
-    "laboratory equipment", "medical device", "የህክምና", "ጥገና"
+    "medical device", "የህክምና", "ጥገና"
 ]
 
 # Generic medical-adjacent words — only count if paired with an equipment/
 # procurement-type word in the same title (avoids matching HR/insurance/
-# consulting tenders that merely mention "health")
-MEDICAL_CONTEXT = ["medical", "health", "hospital", "biomedical", "clinical", "laboratory"]
+# consulting tenders that merely mention "health"). "laboratory" removed —
+# lab-only tenders are handled by HARD_EXCLUDE_TERMS below instead.
+MEDICAL_CONTEXT = ["medical", "health", "hospital", "biomedical", "clinical"]
 EQUIPMENT_CONTEXT = ["equipment", "supplies", "supply", "device", "machine",
                      "instrument", "apparatus", "maintenance", "repair", "procurement",
+                     "calibration", "installation", "servicing", "spare parts",
                      "consulting", "consultancy", "icb"]
 
 # Always excluded regardless of context — these categories are never
-# relevant to Medmetric no matter what else appears in the title
+# relevant to Medmetric no matter what else appears in the title.
+# Laboratory-only tenders and pure medicine/pharmaceutical supply tenders
+# (e.g. "RDF Medicines...") are explicitly out of scope — medMETRIC is a
+# biomedical engineering/technical-service company, not a drug supplier.
 HARD_EXCLUDE_TERMS = [
     "vehicle", "toyota", "car ", "motorbike", "insurance", "life insurance",
-    "term life", "gpa"
+    "term life", "gpa",
+    "laboratory", "lab reagent", "reagent", "lab equipment",
+    "medicine", "medicines", "pharmaceutical", "pharmaceuticals",
+    "drug", "drugs", "vaccine", "vaccines", "rdf medicine", "rdf medicines"
 ]
 
 # Excluded UNLESS the title also shows clear medical + equipment context —
@@ -412,7 +444,44 @@ def scrape_2merkato():
                                     continue
 
                                 found += 1
-                                ai_summary = analyze_tender_with_ai(title_text)
+
+                                # Fetch the actual detail page — the listing title alone
+                                # never contains the submission deadline, which is why
+                                # closing date kept coming back "not specified." Open it
+                                # in a SEPARATE tab so we don't disturb pagination state
+                                # on the main listing page.
+                                detail_text = ""
+                                detail_page = None
+                                try:
+                                    detail_page = context.new_page()
+                                    detail_page.goto(full_link, timeout=20000, wait_until="domcontentloaded")
+                                    try:
+                                        detail_page.wait_for_load_state("networkidle", timeout=10000)
+                                    except Exception:
+                                        pass
+                                    for poll_attempt in range(5):
+                                        detail_page.wait_for_timeout(1000)
+                                        try:
+                                            candidate = detail_page.locator("body").inner_text(timeout=5000)
+                                        except Exception:
+                                            candidate = ""
+                                        if len(candidate) > 300:
+                                            detail_text = candidate
+                                            break
+                                        detail_text = candidate
+                                    detail_text = detail_text[:6000]
+                                    print(f"📄 Captured {len(detail_text)} chars from 2merkato detail page", flush=True)
+                                except Exception as e:
+                                    print(f"⚠️ Could not read 2merkato detail page text: {e}", flush=True)
+                                finally:
+                                    if detail_page is not None:
+                                        try:
+                                            detail_page.close()
+                                        except Exception:
+                                            pass
+
+                                raw_text_payload = f"{title_text}\n\n{detail_text}".strip()
+                                ai_summary = analyze_tender_with_ai(raw_text_payload)
                                 alert = (
                                     f"🔔 *New Medical Tender Found!*\n\n"
                                     f"📋 *Title:* {title_text}\n"
@@ -692,10 +761,32 @@ def scrape_egp():
                                         try:
                                             detail_page = context.new_page()
                                             detail_page.goto(detail_link, timeout=20000, wait_until="domcontentloaded")
-                                            # Angular SPA detail views render fields async —
-                                            # give it a moment before reading the DOM
-                                            detail_page.wait_for_timeout(3000)
-                                            detail_text = detail_page.locator("body").inner_text(timeout=5000)
+                                            # Angular SPA detail views render fields async — a
+                                            # fixed short wait was catching the loading skeleton
+                                            # (both captures logged an identical, suspiciously
+                                            # small 144 chars). Wait for network activity to
+                                            # settle, then poll for the text to actually grow
+                                            # past a "still loading" size before giving up.
+                                            try:
+                                                detail_page.wait_for_load_state("networkidle", timeout=10000)
+                                            except Exception:
+                                                pass  # some SPAs never go fully idle — fine, we still poll below
+
+                                            detail_text = ""
+                                            for poll_attempt in range(5):
+                                                detail_page.wait_for_timeout(1500)
+                                                try:
+                                                    candidate = detail_page.locator("body").inner_text(timeout=5000)
+                                                except Exception:
+                                                    candidate = ""
+                                                # Real detail content (title, ref, dates, scope,
+                                                # eligibility) runs to many hundreds of chars —
+                                                # treat anything under ~300 as still loading
+                                                if len(candidate) > 300:
+                                                    detail_text = candidate
+                                                    break
+                                                detail_text = candidate  # keep best-effort fallback
+
                                             # Trim to a sane size — some detail pages include
                                             # long boilerplate/nav text we don't need to send
                                             # to Gemini, and it wastes tokens/quota
@@ -776,7 +867,7 @@ def monitoring_loop():
         except Exception:
             print("❌ check_for_tenders crashed at the top level:", flush=True)
             print(traceback.format_exc(), flush=True)
-        time.sleep(6 * 3600)
+        time.sleep(4 * 3600)
 
 
 # ==================== FLASK ROUTES ====================
