@@ -21,15 +21,7 @@ EVOLUTION_BASE = os.environ.get("EVOLUTION_BASE", "https://medmetric-evolution.o
 INSTANCE_NAME = os.environ.get("INSTANCE_NAME", "Tender-Notifier.")
 GLOBAL_API_KEY = os.environ.get("GLOBAL_API_KEY")
 
-if not GLOBAL_API_KEY:
-    print("⚠️ GLOBAL_API_KEY is not set — WhatsApp sends will fail until configured.", flush=True)
-
-WHATSAPP_NUMBERS = [
-    n.strip() for n in os.environ.get("WHATSAPP_NUMBERS", "").split(",") if n.strip()
-]
-if not WHATSAPP_NUMBERS:
-    print("⚠️ WHATSAPP_NUMBERS is not set — no recipients configured.", flush=True)
-
+WHATSAPP_NUMBERS = [n.strip() for n in os.environ.get("WHATSAPP_NUMBERS", "").split(",") if n.strip()]
 TEST_CHECK_TOKEN = os.environ.get("TEST_CHECK_TOKEN")
 
 MERKATO_USER = os.environ.get("MERKATO_USER")
@@ -40,18 +32,9 @@ MERKATO_TENDERS_URL = f"{MERKATO_BASE}/tenders"
 MERKATO_MAX_PAGES = int(os.environ.get("MERKATO_MAX_PAGES", "4"))
 
 EGP_BASE = "https://production.egp.gov.et"
-EGP_LOGIN_URL = f"{EGP_BASE}/egp/login"
 EGP_BIDS_URL = f"{EGP_BASE}/egp/bids/all"
-EGP_USER = os.environ.get("EGP_USER")
-EGP_PASS = os.environ.get("EGP_PASS")
-EGP_ORG_NAME = os.environ.get("EGP_ORG_NAME", "Medmetric")
 
-EGP_SEARCH_TERMS = [
-    "medical equipment", "biomedical", "hemodialysis", "dialysis",
-    "calibration", "sterilization", "water treatment", "hospital equipment",
-    "x-ray", "ultrasound", "medical imaging", "spare parts"
-]
-
+# ==================== FILTERING LOGIC ====================
 STRONG_KEYWORDS = [
     "biomedical", "hemodialysis", "dialysis", "b.braun", "dialog+", "sws-4000a",
     "x-ray", "xray", "ultrasound", "ventilator", "autoclave", "sterilizer",
@@ -77,215 +60,136 @@ HARD_EXCLUDE_TERMS = [
 
 CONTEXTUAL_EXCLUDE_TERMS = ["consultancy services", "consulting firm"]
 
-
 def is_relevant_tender(title):
     title_lower = title.lower()
-
     if any(term in title_lower for term in HARD_EXCLUDE_TERMS):
         return False
 
-    has_medical_context = any(term in title_lower for term in MEDICAL_CONTEXT)
-    has_equipment_context = any(term in title_lower for term in EQUIPMENT_CONTEXT)
+    has_medical = any(term in title_lower for term in MEDICAL_CONTEXT)
+    has_equip = any(term in title_lower for term in EQUIPMENT_CONTEXT)
 
     if any(term in title_lower for term in CONTEXTUAL_EXCLUDE_TERMS):
-        if not (has_medical_context and has_equipment_context):
+        if not (has_medical and has_equip):
             return False
 
     if any(term in title_lower for term in STRONG_KEYWORDS):
         return True
 
-    return has_medical_context and has_equipment_context
+    return has_medical and has_equip
 
 
 # ==================== GROQ AI ENGINE ====================
 GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
 
 def batch_analyze_tenders_groq(tenders_list: list) -> list:
-    """
-    Sends a batch of tenders to Groq LLM with rate limit retries and exponential backoff.
-    """
     if not tenders_list:
         return []
 
     groq_api_key = os.environ.get("GROQ_API_KEY")
     if not groq_api_key:
-        print("⚠️ GROQ_API_KEY missing. Falling back to rule-based filtering.", flush=True)
         return _rule_based_fallback(tenders_list)
 
     try:
         client = Groq(api_key=groq_api_key)
-
         system_instruction = (
             "You are an expert procurement analyst for medMETRIC Healthcare Service PLC, "
-            "an Ethiopian biomedical engineering and technical-services company. Their scope "
-            "covers: medical equipment maintenance & service contracts (including hemodialysis "
-            "systems like B.Braun Dialog+ and SWS-4000A), RO/water treatment systems, CSSD & "
-            "sterilization equipment (e.g. Rivamed), calibration & compliance testing of "
-            "diagnostic/therapeutic equipment, medical imaging equipment, spare-parts sourcing, "
-            "and general medical equipment supply/consultancy. They do NOT supply medicines, "
-            "pharmaceuticals, vaccines, or laboratory-only equipment/reagents. "
-            "Analyze the batch of tenders and return a JSON array."
+            "an Ethiopian biomedical engineering company. Scope: medical equipment maintenance "
+            "(hemodialysis, B.Braun, SWS-4000A), RO/water systems, CSSD/sterilization (Rivamed), "
+            "calibration, imaging, and spare-parts. Exclude: medicines, pharmaceuticals, vaccines, "
+            "or lab-only reagents. Analyze the tenders and return a JSON array."
         )
 
         formatted_input = []
         for idx, item in enumerate(tenders_list):
             formatted_input.append(
-                f"--- TENDER INDEX {idx} ---\n"
-                f"ID: {item.get('id')}\n"
-                f"Title: {item.get('title')}\n"
-                f"Details: {item.get('raw_text', '')[:1500]}\n"
+                f"--- INDEX {idx} ---\nID: {item.get('id')}\nTitle: {item.get('title')}\nDetails: {item.get('raw_text', '')[:1000]}\n"
             )
 
         prompt = f"""
-        Analyze the following tenders for medMETRIC Healthcare.
-
-        For each tender:
-        1. Determine if it is RELEVANT to medMETRIC's technical scope (true/false).
-           Set to false if it is primarily for medicines, pharmaceuticals, vaccines, or lab reagents.
-        2. Assign a Match Score (0-100%) with 1-sentence reasoning.
-        3. Extract Key Constraints (bank guarantees, local agent, manufacturer authorizations, etc.).
-        4. Extract Deadline / Closing Date in East Africa Time (EAT).
-
-        Return strictly a JSON array matching this structure:
-        [
-            {{
-                "index": 0,
-                "is_relevant": true,
-                "match_score": "85% - Relevant medical equipment contract.",
-                "constraints": "Bid bond required.",
-                "closing_date": "Aug 15, 2026 at 10:00 AM EAT"
-            }}
-        ]
-
-        Tenders to process:
+        Analyze these tenders. Return strictly a JSON array with this structure:
+        [{{ "index": 0, "is_relevant": true, "match_score": "85% - Reason", "constraints": "Bond req", "closing_date": "Aug 15" }}]
+        
+        Tenders:
         {"".join(formatted_input)}
         """
 
-        max_retries = 3
-        base_delay = 5
-        response_text = None
-
-        for attempt in range(1, max_retries + 1):
+        for attempt in range(1, 4):
             try:
-                chat_completion = client.chat.completions.create(
-                    messages=[
-                        {"role": "system", "content": system_instruction},
-                        {"role": "user", "content": prompt}
-                    ],
+                chat = client.chat.completions.create(
+                    messages=[{"role": "system", "content": system_instruction}, {"role": "user", "content": prompt}],
                     model=GROQ_MODEL,
                     response_format={"type": "json_object"} if "llama-3" in GROQ_MODEL else None,
-                    temperature=0.1,
-                    max_tokens=1500,
+                    temperature=0.1, max_tokens=1500,
                 )
-                response_text = chat_completion.choices[0].message.content
+                response_text = chat.choices[0].message.content
+                
+                data = json.loads(response_text)
+                results = data.get("tenders", data) if isinstance(data, dict) else data
+                results = results if isinstance(results, list) else [data]
+
+                evaluated = []
+                for res in results:
+                    idx = res.get("index")
+                    if idx is not None and idx < len(tenders_list):
+                        tender = tenders_list[idx]
+                        tender["is_relevant"] = res.get("is_relevant", True)
+                        tender["match_score"] = res.get("match_score", "Match identified")
+                        tender["constraints"] = res.get("constraints", "None identified")
+                        tender["closing_date"] = res.get("closing_date", "Refer to portal")
+                        evaluated.append(tender)
+                return evaluated if evaluated else _rule_based_fallback(tenders_list)
+
+            except RateLimitError:
+                time.sleep(5 * (2 ** attempt))
+            except APIError:
                 break
-            except RateLimitError as e:
-                wait_time = base_delay * (2 ** attempt)
-                print(f"⚠️ Groq Rate Limit (RPM/TPM) hit. Retrying in {wait_time}s (Attempt {attempt}/{max_retries})...", flush=True)
-                time.sleep(wait_time)
-            except APIError as e:
-                print(f"❌ Groq API Error: {e}", flush=True)
-                break
 
-        if not response_text:
-            return _rule_based_fallback(tenders_list)
-
-        # Parse JSON output safely
-        data = json.loads(response_text)
-        results = data.get("tenders", data) if isinstance(data, dict) else data
-        if not isinstance(results, list):
-            results = [data]
-
-        evaluated_tenders = []
-        for res in results:
-            idx = res.get("index")
-            if idx is not None and idx < len(tenders_list):
-                tender = tenders_list[idx]
-                tender["is_relevant"] = res.get("is_relevant", True)
-                tender["match_score"] = res.get("match_score", "Match identified")
-                tender["constraints"] = res.get("constraints", "None identified")
-                tender["closing_date"] = res.get("closing_date", "Refer to portal")
-                evaluated_tenders.append(tender)
-
-        return evaluated_tenders if evaluated_tenders else _rule_based_fallback(tenders_list)
-
-    except Exception as e:
-        print(f"❌ Groq analysis failed ({e}). Using rule-based fallback...", flush=True)
+        return _rule_based_fallback(tenders_list)
+    except Exception:
         return _rule_based_fallback(tenders_list)
 
-
 def _rule_based_fallback(tenders_list):
-    """Fallback if Groq API fails or hits limit so notifications are never dropped."""
-    evaluated = []
     for t in tenders_list:
-        t["is_relevant"] = True
-        t["match_score"] = "Keyword Match (AI Fallback)"
-        t["constraints"] = "Review portal listing"
-        t["closing_date"] = "Check link"
-        evaluated.append(t)
-    return evaluated
+        t.update({"is_relevant": True, "match_score": "Rule Match", "constraints": "Check site", "closing_date": "Check site"})
+    return tenders_list
 
 
-# ==================== PERSISTENT DEDUP (Postgres) ====================
+# ==================== DATABASE & NOTIFICATIONS ====================
 DATABASE_URL = os.environ.get("DATABASE_URL")
 _db_conn = None
-
+_MEMORY_FALLBACK = set()
 
 def get_db_connection():
     global _db_conn
     if _db_conn is not None:
         try:
-            cur = _db_conn.cursor()
-            cur.execute("SELECT 1")
-            cur.close()
+            _db_conn.cursor().execute("SELECT 1")
             return _db_conn
         except Exception:
-            try:
-                _db_conn.close()
-            except Exception:
-                pass
             _db_conn = None
-
-    _db_conn = psycopg2.connect(DATABASE_URL, sslmode="require", connect_timeout=10)
+    _db_conn = psycopg2.connect(DATABASE_URL, sslmode="require", connect_timeout=10) if DATABASE_URL else None
     return _db_conn
 
-
 def init_db():
-    if not DATABASE_URL:
-        print("⚠️ DATABASE_URL not set — using in-memory dedup fallback.", flush=True)
-        return
-    try:
-        conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS notified_tenders (
-                tender_id TEXT PRIMARY KEY,
-                notified_at TIMESTAMP DEFAULT NOW()
-            )
-        """)
-        conn.commit()
-        cur.close()
-        print("✅ Connected to Postgres database.", flush=True)
-    except Exception as e:
-        print(f"❌ Postgres init failed: {e}", flush=True)
-
-
-_MEMORY_FALLBACK = set()
-
+    if DATABASE_URL:
+        try:
+            conn = get_db_connection()
+            with conn.cursor() as cur:
+                cur.execute("CREATE TABLE IF NOT EXISTS notified_tenders (tender_id TEXT PRIMARY KEY, notified_at TIMESTAMP DEFAULT NOW())")
+            conn.commit()
+            print("✅ Connected to Postgres.", flush=True)
+        except Exception:
+            pass
 
 def is_already_notified(tender_id: str) -> bool:
-    if not DATABASE_URL:
-        return tender_id in _MEMORY_FALLBACK
+    if not DATABASE_URL: return tender_id in _MEMORY_FALLBACK
     try:
         conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute("SELECT 1 FROM notified_tenders WHERE tender_id = %s", (tender_id,))
-        result = cur.fetchone()
-        cur.close()
-        return result is not None
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM notified_tenders WHERE tender_id = %s", (tender_id,))
+            return cur.fetchone() is not None
     except Exception:
         return tender_id in _MEMORY_FALLBACK
-
 
 def mark_as_notified(tender_id: str):
     if not DATABASE_URL:
@@ -293,294 +197,187 @@ def mark_as_notified(tender_id: str):
         return
     try:
         conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute(
-            "INSERT INTO notified_tenders (tender_id) VALUES (%s) ON CONFLICT DO NOTHING",
-            (tender_id,)
-        )
+        with conn.cursor() as cur:
+            cur.execute("INSERT INTO notified_tenders (tender_id) VALUES (%s) ON CONFLICT DO NOTHING", (tender_id,))
         conn.commit()
-        cur.close()
     except Exception:
         _MEMORY_FALLBACK.add(tender_id)
 
-
 def send_whatsapp(message):
-    if not GLOBAL_API_KEY or not WHATSAPP_NUMBERS:
-        print("❌ WhatsApp configuration missing.", flush=True)
-        return
-
+    if not GLOBAL_API_KEY or not WHATSAPP_NUMBERS: return
     url = f"{EVOLUTION_BASE}/message/sendText/{INSTANCE_NAME}"
     headers = {"Content-Type": "application/json", "apikey": GLOBAL_API_KEY}
     for number in WHATSAPP_NUMBERS:
-        payload = {"number": number, "text": message}
         try:
-            r = requests.post(url, json=payload, headers=headers, timeout=10)
-            masked = number[:5] + "***" + number[-2:] if len(number) > 7 else "***"
-            print(f"✅ WhatsApp status ({masked}): {r.status_code}", flush=True)
+            r = requests.post(url, json={"number": number, "text": message}, headers=headers, timeout=10)
+            print(f"✅ WhatsApp status: {r.status_code}", flush=True)
         except Exception as e:
-            print(f"❌ WhatsApp send error: {e}", flush=True)
+            print(f"❌ WhatsApp error: {e}", flush=True)
 
 
-# ==================== ENGINE: 2MERKATO ====================
-def scrape_2merkato():
+# ==================== ENGINES (Sharing 1 Browser Context) ====================
+
+def process_and_notify(batch, source_name):
+    if not batch: return 0
+    print(f"🤖 Analyzing {len(batch)} tenders from {source_name}...", flush=True)
+    analyzed = batch_analyze_tenders_groq(batch)
+    found = 0
+    for item in analyzed:
+        mark_as_notified(item["id"])
+        if item.get("is_relevant"):
+            found += 1
+            alert = (
+                f"🔔 *New Medical Tender Found! ({source_name})*\n\n"
+                f"📋 *Title:* {item['title']}\n"
+                f"🎯 *Match:* {item['match_score']}\n"
+                f"⚠️ *Constraints:* {item['constraints']}\n"
+                f"📅 *Deadline:* {item['closing_date']}\n\n"
+                f"🔗 *Link:* {item['link']}"
+            )
+            send_whatsapp(alert)
+            time.sleep(1)
+    return found
+
+
+def scrape_2merkato(context):
     print(f"[{datetime.now()}] 🔍 Running 2merkato Engine...", flush=True)
-    pending_batch = []
+    pending = []
+    page = context.new_page()
+    page.route("**/*.{png,jpg,jpeg,svg,css,woff,woff2,gif}", lambda route: route.abort())
 
     try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
-            context = browser.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
-            page = context.new_page()
-
-            if MERKATO_USER and MERKATO_PASS:
-                try:
-                    page.goto(MERKATO_LOGIN_URL, timeout=30000, wait_until="domcontentloaded")
-                    page.wait_for_selector("input[type='password']", timeout=15000)
-                    email_field = page.locator("input[type='email'], input[name*='user' i]").first
-                    pass_field = page.locator("input[type='password']").first
-
-                    if email_field.count() > 0 and pass_field.count() > 0:
-                        email_field.fill(MERKATO_USER)
-                        pass_field.fill(MERKATO_PASS)
-                        page.locator("button[type='submit']").first.click()
-                        page.wait_for_timeout(3000)
-                except Exception as e:
-                    print(f"⚠️ 2merkato login bypassed: {e}", flush=True)
-
-            seen_this_scan = set()
-            for page_num in range(1, MERKATO_MAX_PAGES + 1):
-                page_url = MERKATO_TENDERS_URL if page_num == 1 else f"{MERKATO_TENDERS_URL}?page={page_num}"
-                page.goto(page_url, timeout=30000, wait_until="domcontentloaded")
-                page.wait_for_timeout(2000)
-
-                links = page.locator("a[href*='/tenders/']").all()
-
-                for link in links:
-                    try:
-                        title_text = link.inner_text().strip()
-                        href = link.get_attribute("href")
-                        if not title_text or not href:
-                            continue
-
-                        full_link = href if href.startswith("http") else f"{MERKATO_BASE}{href}"
-                        if full_link in seen_this_scan:
-                            continue
-                        seen_this_scan.add(full_link)
-
-                        if is_relevant_tender(title_text):
-                            tender_id = f"merkato_{full_link.rstrip('/').split('/')[-1]}"
-                            if not is_already_notified(tender_id):
-                                detail_text = ""
-                                detail_page = None
-                                try:
-                                    detail_page = context.new_page()
-                                    detail_page.goto(full_link, timeout=15000, wait_until="domcontentloaded")
-                                    detail_text = detail_page.locator("body").inner_text(timeout=3000)[:3000]
-                                except Exception:
-                                    pass
-                                finally:
-                                    if detail_page: detail_page.close()
-
-                                pending_batch.append({
-                                    "id": tender_id,
-                                    "title": title_text,
-                                    "ref_no": "N/A",
-                                    "link": full_link,
-                                    "raw_text": f"{title_text}\n{detail_text}"
-                                })
-                    except Exception:
-                        continue
-
-            browser.close()
-
-        if pending_batch:
-            print(f"🤖 Batch analyzing {len(pending_batch)} tenders from 2merkato with Groq...", flush=True)
-            analyzed_batch = batch_analyze_tenders_groq(pending_batch)
-            
-            found_count = 0
-            for item in analyzed_batch:
-                mark_as_notified(item["id"])
-                if item.get("is_relevant"):
-                    found_count += 1
-                    alert = (
-                        f"🔔 *New Medical Tender Found! (2merkato)*\n\n"
-                        f"📋 *Title:* {item['title']}\n"
-                        f"🎯 *Match Score:* {item['match_score']}\n"
-                        f"⚠️ *Constraints:* {item['constraints']}\n"
-                        f"📅 *Closing Date:* {item['closing_date']}\n\n"
-                        f"🔗 *Link:* {item['link']}"
-                    )
-                    send_whatsapp(alert)
-                    time.sleep(1)
-            return found_count
-
-        return 0
-
-    except Exception as e:
-        print(f"❌ 2merkato engine error: {e}", flush=True)
-        return 0
-
-
-# ==================== ENGINE: eGP ====================
-def scrape_egp():
-    print(f"[{datetime.now()}] 🔍 Running eGP Engine...", flush=True)
-    pending_batch = []
-
-    try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
-            context = browser.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
-            page = context.new_page()
-
-            if EGP_USER and EGP_PASS:
-                try:
-                    page.goto(EGP_LOGIN_URL, timeout=20000, wait_until="domcontentloaded")
-                    if page.locator("input[type='password']").count() > 0:
-                        user_field = page.locator("input[type='email'], input[type='text']").first
-                        pass_field = page.locator("input[type='password']").first
-                        user_field.fill(EGP_USER)
-                        pass_field.fill(EGP_PASS)
-                        page.locator("button[type='submit']").first.click()
-                        page.wait_for_timeout(3000)
-                except Exception as e:
-                    print(f"⚠️ eGP optional login bypassed: {e}", flush=True)
-
+        if MERKATO_USER and MERKATO_PASS:
             try:
-                page.goto(EGP_BIDS_URL, timeout=30000, wait_until="domcontentloaded")
+                page.goto(MERKATO_LOGIN_URL, timeout=30000, wait_until="domcontentloaded")
+                page.locator("input[type='email'], input[name*='user' i]").first.fill(MERKATO_USER)
+                page.locator("input[type='password']").first.fill(MERKATO_PASS)
+                page.locator("button[type='submit']").first.click()
                 page.wait_for_timeout(3000)
-            except Exception as e:
-                print(f"❌ Could not reach eGP public portal: {e}", flush=True)
-                browser.close()
-                return 0
+            except Exception:
+                pass
 
-            search_box = page.locator("input[placeholder*='Search' i]").first
-            seen_this_scan = set()
-
-            for term in EGP_SEARCH_TERMS:
+        seen = set()
+        for page_num in range(1, MERKATO_MAX_PAGES + 1):
+            url = MERKATO_TENDERS_URL if page_num == 1 else f"{MERKATO_TENDERS_URL}?page={page_num}"
+            page.goto(url, timeout=30000, wait_until="domcontentloaded")
+            
+            for link in page.locator("a[href*='/tenders/']").all():
                 try:
-                    search_box.click()
-                    search_box.fill("")
-                    search_box.fill(term)
-                    search_box.press("Enter")
-                    
-                    try:
-                        page.wait_for_selector("table tbody tr", timeout=4000)
-                    except Exception:
-                        page.wait_for_timeout(2000)
+                    title = link.inner_text().strip()
+                    href = link.get_attribute("href")
+                    if not title or not href: continue
 
-                    rows = page.locator("table tbody tr").all()
-                    for row in rows:
-                        cells = row.locator("td").all_inner_texts()
-                        if not cells: 
-                            continue
-                        ref_no = cells[0].strip() if len(cells) > 0 else ""
-                        title_text = cells[2].strip() if len(cells) > 2 else " ".join(cells)
+                    full_link = href if href.startswith("http") else f"{MERKATO_BASE}{href}"
+                    if full_link in seen: continue
+                    seen.add(full_link)
 
-                        row_key = ref_no or title_text
-                        if row_key in seen_this_scan: 
-                            continue
-                        seen_this_scan.add(row_key)
-
-                        if is_relevant_tender(title_text):
-                            tender_id = f"egp_{ref_no or title_text}"
-                            if not is_already_notified(tender_id):
-                                pending_batch.append({
-                                    "id": tender_id,
-                                    "title": title_text,
-                                    "ref_no": ref_no,
-                                    "link": EGP_BIDS_URL,
-                                    "raw_text": f"Title: {title_text}, Ref: {ref_no}"
-                                })
+                    if is_relevant_tender(title):
+                        tender_id = f"merkato_{full_link.rstrip('/').split('/')[-1]}"
+                        if not is_already_notified(tender_id):
+                            pending.append({
+                                "id": tender_id, "title": title, "ref_no": "N/A",
+                                "link": full_link, "raw_text": title
+                            })
                 except Exception:
                     continue
+    finally:
+        page.close() # Free RAM immediately
+    
+    return process_and_notify(pending, "2merkato")
 
-            browser.close()
 
-        if pending_batch:
-            print(f"🤖 Batch analyzing {len(pending_batch)} tenders from eGP with Groq...", flush=True)
-            analyzed_batch = batch_analyze_tenders_groq(pending_batch)
+def scrape_egp(context):
+    print(f"[{datetime.now()}] 🔍 Running eGP Engine (Direct Read)...", flush=True)
+    pending = []
+    page = context.new_page()
+    page.route("**/*.{png,jpg,jpeg,svg,css,woff,woff2,gif}", lambda route: route.abort())
+
+    try:
+        # Load the index directly. No search bar interaction to prevent Angular hangs.
+        page.goto(EGP_BIDS_URL, timeout=60000, wait_until="domcontentloaded")
+        page.wait_for_selector("table tbody tr", timeout=25000)
+        page.wait_for_timeout(2000) # Buffer for final JS rendering
+
+        rows = page.locator("table tbody tr").all()
+        for row in rows:
+            cells = row.locator("td").all_inner_texts()
+            if not cells or len(cells) < 3: continue
             
-            found_count = 0
-            for item in analyzed_batch:
-                mark_as_notified(item["id"])
-                if item.get("is_relevant"):
-                    found_count += 1
-                    alert = (
-                        f"🔔 *New Medical Tender Found! (eGP)*\n\n"
-                        f"📋 *Title:* {item['title']}\n"
-                        f"📄 *Ref No:* {item['ref_no']}\n"
-                        f"🎯 *Match Score:* {item['match_score']}\n"
-                        f"⚠️ *Constraints:* {item['constraints']}\n"
-                        f"📅 *Closing Date:* {item['closing_date']}\n\n"
-                        f"🔗 *Link:* {item['link']}"
-                    )
-                    send_whatsapp(alert)
-                    time.sleep(1)
-            return found_count
+            ref_no = cells[0].strip()
+            title = cells[2].strip()
 
-        return 0
-
+            # Filter dynamically in Python instead of requesting the UI to do it
+            if is_relevant_tender(title):
+                tender_id = f"egp_{ref_no or title}"
+                if not is_already_notified(tender_id):
+                    pending.append({
+                        "id": tender_id, "title": title, "ref_no": ref_no,
+                        "link": EGP_BIDS_URL, "raw_text": f"Title: {title}, Ref: {ref_no}"
+                    })
     except Exception as e:
-        print(f"❌ eGP engine error: {e}", flush=True)
-        return 0
+        print(f"❌ eGP skipped/timed out: {e}", flush=True)
+    finally:
+        page.close() # Free RAM immediately
+
+    return process_and_notify(pending, "eGP")
 
 
 # ==================== RUN COORDINATOR ====================
 def check_for_tenders():
-    print("=================== STARTING SCAN CYCLE ===================", flush=True)
-    try:
-        merkato_total = scrape_2merkato()
-    except Exception:
-        print("❌ 2merkato crashed:", traceback.format_exc(), flush=True)
-        merkato_total = 0
+    print(f"\n[{datetime.now()}] =================== STARTING SCAN CYCLE ===================", flush=True)
+    m_total, e_total = 0, 0
 
     try:
-        egp_total = scrape_egp()
-    except Exception:
-        print("❌ eGP crashed:", traceback.format_exc(), flush=True)
-        egp_total = 0
+        with sync_playwright() as p:
+            # Singleton Browser: Launched ONCE per cycle to prevent OOM kills
+            browser = p.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu", "--single-process", "--no-zygote"]
+            )
+            context = browser.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
 
-    total = merkato_total + egp_total
-    print(f"=================== SCAN COMPLETE: {total} NEW FOUND ===================", flush=True)
+            try:
+                m_total = scrape_2merkato(context)
+            except Exception as e:
+                print(f"❌ 2merkato loop crash: {e}", flush=True)
 
+            try:
+                e_total = scrape_egp(context)
+            except Exception as e:
+                print(f"❌ eGP loop crash: {e}", flush=True)
+
+            browser.close()
+    except Exception as e:
+        print(f"❌ Playwright fatal error: {e}", flush=True)
+
+    total = m_total + e_total
+    print(f"[{datetime.now()}] =================== SCAN COMPLETE: {total} NEW FOUND ===================\n", flush=True)
     if total == 0:
-        send_whatsapp("🔍 *Tender Monitor Scan Completed.*\nNo new unique medical equipment or maintenance matches found.")
+        send_whatsapp("🔍 *Tender Monitor Scan Completed.*\nNo new unique matches found.")
 
 
 def monitoring_loop():
-    try:
-        interval_hours = float(os.environ.get("SCAN_INTERVAL_HOURS", "6"))
-    except ValueError:
-        interval_hours = 6
+    try: interval_hours = float(os.environ.get("SCAN_INTERVAL_HOURS", "6"))
+    except ValueError: interval_hours = 6
     while True:
-        try:
-            check_for_tenders()
-        except Exception:
-            print("❌ Top-level error:", traceback.format_exc(), flush=True)
+        try: check_for_tenders()
+        except Exception: print("❌ Fatal loop error:", traceback.format_exc(), flush=True)
         time.sleep(interval_hours * 3600)
-
 
 @app.route('/')
 def home():
     return "Medical Tender Tracking Service Is Online!", 200
 
-
 @app.route('/test-check')
 def manual_test():
-    if not TEST_CHECK_TOKEN:
-        return "Manual trigger disabled: TEST_CHECK_TOKEN is not configured.", 503
-
-    provided_token = request.args.get("token", "")
-    if not hmac.compare_digest(provided_token, TEST_CHECK_TOKEN):
-        return "Unauthorized", 401
-
+    if not TEST_CHECK_TOKEN: return "Token not configured.", 503
+    if not hmac.compare_digest(request.args.get("token", ""), TEST_CHECK_TOKEN): return "Unauthorized", 401
     threading.Thread(target=check_for_tenders).start()
     return "Scraper sync cycle triggered!", 200
-
 
 init_db()
 
 if __name__ == "__main__":
     threading.Thread(target=monitoring_loop, daemon=True).start()
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+
