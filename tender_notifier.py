@@ -262,6 +262,31 @@ def scrape_2merkato(context):
     page.route("**/*.{png,jpg,jpeg,svg,css,woff,woff2,gif}", lambda route: route.abort())
 
     try:
+        print(f"🔑 2merkato credentials check: User set = {bool(MERKATO_USER)}, Pass set = {bool(MERKATO_PASS)}", flush=True)
+        if MERKATO_USER and MERKATO_PASS:
+            try:
+                page.goto(MERKATO_LOGIN_URL, timeout=30000, wait_until="domcontentloaded")
+                print("🌐 Navigated to 2merkato login page.", flush=True)
+                
+                email_input = page.locator("input[type='email'], input[name*='email' i], input[name*='username' i], input[name*='user' i]").first
+                print(f"🔍 2merkato email/user input found = {email_input.count() > 0}", flush=True)
+                if email_input.count() > 0:
+                    email_input.fill(MERKATO_USER)
+                
+                pass_input = page.locator("input[type='password'], input[name*='pass' i]").first
+                print(f"🔍 2merkato password input found = {pass_input.count() > 0}", flush=True)
+                if pass_input.count() > 0:
+                    pass_input.fill(MERKATO_PASS)
+                
+                submit_btn = page.locator("button[type='submit'], input[type='submit'], button:has-text('Login'), button:has-text('Sign')").first
+                print(f"🔍 2merkato submit button found = {submit_btn.count() > 0}", flush=True)
+                if submit_btn.count() > 0:
+                    submit_btn.click()
+                    page.wait_for_timeout(5000)
+                    print("✅ 2merkato login submitted.", flush=True)
+            except Exception as e:
+                print(f"⚠️ 2merkato login error: {e}", flush=True)
+
         seen = set()
         for page_num in range(1, MERKATO_MAX_PAGES + 1):
             url = MERKATO_TENDERS_URL if page_num == 1 else f"{MERKATO_TENDERS_URL}?page={page_num}"
@@ -333,7 +358,9 @@ def scrape_egp(context):
                     
                     row_text = " | ".join([c.strip() for c in cells if c.strip()])
                     ref_no = cells[0].strip() if len(cells) > 0 else "N/A"
-                    title = cells[2].strip() if len(cells) > 2 else row_text
+                    
+                    potential_titles = [c.strip() for c in cells if len(c.strip()) > 10]
+                    title = max(potential_titles, key=len) if potential_titles else row_text
 
                     if is_relevant_tender(title) or is_relevant_tender(row_text):
                         print(f"🎯 Match found (eGP): {title[:60]}...", flush=True)
@@ -424,3 +451,4 @@ if __name__ == "__main__":
     threading.Thread(target=monitoring_loop, daemon=True).start()
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
