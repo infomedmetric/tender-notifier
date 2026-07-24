@@ -271,12 +271,13 @@ def scrape_2merkato(context):
                 page.goto(MERKATO_LOGIN_URL, timeout=30000, wait_until="domcontentloaded")
                 print("🌐 Navigated to 2merkato login page.", flush=True)
                 
-                email_input = page.locator("input[type='email'], input[name*='email' i], input[name*='username' i], input[name*='user' i]").first
+                # Robust selector expansion for 2merkato email/username field
+                email_input = page.locator("input[type='email'], input[id='email'], input[name='email'], input[name*='email' i], input[name*='username' i], input[name*='user' i], input[placeholder*='email' i]").first
                 print(f"🔍 2merkato email/user input found = {email_input.count() > 0}", flush=True)
                 if email_input.count() > 0:
                     email_input.fill(MERKATO_USER)
                 
-                pass_input = page.locator("input[type='password'], input[name*='pass' i]").first
+                pass_input = page.locator("input[type='password'], input[id='password'], input[name='password'], input[name*='pass' i]").first
                 print(f"🔍 2merkato password input found = {pass_input.count() > 0}", flush=True)
                 if pass_input.count() > 0:
                     pass_input.fill(MERKATO_PASS)
@@ -345,15 +346,18 @@ def scrape_egp(context):
                 page.goto(EGP_LOGIN_URL, timeout=30000, wait_until="domcontentloaded")
                 print("🌐 Navigated to eGP login page.", flush=True)
                 
-                email_input = page.locator("input[type='email'], input[name*='email' i], input[name*='username' i], input[name*='user' i]").first
+                email_input = page.locator("input[type='email'], input[id='email'], input[name='email'], input[name*='email' i], input[name*='username' i], input[name*='user' i]").first
+                print(f"🔍 eGP email/user input found = {email_input.count() > 0}", flush=True)
                 if email_input.count() > 0:
                     email_input.fill(EGP_USER)
                 
-                pass_input = page.locator("input[type='password'], input[name*='pass' i]").first
+                pass_input = page.locator("input[type='password'], input[id='password'], input[name='password'], input[name*='pass' i]").first
+                print(f"🔍 eGP password input found = {pass_input.count() > 0}", flush=True)
                 if pass_input.count() > 0:
                     pass_input.fill(EGP_PASS)
                 
                 submit_btn = page.locator("button[type='submit'], input[type='submit'], button:has-text('Login'), button:has-text('Sign')").first
+                print(f"🔍 eGP submit button found = {submit_btn.count() > 0}", flush=True)
                 if submit_btn.count() > 0:
                     submit_btn.click()
                     page.wait_for_timeout(5000)
