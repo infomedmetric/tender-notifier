@@ -182,10 +182,10 @@ STRONG_KEYWORDS = [
     "biomedical", "hemodialysis", "dialysis", "b.braun", "dialog+", "sws-4000a",
     "x-ray", "xray", "ultrasound", "ventilator", "autoclave", "sterilizer",
     "sterilization", "sterile processing", "cssd", "rivamed",
-    "reverse osmosis", "ro system", "water treatment", "spare parts",
+    "reverse osmosis", "ro system", "water treatment", "medical equipment spare parts",
     "biomedical engineering", "medical imaging", "calibration",
     "diagnostic equipment", "medical equipment", "hospital equipment",
-    "medical device", "የህክምና", "ጥገና"
+    "medical device", "የህክምና", "የህክምና ጥገና"
 ]
 
 # Generic medical-adjacent words — only count if paired with an equipment/
@@ -205,7 +205,7 @@ EQUIPMENT_CONTEXT = ["equipment", "supplies", "supply", "device", "machine",
 # biomedical engineering/technical-service company, not a drug supplier.
 HARD_EXCLUDE_TERMS = [
     "vehicle", "toyota", "car ", "motorbike", "insurance", "life insurance",
-    "term life", "gpa",
+    "term life", "gpa","ተሽከርካሪዎች",
     "laboratory", "lab reagent", "reagent", "lab equipment",
     "medicine", "medicines", "pharmaceutical", "pharmaceuticals",
     "drug", "drugs", "vaccine", "vaccines", "rdf medicine", "rdf medicines"
