@@ -34,7 +34,10 @@ MERKATO_LOGIN_URL = f"{MERKATO_BASE}/login"
 MERKATO_TENDERS_URL = f"{MERKATO_BASE}/tenders"
 MERKATO_MAX_PAGES = int(os.environ.get("MERKATO_MAX_PAGES", "4"))
 
+EGP_USER = os.environ.get("EGP_USER")
+EGP_PASS = os.environ.get("EGP_PASS")
 EGP_BASE = "https://production.egp.gov.et"
+EGP_LOGIN_URL = f"{EGP_BASE}/egp/login"
 EGP_BIDS_URL = f"{EGP_BASE}/egp/bids/all"
 EGP_SEARCH_TERMS = ["medical", "biomedical", "hemodialysis", "health", "ጥገና"]
 
@@ -302,6 +305,12 @@ def scrape_2merkato(context):
                     if not title or not href: continue
 
                     full_link = href if href.startswith("http") else f"{MERKATO_BASE}{href}"
+                    
+                    # Ensure it's a specific tender detail link and not a general listing or pagination URL
+                    parsed_path = full_link.split('?')[0].rstrip('/')
+                    if parsed_path.endswith('/tenders') or '/tenders?page' in full_link:
+                        continue
+
                     if full_link in seen: continue
                     seen.add(full_link)
 
@@ -329,11 +338,33 @@ def scrape_egp(context):
     page = context.new_page()
     page.route("**/*.{png,jpg,jpeg,svg,css,woff,woff2,gif}", lambda route: route.abort())
 
-    seen = set()
     try:
+        print(f"🔑 eGP credentials check: User set = {bool(EGP_USER)}, Pass set = {bool(EGP_PASS)}", flush=True)
+        if EGP_USER and EGP_PASS:
+            try:
+                page.goto(EGP_LOGIN_URL, timeout=30000, wait_until="domcontentloaded")
+                print("🌐 Navigated to eGP login page.", flush=True)
+                
+                email_input = page.locator("input[type='email'], input[name*='email' i], input[name*='username' i], input[name*='user' i]").first
+                if email_input.count() > 0:
+                    email_input.fill(EGP_USER)
+                
+                pass_input = page.locator("input[type='password'], input[name*='pass' i]").first
+                if pass_input.count() > 0:
+                    pass_input.fill(EGP_PASS)
+                
+                submit_btn = page.locator("button[type='submit'], input[type='submit'], button:has-text('Login'), button:has-text('Sign')").first
+                if submit_btn.count() > 0:
+                    submit_btn.click()
+                    page.wait_for_timeout(5000)
+                    print("✅ eGP login submitted.", flush=True)
+            except Exception as e:
+                print(f"⚠️ eGP login error: {e}", flush=True)
+
         page.goto(EGP_BIDS_URL, timeout=60000, wait_until="domcontentloaded")
         page.wait_for_timeout(3000)
 
+        seen = set()
         for term in EGP_SEARCH_TERMS:
             try:
                 search_box = page.locator("input#search, input[name*='search' i], input[placeholder*='Search' i], input[type='search']").first
@@ -362,6 +393,14 @@ def scrape_egp(context):
                     potential_titles = [c.strip() for c in cells if len(c.strip()) > 10]
                     title = max(potential_titles, key=len) if potential_titles else row_text
 
+                    # Extract direct detail link if available in the row
+                    link_elem = row.locator("a[href]").first
+                    if link_elem.count() > 0:
+                        href = link_elem.get_attribute("href")
+                        full_link = href if href.startswith("http") else f"{EGP_BASE}{href}"
+                    else:
+                        full_link = EGP_BIDS_URL
+
                     if is_relevant_tender(title) or is_relevant_tender(row_text):
                         print(f"🎯 Match found (eGP): {title[:60]}...", flush=True)
                         tender_id = f"egp_{ref_no if ref_no != 'N/A' else abs(hash(title))}"
@@ -370,7 +409,7 @@ def scrape_egp(context):
                             if not is_already_notified(tender_id):
                                 pending.append({
                                     "id": tender_id, "title": title, "ref_no": ref_no,
-                                    "link": EGP_BIDS_URL, "raw_text": row_text
+                                    "link": full_link, "raw_text": row_text
                                 })
             except Exception as e:
                 print(f"⚠️ eGP search error for term '{term}': {e}", flush=True)
@@ -451,4 +490,3 @@ if __name__ == "__main__":
     threading.Thread(target=monitoring_loop, daemon=True).start()
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
-
