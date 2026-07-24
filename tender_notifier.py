@@ -10,8 +10,7 @@ from datetime import datetime
 from flask import Flask, request
 from playwright.sync_api import sync_playwright
 import urllib3
-from google import genai
-from google.genai import types
+from groq import Groq, RateLimitError, APIError
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -98,44 +97,24 @@ def is_relevant_tender(title):
     return has_medical_context and has_equipment_context
 
 
-# ==================== GEMINI AI ENGINE (BATCH & RETRY) ====================
-def _call_gemini_with_retry(client, prompt, config, max_retries=3):
-    """
-    Handles 429 RESOURCE_EXHAUSTED quota errors by waiting out Gemini's cooling period.
-    """
-    for attempt in range(1, max_retries + 1):
-        try:
-            return client.models.generate_content(
-                model='gemini-flash-latest',
-                contents=prompt,
-                config=config,
-            )
-        except Exception as e:
-            err_msg = str(e)
-            if "429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg:
-                delay = 25 * attempt
-                print(f"⚠️ Gemini Quota (429): Waiting {delay}s before retry {attempt}/{max_retries}...", flush=True)
-                time.sleep(delay)
-            else:
-                raise e
-    raise Exception("Max Gemini retries exceeded due to rate limits.")
+# ==================== GROQ AI ENGINE ====================
+GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
 
-
-def batch_analyze_tenders(tenders_list: list) -> list:
+def batch_analyze_tenders_groq(tenders_list: list) -> list:
     """
-    Analyzes multiple tenders in a single API call to conserve free tier quota.
+    Sends a batch of tenders to Groq LLM with rate limit retries and exponential backoff.
     """
     if not tenders_list:
         return []
 
-    api_key = os.environ.get("GEMINI_API_KEY")
-    if not api_key:
-        print("⚠️ GEMINI_API_KEY missing. Falling back to rule-based verification.", flush=True)
+    groq_api_key = os.environ.get("GROQ_API_KEY")
+    if not groq_api_key:
+        print("⚠️ GROQ_API_KEY missing. Falling back to rule-based filtering.", flush=True)
         return _rule_based_fallback(tenders_list)
 
     try:
-        client = genai.Client(api_key=api_key)
-        
+        client = Groq(api_key=groq_api_key)
+
         system_instruction = (
             "You are an expert procurement analyst for medMETRIC Healthcare Service PLC, "
             "an Ethiopian biomedical engineering and technical-services company. Their scope "
@@ -145,7 +124,7 @@ def batch_analyze_tenders(tenders_list: list) -> list:
             "diagnostic/therapeutic equipment, medical imaging equipment, spare-parts sourcing, "
             "and general medical equipment supply/consultancy. They do NOT supply medicines, "
             "pharmaceuticals, vaccines, or laboratory-only equipment/reagents. "
-            "Analyze the provided batch of tenders and return a JSON array matching the schema."
+            "Analyze the batch of tenders and return a JSON array."
         )
 
         formatted_input = []
@@ -154,20 +133,20 @@ def batch_analyze_tenders(tenders_list: list) -> list:
                 f"--- TENDER INDEX {idx} ---\n"
                 f"ID: {item.get('id')}\n"
                 f"Title: {item.get('title')}\n"
-                f"Details: {item.get('raw_text', '')[:2000]}\n"
+                f"Details: {item.get('raw_text', '')[:1500]}\n"
             )
 
         prompt = f"""
         Analyze the following tenders for medMETRIC Healthcare.
 
         For each tender:
-        1. Determine if it is RELEVANT to medMETRIC's scope (Yes/No).
-           Answer NO if it's primarily for medicines, pharmaceuticals, vaccines, or lab reagents.
-        2. Assign a Match Score (0-100%) and 1-sentence reasoning.
+        1. Determine if it is RELEVANT to medMETRIC's technical scope (true/false).
+           Set to false if it is primarily for medicines, pharmaceuticals, vaccines, or lab reagents.
+        2. Assign a Match Score (0-100%) with 1-sentence reasoning.
         3. Extract Key Constraints (bank guarantees, local agent, manufacturer authorizations, etc.).
-        4. Extract Deadline / Closing Date in EAT.
+        4. Extract Deadline / Closing Date in East Africa Time (EAT).
 
-        Return a JSON Array matching this schema exactly:
+        Return strictly a JSON array matching this structure:
         [
             {{
                 "index": 0,
@@ -182,17 +161,41 @@ def batch_analyze_tenders(tenders_list: list) -> list:
         {"".join(formatted_input)}
         """
 
-        response = _call_gemini_with_retry(
-            client,
-            prompt,
-            types.GenerateContentConfig(
-                system_instruction=system_instruction,
-                temperature=0.1,
-                response_mime_type="application/json"
-            )
-        )
+        max_retries = 3
+        base_delay = 5
+        response_text = None
 
-        results = json.loads(response.text)
+        for attempt in range(1, max_retries + 1):
+            try:
+                chat_completion = client.chat.completions.create(
+                    messages=[
+                        {"role": "system", "content": system_instruction},
+                        {"role": "user", "content": prompt}
+                    ],
+                    model=GROQ_MODEL,
+                    response_format={"type": "json_object"} if "llama-3" in GROQ_MODEL else None,
+                    temperature=0.1,
+                    max_tokens=1500,
+                )
+                response_text = chat_completion.choices[0].message.content
+                break
+            except RateLimitError as e:
+                wait_time = base_delay * (2 ** attempt)
+                print(f"⚠️ Groq Rate Limit (RPM/TPM) hit. Retrying in {wait_time}s (Attempt {attempt}/{max_retries})...", flush=True)
+                time.sleep(wait_time)
+            except APIError as e:
+                print(f"❌ Groq API Error: {e}", flush=True)
+                break
+
+        if not response_text:
+            return _rule_based_fallback(tenders_list)
+
+        # Parse JSON output safely
+        data = json.loads(response_text)
+        results = data.get("tenders", data) if isinstance(data, dict) else data
+        if not isinstance(results, list):
+            results = [data]
+
         evaluated_tenders = []
         for res in results:
             idx = res.get("index")
@@ -204,19 +207,19 @@ def batch_analyze_tenders(tenders_list: list) -> list:
                 tender["closing_date"] = res.get("closing_date", "Refer to portal")
                 evaluated_tenders.append(tender)
 
-        return evaluated_tenders
+        return evaluated_tenders if evaluated_tenders else _rule_based_fallback(tenders_list)
 
     except Exception as e:
-        print(f"❌ Gemini Batch AI analysis failed ({e}). Falling back to rule-based filtering...", flush=True)
+        print(f"❌ Groq analysis failed ({e}). Using rule-based fallback...", flush=True)
         return _rule_based_fallback(tenders_list)
 
 
 def _rule_based_fallback(tenders_list):
-    """Fallback if Gemini API fails so alerts still deliver."""
+    """Fallback if Groq API fails or hits limit so notifications are never dropped."""
     evaluated = []
     for t in tenders_list:
-        t["is_relevant"] = True  # Passed local keyword filter
-        t["match_score"] = "Keyword Match (AI Quota Unavailable)"
+        t["is_relevant"] = True
+        t["match_score"] = "Keyword Match (AI Fallback)"
         t["constraints"] = "Review portal listing"
         t["closing_date"] = "Check link"
         evaluated.append(t)
@@ -249,7 +252,7 @@ def get_db_connection():
 
 def init_db():
     if not DATABASE_URL:
-        print("⚠️ DATABASE_URL not set — falling back to in-memory dedup", flush=True)
+        print("⚠️ DATABASE_URL not set — using in-memory dedup fallback.", flush=True)
         return
     try:
         conn = get_db_connection()
@@ -262,7 +265,7 @@ def init_db():
         """)
         conn.commit()
         cur.close()
-        print("✅ Connected to Postgres and verified notified_tenders table", flush=True)
+        print("✅ Connected to Postgres database.", flush=True)
     except Exception as e:
         print(f"❌ Postgres init failed: {e}", flush=True)
 
@@ -303,7 +306,7 @@ def mark_as_notified(tender_id: str):
 
 def send_whatsapp(message):
     if not GLOBAL_API_KEY or not WHATSAPP_NUMBERS:
-        print("❌ WhatsApp not configured.", flush=True)
+        print("❌ WhatsApp configuration missing.", flush=True)
         return
 
     url = f"{EVOLUTION_BASE}/message/sendText/{INSTANCE_NAME}"
@@ -313,7 +316,7 @@ def send_whatsapp(message):
         try:
             r = requests.post(url, json=payload, headers=headers, timeout=10)
             masked = number[:5] + "***" + number[-2:] if len(number) > 7 else "***"
-            print(f"✅ WhatsApp Status ({masked}): {r.status_code}", flush=True)
+            print(f"✅ WhatsApp status ({masked}): {r.status_code}", flush=True)
         except Exception as e:
             print(f"❌ WhatsApp send error: {e}", flush=True)
 
@@ -342,7 +345,7 @@ def scrape_2merkato():
                         page.locator("button[type='submit']").first.click()
                         page.wait_for_timeout(3000)
                 except Exception as e:
-                    print(f"⚠️ 2merkato login error, continuing without auth: {e}", flush=True)
+                    print(f"⚠️ 2merkato login bypassed: {e}", flush=True)
 
             seen_this_scan = set()
             for page_num in range(1, MERKATO_MAX_PAGES + 1):
@@ -391,8 +394,8 @@ def scrape_2merkato():
             browser.close()
 
         if pending_batch:
-            print(f"🤖 Batch analyzing {len(pending_batch)} tenders from 2merkato with Gemini...", flush=True)
-            analyzed_batch = batch_analyze_tenders(pending_batch)
+            print(f"🤖 Batch analyzing {len(pending_batch)} tenders from 2merkato with Groq...", flush=True)
+            analyzed_batch = batch_analyze_tenders_groq(pending_batch)
             
             found_count = 0
             for item in analyzed_batch:
@@ -429,7 +432,6 @@ def scrape_egp():
             context = browser.new_context(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
             page = context.new_page()
 
-            # Non-blocking login check
             if EGP_USER and EGP_PASS:
                 try:
                     page.goto(EGP_LOGIN_URL, timeout=20000, wait_until="domcontentloaded")
@@ -443,12 +445,11 @@ def scrape_egp():
                 except Exception as e:
                     print(f"⚠️ eGP optional login bypassed: {e}", flush=True)
 
-            # Direct navigation to public bids
             try:
                 page.goto(EGP_BIDS_URL, timeout=30000, wait_until="domcontentloaded")
                 page.wait_for_timeout(3000)
             except Exception as e:
-                print(f"❌ Could not reach eGP bids view: {e}", flush=True)
+                print(f"❌ Could not reach eGP public portal: {e}", flush=True)
                 browser.close()
                 return 0
 
@@ -462,7 +463,6 @@ def scrape_egp():
                     search_box.fill(term)
                     search_box.press("Enter")
                     
-                    # Wait for Angular dynamic rows to render
                     try:
                         page.wait_for_selector("table tbody tr", timeout=4000)
                     except Exception:
@@ -497,8 +497,8 @@ def scrape_egp():
             browser.close()
 
         if pending_batch:
-            print(f"🤖 Batch analyzing {len(pending_batch)} tenders from eGP with Gemini...", flush=True)
-            analyzed_batch = batch_analyze_tenders(pending_batch)
+            print(f"🤖 Batch analyzing {len(pending_batch)} tenders from eGP with Groq...", flush=True)
+            analyzed_batch = batch_analyze_tenders_groq(pending_batch)
             
             found_count = 0
             for item in analyzed_batch:
