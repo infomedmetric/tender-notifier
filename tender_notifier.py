@@ -13,7 +13,6 @@ import urllib3
 from groq import Groq, RateLimitError, APIError
 from dotenv import load_dotenv
 
-# Load environment variables if running locally
 load_dotenv()
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -37,7 +36,6 @@ MERKATO_MAX_PAGES = int(os.environ.get("MERKATO_MAX_PAGES", "4"))
 
 EGP_BASE = "https://production.egp.gov.et"
 EGP_BIDS_URL = f"{EGP_BASE}/egp/bids/all"
-# Streamlined list for memory safety during search loops
 EGP_SEARCH_TERMS = ["medical", "biomedical", "hemodialysis", "health", "ጥገና"]
 
 
@@ -232,9 +230,10 @@ def _rule_based_fallback(tenders_list):
     return tenders_list
 
 
-# ==================== SCRAPING ENGINES ====================
+# ==================== SCRAPING ENGINES WITH DEBUG LOGS ====================
 def process_and_notify(batch, source_name):
     if not batch:
+        print(f"ℹ️ No relevant pending tenders found for {source_name}.", flush=True)
         return 0
     print(f"🤖 Batch analyzing {len(batch)} tenders from {source_name} with Groq...", flush=True)
     analyzed = batch_analyze_tenders_groq(batch)
@@ -270,15 +269,19 @@ def scrape_2merkato(context):
                 page.locator("input[type='password']").first.fill(MERKATO_PASS)
                 page.locator("button[type='submit']").first.click()
                 page.wait_for_timeout(3000)
-            except Exception:
-                pass
+                print("✅ 2merkato login attempt completed.", flush=True)
+            except Exception as e:
+                print(f"⚠️ 2merkato login skipped/failed: {e}", flush=True)
 
         seen = set()
         for page_num in range(1, MERKATO_MAX_PAGES + 1):
             url = MERKATO_TENDERS_URL if page_num == 1 else f"{MERKATO_TENDERS_URL}?page={page_num}"
             page.goto(url, timeout=30000, wait_until="domcontentloaded")
             
-            for link in page.locator("a[href*='/tenders/']").all():
+            links = page.locator("a[href*='/tenders/']").all()
+            print(f"🔍 2merkato Page {page_num}: Found {len(links)} tender links.", flush=True)
+            
+            for link in links:
                 try:
                     title = link.inner_text().strip()
                     href = link.get_attribute("href")
@@ -289,6 +292,7 @@ def scrape_2merkato(context):
                     seen.add(full_link)
 
                     if is_relevant_tender(title):
+                        print(f"🎯 Match found (2merkato): {title[:60]}...", flush=True)
                         tender_id = f"merkato_{full_link.rstrip('/').split('/')[-1]}"
                         if not is_already_notified(tender_id):
                             pending.append({
@@ -313,35 +317,40 @@ def scrape_egp(context):
 
     seen = set()
     try:
-        # Loop over keywords safely. Reloading the page resets DOM memory to prevent crashes.
         for term in EGP_SEARCH_TERMS:
             try:
                 page.goto(EGP_BIDS_URL, timeout=60000, wait_until="domcontentloaded")
                 page.wait_for_timeout(2000)
                 
-                search_box = page.locator("input[placeholder*='Search' i]").first
-                if search_box.count() > 0:
+                search_box = page.locator("input[placeholder*='Search' i], input[type='text'], input.form-control").first
+                box_count = search_box.count()
+                print(f"🔍 eGP Search term '{term}': Input box found = {box_count > 0}", flush=True)
+
+                if box_count > 0:
                     search_box.fill(term)
                     search_box.press("Enter")
-                    page.wait_for_timeout(3000) # Wait for Angular to update the table
+                    page.wait_for_timeout(3000)
 
-                    rows = page.locator("table tbody tr").all()
-                    for row in rows:
-                        cells = row.locator("td").all_inner_texts()
-                        if not cells or len(cells) < 3: continue
-                        
-                        ref_no = cells[0].strip()
-                        title = cells[2].strip()
+                rows = page.locator("table tbody tr").all()
+                print(f"🔍 eGP Search term '{term}': Extracted {len(rows)} table rows.", flush=True)
 
-                        if is_relevant_tender(title):
-                            tender_id = f"egp_{ref_no or title}"
-                            if tender_id not in seen:
-                                seen.add(tender_id)
-                                if not is_already_notified(tender_id):
-                                    pending.append({
-                                        "id": tender_id, "title": title, "ref_no": ref_no,
-                                        "link": EGP_BIDS_URL, "raw_text": f"Title: {title}, Ref: {ref_no}"
-                                    })
+                for row in rows:
+                    cells = row.locator("td").all_inner_texts()
+                    if not cells or len(cells) < 3: continue
+                    
+                    ref_no = cells[0].strip()
+                    title = cells[2].strip()
+
+                    if is_relevant_tender(title):
+                        print(f"🎯 Match found (eGP): {title[:60]}...", flush=True)
+                        tender_id = f"egp_{ref_no or title}"
+                        if tender_id not in seen:
+                            seen.add(tender_id)
+                            if not is_already_notified(tender_id):
+                                pending.append({
+                                    "id": tender_id, "title": title, "ref_no": ref_no,
+                                    "link": EGP_BIDS_URL, "raw_text": f"Title: {title}, Ref: {ref_no}"
+                                })
             except Exception as e:
                 print(f"⚠️ eGP search error for term '{term}': {e}", flush=True)
                 continue
@@ -360,7 +369,6 @@ def check_for_tenders():
 
     try:
         with sync_playwright() as p:
-            # Singleton Browser launched ONCE to save massive amounts of RAM
             browser = p.chromium.launch(
                 headless=True,
                 args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu", "--single-process", "--no-zygote"]
