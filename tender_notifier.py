@@ -184,7 +184,7 @@ STRONG_KEYWORDS = [
     "reverse osmosis", "ro system", "water treatment", "spare parts",
     "biomedical engineering", "medical imaging", "calibration",
     "diagnostic equipment", "medical equipment", "hospital equipment",
-    "medical device", "የህክምና", "ጥገና"
+    "medical device", "የህክምና", "የህክምና መሣሪያ ጥገና"
 ]
 
 # Generic medical-adjacent words — only count if paired with an equipment/
