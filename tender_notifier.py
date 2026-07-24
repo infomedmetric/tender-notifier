@@ -12,6 +12,31 @@ import urllib3
 from google import genai
 from google.genai import types
 
+def _call_gemini_with_retry(client, prompt, config, max_retries=3, base_delay=2):
+    """
+    Wraps a Gemini generate_content call with retries + exponential backoff.
+    Most "connection error" fallbacks and irrelevant-tenders-slipping-through
+    cases were caused by a SINGLE transient network blip immediately giving
+    up — Render's free tier + Gemini's free tier both see occasional timeouts
+    that succeed on a second attempt.
+    """
+    last_error = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            return client.models.generate_content(
+                model='gemini-flash-latest',
+                contents=prompt,
+                config=config,
+            )
+        except Exception as e:
+            last_error = e
+            if attempt < max_retries:
+                delay = base_delay * attempt  # 2s, 4s, 6s...
+                print(f"⚠️ Gemini call failed (attempt {attempt}/{max_retries}): {e} — retrying in {delay}s", flush=True)
+                time.sleep(delay)
+    raise last_error
+
+
 def analyze_tender_with_ai(raw_tender_text: str) -> str:
     """
     Passes raw tender data to Gemini to handle translation, match scoring,
@@ -56,10 +81,10 @@ def analyze_tender_with_ai(raw_tender_text: str) -> str:
         """
         
         # Using gemini-2.5-flash as it is lightning fast, cheap, and has a huge context window for long texts
-        response = client.models.generate_content(
-            model='gemini-flash-latest',
-            contents=prompt,
-            config=types.GenerateContentConfig(
+        response = _call_gemini_with_retry(
+            client,
+            prompt,
+            types.GenerateContentConfig(
                 system_instruction=system_instruction,
                 temperature=0.2, # Low temperature ensures factual extraction instead of creative guessing
             )
@@ -73,16 +98,20 @@ def analyze_tender_with_ai(raw_tender_text: str) -> str:
 
 
 
-def ai_confirm_relevance(raw_tender_text: str) -> bool:
+def ai_confirm_relevance(raw_tender_text: str):
     """
     Second-stage check: even after keyword filtering, ask Gemini to confirm
     a tender is genuinely relevant before we spend a WhatsApp message on it.
-    Defaults to trusting the keyword filter if the AI call fails, so a
-    Gemini outage never blocks legitimate notifications.
+
+    Returns a (is_relevant, ai_verified) tuple. If the AI call fails even
+    after retries, we still default to trusting the keyword filter (so a
+    Gemini outage never blocks legitimate notifications) — but ai_verified
+    is False so the caller can flag the alert as unverified instead of
+    silently presenting a keyword-only match as if the AI had confirmed it.
     """
     api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
-        return True
+        return True, False
 
     try:
         client = genai.Client(api_key=api_key)
@@ -106,16 +135,16 @@ def ai_confirm_relevance(raw_tender_text: str) -> bool:
 
         Tender: {raw_tender_text}
         """
-        response = client.models.generate_content(
-            model='gemini-flash-latest',
-            contents=prompt,
-            config=types.GenerateContentConfig(temperature=0.0),
+        response = _call_gemini_with_retry(
+            client,
+            prompt,
+            types.GenerateContentConfig(temperature=0.0),
         )
         answer = (response.text or "").strip().upper()
-        return answer.startswith("Y")
+        return answer.startswith("Y"), True
     except Exception as e:
-        print(f"⚠️ AI relevance check failed, defaulting to keyword match result: {e}", flush=True)
-        return True
+        print(f"⚠️ AI relevance check failed after retries, defaulting to keyword match result: {e}", flush=True)
+        return True, False
 
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -436,10 +465,11 @@ def scrape_2merkato():
                             if not is_already_notified(tender_id):
                                 # Mark as notified immediately regardless of the AI
                                 # verdict — prevents re-checking (and re-spending
-                                # Gemini quota on) the same tender every 4 hours
+                                # Gemini quota on) the same tender on every scan cycle
                                 mark_as_notified(tender_id)
 
-                                if not ai_confirm_relevance(title_text):
+                                is_relevant, ai_verified = ai_confirm_relevance(title_text)
+                                if not is_relevant:
                                     print(f"🤖 AI rejected as not relevant, skipping alert: {title_text}", flush=True)
                                     continue
 
@@ -482,8 +512,10 @@ def scrape_2merkato():
 
                                 raw_text_payload = f"{title_text}\n\n{detail_text}".strip()
                                 ai_summary = analyze_tender_with_ai(raw_text_payload)
+                                verification_note = "" if ai_verified else "⚠️ *Unverified* (AI relevance check failed — keyword match only)\n"
                                 alert = (
                                     f"🔔 *New Medical Tender Found!*\n\n"
+                                    f"{verification_note}"
                                     f"📋 *Title:* {title_text}\n"
                                     f"🤖 *AI Summary:* {ai_summary}\n"
                                     f"🔗 *Link:* {full_link}"
@@ -705,10 +737,11 @@ def scrape_egp():
                                     # Mark as notified immediately regardless of the
                                     # AI verdict — prevents re-checking (and
                                     # re-spending Gemini quota on) the same tender
-                                    # every 4 hours
+                                    # on every scan cycle
                                     mark_as_notified(tender_id)
 
-                                    if not ai_confirm_relevance(f"{title_text} {ref_no}"):
+                                    is_relevant, ai_verified = ai_confirm_relevance(f"{title_text} {ref_no}")
+                                    if not is_relevant:
                                         print(f"🤖 AI rejected as not relevant, skipping alert: {title_text}", flush=True)
                                         continue
 
@@ -808,8 +841,10 @@ def scrape_egp():
                                     ai_summary = analyze_tender_with_ai(raw_text_payload)
 
                                     # 3. Construct the properly formatted multi-line WhatsApp alert string
+                                    verification_note = "" if ai_verified else "⚠️ *Unverified* (AI relevance check failed — keyword match only)\n\n"
                                     alert = (
                                         f"🔔 *New Medical Tender Found (eGP)!*\n\n"
+                                        f"{verification_note}"
                                         f"📋 *Title:* {title_text}\n"
                                         f"📄 *Ref No:* {ref_no}\n\n"
                                         f"🤖 *AI Analysis:*\n"
@@ -861,13 +896,19 @@ def check_for_tenders():
 
 
 def monitoring_loop():
+    # Configurable via Render env var so this doesn't need a code change next time —
+    # defaults to 6 hours if SCAN_INTERVAL_HOURS isn't set
+    try:
+        interval_hours = float(os.environ.get("SCAN_INTERVAL_HOURS", "6"))
+    except ValueError:
+        interval_hours = 6
     while True:
         try:
             check_for_tenders()
         except Exception:
             print("❌ check_for_tenders crashed at the top level:", flush=True)
             print(traceback.format_exc(), flush=True)
-        time.sleep(4 * 3600)
+        time.sleep(interval_hours * 3600)
 
 
 # ==================== FLASK ROUTES ====================
