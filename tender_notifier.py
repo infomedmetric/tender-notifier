@@ -13,11 +13,12 @@ import urllib3
 from google import genai
 from google.genai import types
 
-def _call_gemini_with_retry(client, prompt, config, max_retries=3, base_delay=2):
+# ==================== GEMINI AI ENGINE (BATCHED) ====================
+
+def _call_gemini_with_retry(client, prompt, config, max_retries=3):
     """
-    Wraps a Gemini generate_content call with retries + exponential backoff.
+    Handles 429 RESOURCE_EXHAUSTED errors by waiting out the free-tier rate limit delay.
     """
-    last_error = None
     for attempt in range(1, max_retries + 1):
         try:
             return client.models.generate_content(
@@ -26,32 +27,30 @@ def _call_gemini_with_retry(client, prompt, config, max_retries=3, base_delay=2)
                 config=config,
             )
         except Exception as e:
-            last_error = e
-            if attempt < max_retries:
-                delay = base_delay * attempt
-                print(f"⚠️ Gemini call failed (attempt {attempt}/{max_retries}): {e} — retrying in {delay}s", flush=True)
+            err_msg = str(e)
+            if "429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg:
+                delay = 25 * attempt
+                print(f"⚠️ Gemini Rate Limit / 429 Quota Exceeded. Retrying in {delay}s (Attempt {attempt}/{max_retries})...", flush=True)
                 time.sleep(delay)
-    raise last_error
+            else:
+                if attempt < max_retries:
+                    time.sleep(3 * attempt)
+                else:
+                    raise e
+    raise Exception("Max Gemini retries exceeded.")
 
 
 def batch_analyze_tenders(tenders_list: list) -> list:
     """
-    Analyzes multiple tenders at once in a single Gemini API call.
-    Reduces API calls dramatically to respect free tier rate limits.
-    
-    tenders_list should be a list of dicts:
-    [
-        {"id": "...", "title": "...", "ref_no": "...", "link": "...", "raw_text": "..."},
-        ...
-    ]
+    Processes a list of tenders in a single Gemini API call to conserve free-tier quota.
     """
     if not tenders_list:
         return []
 
     api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
-        print("Error: GEMINI_API_KEY environment variable is missing.", flush=True)
-        return []
+        print("⚠️ GEMINI_API_KEY missing. Falling back to rule-based filtering.", flush=True)
+        return _rule_based_fallback(tenders_list)
 
     try:
         client = genai.Client(api_key=api_key)
@@ -74,6 +73,7 @@ def batch_analyze_tenders(tenders_list: list) -> list:
                 f"--- TENDER INDEX {idx} ---\n"
                 f"ID: {item.get('id')}\n"
                 f"Title: {item.get('title')}\n"
+                f"Ref No: {item.get('ref_no', 'N/A')}\n"
                 f"Details: {item.get('raw_text', '')[:2000]}\n"
             )
 
@@ -81,11 +81,11 @@ def batch_analyze_tenders(tenders_list: list) -> list:
         Analyze the following tenders for medMETRIC Healthcare.
 
         For each tender:
-        1. Determine if it is RELEVANT to medMETRIC's technical scope (Yes/No).
-           Answer NO if it's primarily for medicines, pharmaceuticals, vaccines, or lab reagents.
-        2. Assign a Match Score (0-100%) and 1-sentence reasoning.
+        1. Determine if it is RELEVANT to medMETRIC's technical scope (true/false).
+           Set to false if it's primarily for medicines, pharmaceuticals, vaccines, or lab reagents.
+        2. Assign a Match Score (0-100%) with 1-sentence reasoning.
         3. Extract Key Constraints (bank guarantees, local agent, manufacturer authorizations, etc.).
-        4. Extract Deadline / Closing Date in EAT.
+        4. Extract Deadline / Closing Date in East Africa Time (EAT).
 
         Return a JSON Array matching this schema exactly:
         [
@@ -113,24 +113,33 @@ def batch_analyze_tenders(tenders_list: list) -> list:
         )
 
         results = json.loads(response.text)
-        
-        # Attach AI analysis results back to original tender dictionaries
-        evaluated_tenders = []
+        evaluated = []
         for res in results:
             idx = res.get("index")
             if idx is not None and idx < len(tenders_list):
-                tender = tenders_list[idx]
-                tender["is_relevant"] = res.get("is_relevant", False)
-                tender["match_score"] = res.get("match_score", "N/A")
-                tender["constraints"] = res.get("constraints", "None identified")
-                tender["closing_date"] = res.get("closing_date", "Not specified")
-                evaluated_tenders.append(tender)
-
-        return evaluated_tenders
+                t = tenders_list[idx]
+                t["is_relevant"] = res.get("is_relevant", True)
+                t["match_score"] = res.get("match_score", "Match identified")
+                t["constraints"] = res.get("constraints", "Check full listing")
+                t["closing_date"] = res.get("closing_date", "Refer to portal")
+                evaluated.append(t)
+        return evaluated
 
     except Exception as e:
-        print(f"❌ Batch AI analysis failed: {e}", flush=True)
-        return []
+        print(f"❌ Batch AI analysis failed ({e}). Using rule-based fallback...", flush=True)
+        return _rule_based_fallback(tenders_list)
+
+
+def _rule_based_fallback(tenders_list):
+    """Fallback if Gemini API fails or runs out of quota so alerts still trigger."""
+    evaluated = []
+    for t in tenders_list:
+        t["is_relevant"] = True  # Already passed is_relevant_tender filter
+        t["match_score"] = "Keyword Match (AI Unavailable)"
+        t["constraints"] = "Review portal listing directly"
+        t["closing_date"] = "Check portal"
+        evaluated.append(t)
+    return evaluated
 
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -195,6 +204,7 @@ HARD_EXCLUDE_TERMS = [
 ]
 
 CONTEXTUAL_EXCLUDE_TERMS = ["consultancy services", "consulting firm"]
+
 
 def is_relevant_tender(title):
     title_lower = title.lower()
@@ -312,8 +322,7 @@ def scrape_2merkato():
 
             if MERKATO_USER and MERKATO_PASS:
                 try:
-                    page.goto(MERKATO_LOGIN_URL, timeout=30000, wait_until="domcontentloaded")
-                    page.wait_for_selector("input[type='password']", timeout=20000)
+                    page.goto(MERKATO_LOGIN_URL, timeout=20000, wait_until="domcontentloaded")
                     email_field = page.locator("input[type='email'], input[name*='user' i]").first
                     pass_field = page.locator("input[type='password']").first
 
@@ -321,9 +330,9 @@ def scrape_2merkato():
                         email_field.fill(MERKATO_USER)
                         pass_field.fill(MERKATO_PASS)
                         page.locator("button[type='submit']").first.click()
-                        page.wait_for_timeout(4000)
+                        page.wait_for_timeout(3000)
                 except Exception as e:
-                    print(f"⚠️ Login error: {e}", flush=True)
+                    print(f"⚠️ 2merkato optional login bypassed: {e}", flush=True)
 
             seen_this_scan = set()
             for page_num in range(1, MERKATO_MAX_PAGES + 1):
@@ -357,7 +366,8 @@ def scrape_2merkato():
                                 except Exception:
                                     pass
                                 finally:
-                                    if detail_page: detail_page.close()
+                                    if detail_page: 
+                                        detail_page.close()
 
                                 pending_batch.append({
                                     "id": tender_id,
@@ -396,7 +406,7 @@ def scrape_2merkato():
         return 0
 
     except Exception as e:
-        print(f"❌ 2merkato error: {e}", flush=True)
+        print(f"❌ 2merkato engine error: {e}", flush=True)
         return 0
 
 
@@ -411,10 +421,10 @@ def scrape_egp():
             context = browser.new_context()
             page = context.new_page()
 
+            # Optional Login Attempt - Bypassed gracefully on timeout
             if EGP_USER and EGP_PASS:
                 try:
-                    page.goto(EGP_LOGIN_URL, timeout=30000, wait_until="domcontentloaded")
-                    page.wait_for_selector("input[type='password']", timeout=20000)
+                    page.goto(EGP_LOGIN_URL, timeout=15000, wait_until="domcontentloaded")
                     user_field = page.locator("input[type='email'], input[type='text']").first
                     pass_field = page.locator("input[type='password']").first
 
@@ -422,51 +432,56 @@ def scrape_egp():
                         user_field.fill(EGP_USER)
                         pass_field.fill(EGP_PASS)
                         page.locator("button[type='submit']").first.click()
-                        page.wait_for_timeout(3000)
+                        page.wait_for_timeout(2000)
                 except Exception as e:
-                    print(f"⚠️ eGP login error: {e}", flush=True)
+                    print(f"⚠️ eGP optional login bypassed/timed out: {e}", flush=True)
 
+            # Directly load the public bids view
             try:
-                page.locator("text=Tenders").first.click(timeout=10000, force=True)
-                page.wait_for_selector("text=/Bidding List/i", timeout=15000)
-            except Exception:
+                page.goto(EGP_BIDS_URL, timeout=25000, wait_until="domcontentloaded")
+                page.wait_for_timeout(3000)
+            except Exception as e:
+                print(f"❌ Could not reach eGP public bids portal: {e}", flush=True)
                 browser.close()
                 return 0
 
             search_box = page.locator("input[placeholder*='Search' i]").first
             seen_this_scan = set()
 
-            for term in EGP_SEARCH_TERMS:
-                try:
-                    search_box.click()
-                    search_box.fill("")
-                    search_box.fill(term)
-                    search_box.press("Enter")
-                    page.wait_for_timeout(2000)
+            if search_box.count() > 0:
+                for term in EGP_SEARCH_TERMS:
+                    try:
+                        search_box.click()
+                        search_box.fill("")
+                        search_box.fill(term)
+                        search_box.press("Enter")
+                        page.wait_for_timeout(2000)
 
-                    rows = page.locator("table tbody tr").all()
-                    for row in rows:
-                        cells = row.locator("td").all_inner_texts()
-                        if not cells: continue
-                        ref_no = cells[0].strip() if len(cells) > 0 else ""
-                        title_text = cells[2].strip() if len(cells) > 2 else " ".join(cells)
+                        rows = page.locator("table tbody tr").all()
+                        for row in rows:
+                            cells = row.locator("td").all_inner_texts()
+                            if not cells: 
+                                continue
+                            ref_no = cells[0].strip() if len(cells) > 0 else ""
+                            title_text = cells[2].strip() if len(cells) > 2 else " ".join(cells)
 
-                        row_key = ref_no or title_text
-                        if row_key in seen_this_scan: continue
-                        seen_this_scan.add(row_key)
+                            row_key = ref_no or title_text
+                            if row_key in seen_this_scan: 
+                                continue
+                            seen_this_scan.add(row_key)
 
-                        if is_relevant_tender(title_text):
-                            tender_id = f"egp_{ref_no or title_text}"
-                            if not is_already_notified(tender_id):
-                                pending_batch.append({
-                                    "id": tender_id,
-                                    "title": title_text,
-                                    "ref_no": ref_no,
-                                    "link": EGP_BIDS_URL,
-                                    "raw_text": f"Title: {title_text}, Ref: {ref_no}"
-                                })
-                except Exception:
-                    continue
+                            if is_relevant_tender(title_text):
+                                tender_id = f"egp_{ref_no or title_text}"
+                                if not is_already_notified(tender_id):
+                                    pending_batch.append({
+                                        "id": tender_id,
+                                        "title": title_text,
+                                        "ref_no": ref_no,
+                                        "link": EGP_BIDS_URL,
+                                        "raw_text": f"Title: {title_text}, Ref: {ref_no}"
+                                    })
+                    except Exception:
+                        continue
 
             browser.close()
 
@@ -496,7 +511,7 @@ def scrape_egp():
         return 0
 
     except Exception as e:
-        print(f"❌ eGP error: {e}", flush=True)
+        print(f"❌ eGP engine error: {e}", flush=True)
         return 0
 
 
@@ -550,4 +565,3 @@ if __name__ == "__main__":
     threading.Thread(target=monitoring_loop, daemon=True).start()
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
-
