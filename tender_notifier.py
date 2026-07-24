@@ -5,6 +5,7 @@ import threading
 import traceback
 import hmac
 import psycopg2
+import json
 from datetime import datetime
 from flask import Flask, request
 from playwright.sync_api import sync_playwright
@@ -12,24 +13,49 @@ import urllib3
 from google import genai
 from google.genai import types
 
-def analyze_tender_with_ai(raw_tender_text: str) -> str:
+def _call_gemini_with_retry(client, prompt, config, max_retries=3, base_delay=2):
     """
-    Passes raw tender data to Gemini to handle translation, match scoring,
-    and constraint extraction in a single step.
+    Wraps a Gemini generate_content call with retries + exponential backoff.
     """
-    # Fallback structure if the API call fails
-    fallback_text = "⚠️ [AI Analysis Unavailable due to a connection error]"
+    last_error = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            return client.models.generate_content(
+                model='gemini-flash-latest',
+                contents=prompt,
+                config=config,
+            )
+        except Exception as e:
+            last_error = e
+            if attempt < max_retries:
+                delay = base_delay * attempt
+                print(f"⚠️ Gemini call failed (attempt {attempt}/{max_retries}): {e} — retrying in {delay}s", flush=True)
+                time.sleep(delay)
+    raise last_error
+
+
+def batch_analyze_tenders(tenders_list: list) -> list:
+    """
+    Analyzes multiple tenders at once in a single Gemini API call.
+    Reduces API calls dramatically to respect free tier rate limits.
     
+    tenders_list should be a list of dicts:
+    [
+        {"id": "...", "title": "...", "ref_no": "...", "link": "...", "raw_text": "..."},
+        ...
+    ]
+    """
+    if not tenders_list:
+        return []
+
     api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
-        print("Error: GEMINI_API_KEY environment variable is missing.")
-        return fallback_text
+        print("Error: GEMINI_API_KEY environment variable is missing.", flush=True)
+        return []
 
     try:
-        # Initialize the official current client
         client = genai.Client(api_key=api_key)
         
-        # System instructions force the AI to behave like a strict procurement bot
         system_instruction = (
             "You are an expert procurement analyst for medMETRIC Healthcare Service PLC, "
             "an Ethiopian biomedical engineering and technical-services company. Their scope "
@@ -39,83 +65,72 @@ def analyze_tender_with_ai(raw_tender_text: str) -> str:
             "diagnostic/therapeutic equipment, medical imaging equipment, spare-parts sourcing, "
             "and general medical equipment supply/consultancy. They do NOT supply medicines, "
             "pharmaceuticals, vaccines, or laboratory-only equipment/reagents. "
-            "Analyze the provided raw text and return a structured analysis matching the requested format. "
-            "Keep answers extremely concise so they fit perfectly on a mobile phone WhatsApp screen."
+            "Analyze the batch of tenders and return a JSON array of objects."
         )
-        
+
+        formatted_input = []
+        for idx, item in enumerate(tenders_list):
+            formatted_input.append(
+                f"--- TENDER INDEX {idx} ---\n"
+                f"ID: {item.get('id')}\n"
+                f"Title: {item.get('title')}\n"
+                f"Details: {item.get('raw_text', '')[:2000]}\n"
+            )
+
         prompt = f"""
-        Analyze this raw tender data and extract the details precisely. 
-        
-        Format your response exactly like this:
-        🎯 **Match Score:** [X% - Provide a 1-sentence reason judged against medMETRIC's full scope: equipment maintenance/service contracts, calibration, CSSD/sterilization, RO/water treatment, medical imaging, spare parts, or general medical equipment supply — not hemodialysis alone. If this is actually a pure medicine/pharmaceutical or laboratory-only tender, score it low and say so explicitly]
-        ⚠️ **Constraints:** [List any crucial requirements like bank guarantees/bid bonds, local agent rules, or specific manufacturer authorizations. If none, write "None identified"]
-        📅 **Closing Date:** [Extract deadline date and time. Keep it in East Africa Time (EAT)]
-        
-        Raw Tender Data:
-        {raw_tender_text}
+        Analyze the following tenders for medMETRIC Healthcare.
+
+        For each tender:
+        1. Determine if it is RELEVANT to medMETRIC's technical scope (Yes/No).
+           Answer NO if it's primarily for medicines, pharmaceuticals, vaccines, or lab reagents.
+        2. Assign a Match Score (0-100%) and 1-sentence reasoning.
+        3. Extract Key Constraints (bank guarantees, local agent, manufacturer authorizations, etc.).
+        4. Extract Deadline / Closing Date in EAT.
+
+        Return a JSON Array matching this schema exactly:
+        [
+            {{
+                "index": 0,
+                "is_relevant": true,
+                "match_score": "85% - Relevant equipment service contract.",
+                "constraints": "100,000 ETB Bid Bond required.",
+                "closing_date": "Aug 15, 2026 at 10:00 AM EAT"
+            }}
+        ]
+
+        Tenders to process:
+        {"".join(formatted_input)}
         """
-        
-        # Using gemini-2.5-flash as it is lightning fast, cheap, and has a huge context window for long texts
-        response = client.models.generate_content(
-            model='gemini-flash-latest',
-            contents=prompt,
-            config=types.GenerateContentConfig(
+
+        response = _call_gemini_with_retry(
+            client,
+            prompt,
+            types.GenerateContentConfig(
                 system_instruction=system_instruction,
-                temperature=0.2, # Low temperature ensures factual extraction instead of creative guessing
+                temperature=0.1,
+                response_mime_type="application/json"
             )
         )
+
+        results = json.loads(response.text)
         
-        return response.text if response.text else fallback_text
+        # Attach AI analysis results back to original tender dictionaries
+        evaluated_tenders = []
+        for res in results:
+            idx = res.get("index")
+            if idx is not None and idx < len(tenders_list):
+                tender = tenders_list[idx]
+                tender["is_relevant"] = res.get("is_relevant", False)
+                tender["match_score"] = res.get("match_score", "N/A")
+                tender["constraints"] = res.get("constraints", "None identified")
+                tender["closing_date"] = res.get("closing_date", "Not specified")
+                evaluated_tenders.append(tender)
+
+        return evaluated_tenders
 
     except Exception as e:
-        print(f"AI Generation failed: {e}")
-        return fallback_text
-
-
-
-def ai_confirm_relevance(raw_tender_text: str) -> bool:
-    """
-    Second-stage check: even after keyword filtering, ask Gemini to confirm
-    a tender is genuinely relevant before we spend a WhatsApp message on it.
-    Defaults to trusting the keyword filter if the AI call fails, so a
-    Gemini outage never blocks legitimate notifications.
-    """
-    api_key = os.environ.get("GEMINI_API_KEY")
-    if not api_key:
-        return True
-
-    try:
-        client = genai.Client(api_key=api_key)
-        prompt = f"""
-        You are a strict relevance filter for medMETRIC Healthcare, an Ethiopian
-        biomedical engineering and technical-services company.
-
-        Is this tender clearly relevant to ANY of: medical equipment supply,
-        medical equipment maintenance/repair/service contracts, biomedical
-        engineering, hemodialysis machines, RO/water treatment systems,
-        CSSD/sterilization equipment, calibration & compliance testing of
-        medical equipment, medical imaging equipment, spare parts for medical
-        equipment, medical equipment consultancy, or a medical-equipment-related
-        ICB (International Competitive Bid) tender?
-
-        Answer NO if the tender is primarily about: medicines, pharmaceuticals,
-        vaccines, or laboratory-only equipment/reagents/consumables — medMETRIC
-        does not supply those, even though they may mention "medical" in passing.
-
-        Reply with EXACTLY one word: YES or NO.
-
-        Tender: {raw_tender_text}
-        """
-        response = client.models.generate_content(
-            model='gemini-flash-latest',
-            contents=prompt,
-            config=types.GenerateContentConfig(temperature=0.0),
-        )
-        answer = (response.text or "").strip().upper()
-        return answer.startswith("Y")
-    except Exception as e:
-        print(f"⚠️ AI relevance check failed, defaulting to keyword match result: {e}", flush=True)
-        return True
+        print(f"❌ Batch AI analysis failed: {e}", flush=True)
+        return []
 
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -125,31 +140,19 @@ app = Flask(__name__)
 # ================== CONFIGURATION ==================
 EVOLUTION_BASE = os.environ.get("EVOLUTION_BASE", "https://medmetric-evolution.onrender.com")
 INSTANCE_NAME = os.environ.get("INSTANCE_NAME", "Tender-Notifier.")
-
-# SECURITY: no hardcoded fallback — a real API key must never live in source
-# code, especially in a public repo. If it's missing, we log a clear warning
-# at startup rather than silently sending requests with an empty key.
 GLOBAL_API_KEY = os.environ.get("GLOBAL_API_KEY")
-if not GLOBAL_API_KEY:
-    print("⚠️ GLOBAL_API_KEY is not set — WhatsApp sends will fail until it's configured in Render's environment variables.", flush=True)
 
-# SECURITY/PRIVACY: no hardcoded phone number — recipients must be supplied
-# via the WHATSAPP_NUMBERS env var (comma-separated).
+if not GLOBAL_API_KEY:
+    print("⚠️ GLOBAL_API_KEY is not set.", flush=True)
+
 WHATSAPP_NUMBERS = [
     n.strip() for n in os.environ.get("WHATSAPP_NUMBERS", "").split(",") if n.strip()
 ]
-if not WHATSAPP_NUMBERS:
-    print("⚠️ WHATSAPP_NUMBERS is not set — no recipients configured.", flush=True)
 
-# Shared secret required to trigger a manual scan via /test-check. Without
-# this, anyone who discovers the public Render URL could trigger scans on
-# demand, burning your Gemini quota and spamming your WhatsApp numbers.
 TEST_CHECK_TOKEN = os.environ.get("TEST_CHECK_TOKEN")
-
 MERKATO_USER = os.environ.get("MERKATO_USER")
 MERKATO_PASS = os.environ.get("MERKATO_PASS")
 
-# CORRECT domain — the working tenders app, not www.2merkato.com
 MERKATO_BASE = "https://tender.2merkato.com"
 MERKATO_LOGIN_URL = f"{MERKATO_BASE}/login"
 MERKATO_TENDERS_URL = f"{MERKATO_BASE}/tenders"
@@ -162,61 +165,36 @@ EGP_USER = os.environ.get("EGP_USER")
 EGP_PASS = os.environ.get("EGP_PASS")
 EGP_ORG_NAME = os.environ.get("EGP_ORG_NAME", "Medmetric")
 
-# Search terms fed one at a time into eGP's own built-in table search box —
-# far more reliable than scraping every row across 13+ pages.
-# Rebuilt around medMETRIC's actual service lines (medmetrichealthcare.com):
-# maintenance/service contracts, RO water treatment, CSSD/sterilization,
-# and calibration — not just dialysis. "laboratory" intentionally dropped —
-# lab-only tenders are explicitly out of scope.
 EGP_SEARCH_TERMS = [
     "medical equipment", "biomedical", "hemodialysis", "dialysis",
     "calibration", "sterilization", "water treatment", "hospital equipment",
     "x-ray", "ultrasound", "medical imaging", "spare parts"
 ]
 
-# Any ONE of these alone is specific enough to trigger a match.
-# Includes medMETRIC's actual named service lines (CSSD, RO/water treatment,
-# calibration, spare parts, biomedical engineering) so tenders aren't
-# under-scored just because they're not dialysis-specific.
 STRONG_KEYWORDS = [
     "biomedical", "hemodialysis", "dialysis", "b.braun", "dialog+", "sws-4000a",
     "x-ray", "xray", "ultrasound", "ventilator", "autoclave", "sterilizer",
     "sterilization", "sterile processing", "cssd", "rivamed",
-    "reverse osmosis", "ro system", "water treatment", "medical equipment spare parts",
+    "reverse osmosis", "ro system", "water treatment", "spare parts",
     "biomedical engineering", "medical imaging", "calibration",
     "diagnostic equipment", "medical equipment", "hospital equipment",
-    "medical device", "የህክምና", "የህክምና ጥገና"
+    "medical device", "የህክምና", "ጥገና"
 ]
 
-# Generic medical-adjacent words — only count if paired with an equipment/
-# procurement-type word in the same title (avoids matching HR/insurance/
-# consulting tenders that merely mention "health"). "laboratory" removed —
-# lab-only tenders are handled by HARD_EXCLUDE_TERMS below instead.
 MEDICAL_CONTEXT = ["medical", "health", "hospital", "biomedical", "clinical"]
 EQUIPMENT_CONTEXT = ["equipment", "supplies", "supply", "device", "machine",
                      "instrument", "apparatus", "maintenance", "repair", "procurement",
                      "calibration", "installation", "servicing", "spare parts",
                      "consulting", "consultancy", "icb"]
 
-# Always excluded regardless of context — these categories are never
-# relevant to Medmetric no matter what else appears in the title.
-# Laboratory-only tenders and pure medicine/pharmaceutical supply tenders
-# (e.g. "RDF Medicines...") are explicitly out of scope — medMETRIC is a
-# biomedical engineering/technical-service company, not a drug supplier.
 HARD_EXCLUDE_TERMS = [
     "vehicle", "toyota", "car ", "motorbike", "insurance", "life insurance",
-    "term life", "gpa","ተሽከርካሪዎች",
-    "laboratory", "lab reagent", "reagent", "lab equipment",
+    "term life", "gpa", "laboratory", "lab reagent", "reagent", "lab equipment",
     "medicine", "medicines", "pharmaceutical", "pharmaceuticals",
     "drug", "drugs", "vaccine", "vaccines", "rdf medicine", "rdf medicines"
 ]
 
-# Excluded UNLESS the title also shows clear medical + equipment context —
-# generic "consultancy services" for HR/finance/etc. should be skipped, but
-# "medical equipment consultancy services" should NOT be, since Medmetric
-# offers exactly that
 CONTEXTUAL_EXCLUDE_TERMS = ["consultancy services", "consulting firm"]
-
 
 def is_relevant_tender(title):
     title_lower = title.lower()
@@ -230,7 +208,6 @@ def is_relevant_tender(title):
     if any(term in title_lower for term in CONTEXTUAL_EXCLUDE_TERMS):
         if not (has_medical_context and has_equipment_context):
             return False
-        # else: it's medical-equipment consultancy — fall through, don't exclude
 
     if any(term in title_lower for term in STRONG_KEYWORDS):
         return True
@@ -240,19 +217,12 @@ def is_relevant_tender(title):
 
 # ==================== PERSISTENT DEDUP (Postgres) ====================
 DATABASE_URL = os.environ.get("DATABASE_URL")
-
-# Reuse a single connection across the whole scan instead of opening/closing
-# a new one per tender — repeated SSL handshakes were adding real memory/CPU
-# overhead on Render's free tier and were the likely cause of the scan
-# stalling or getting silently killed partway through page 1.
 _db_conn = None
-
 
 def get_db_connection():
     global _db_conn
     if _db_conn is not None:
         try:
-            # Cheap liveness check — reuse the connection if it's still good
             cur = _db_conn.cursor()
             cur.execute("SELECT 1")
             cur.close()
@@ -267,11 +237,8 @@ def get_db_connection():
     _db_conn = psycopg2.connect(DATABASE_URL, sslmode="require", connect_timeout=10)
     return _db_conn
 
-
 def init_db():
-    """Run once at startup to ensure the dedup table exists."""
     if not DATABASE_URL:
-        print("⚠️ DATABASE_URL not set — falling back to in-memory dedup (will reset on restart)", flush=True)
         return
     try:
         conn = get_db_connection()
@@ -284,15 +251,10 @@ def init_db():
         """)
         conn.commit()
         cur.close()
-        print("✅ Connected to Postgres and verified notified_tenders table", flush=True)
     except Exception as e:
-        print(f"❌ Postgres init failed, falling back to in-memory dedup: {e}", flush=True)
+        print(f"❌ Postgres init failed: {e}", flush=True)
 
-
-# In-memory fallback used only if DATABASE_URL is missing or unreachable —
-# keeps the app functional (just without persistence) rather than crashing
 _MEMORY_FALLBACK = set()
-
 
 def is_already_notified(tender_id: str) -> bool:
     if not DATABASE_URL:
@@ -304,10 +266,8 @@ def is_already_notified(tender_id: str) -> bool:
         result = cur.fetchone()
         cur.close()
         return result is not None
-    except Exception as e:
-        print(f"⚠️ DB check failed for {tender_id}, using memory fallback: {e}", flush=True)
+    except Exception:
         return tender_id in _MEMORY_FALLBACK
-
 
 def mark_as_notified(tender_id: str):
     if not DATABASE_URL:
@@ -322,14 +282,11 @@ def mark_as_notified(tender_id: str):
         )
         conn.commit()
         cur.close()
-    except Exception as e:
-        print(f"⚠️ DB insert failed for {tender_id}, using memory fallback: {e}", flush=True)
+    except Exception:
         _MEMORY_FALLBACK.add(tender_id)
-
 
 def send_whatsapp(message):
     if not GLOBAL_API_KEY or not WHATSAPP_NUMBERS:
-        print("❌ Cannot send WhatsApp message: GLOBAL_API_KEY or WHATSAPP_NUMBERS is not configured.", flush=True)
         return
 
     url = f"{EVOLUTION_BASE}/message/sendText/{INSTANCE_NAME}"
@@ -337,86 +294,44 @@ def send_whatsapp(message):
     for number in WHATSAPP_NUMBERS:
         payload = {"number": number, "text": message}
         try:
-            r = requests.post(url, json=payload, headers=headers, timeout=10)
-            # PRIVACY: mask most of the phone number in logs rather than
-            # printing it in full — logs can end up shared/exported more
-            # widely than intended
-            masked = number[:5] + "***" + number[-2:] if len(number) > 7 else "***"
-            print(f"✅ WhatsApp Status ({masked}): {r.status_code}", flush=True)
+            requests.post(url, json=payload, headers=headers, timeout=10)
         except Exception as e:
             print(f"❌ Send error: {e}", flush=True)
 
 
-# ==================== ENGINE: 2MERKATO (Playwright) ====================
+# ==================== ENGINE: 2MERKATO ====================
 def scrape_2merkato():
-    print(f"[{datetime.now()}] 🔍 Running 2merkato Engine (Playwright)...", flush=True)
-    found = 0
+    print(f"[{datetime.now()}] 🔍 Running 2merkato Engine...", flush=True)
+    pending_batch = []
 
     try:
         with sync_playwright() as p:
-            browser = p.chromium.launch(
-                headless=True,
-                args=["--no-sandbox", "--disable-dev-shm-usage"]
-            )
-            context = browser.new_context(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-            )
+            browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
+            context = browser.new_context()
             page = context.new_page()
 
-            # --- Login (optional — only if credentials provided) ---
             if MERKATO_USER and MERKATO_PASS:
                 try:
-                    # domcontentloaded instead of networkidle — SPA sites with
-                    # ads/analytics often never go fully idle, causing false timeouts
                     page.goto(MERKATO_LOGIN_URL, timeout=30000, wait_until="domcontentloaded")
-
-                    # Wait specifically for a password field to render, rather than
-                    # waiting for the whole network to go quiet
                     page.wait_for_selector("input[type='password']", timeout=20000)
-
-                    # Diagnostic dump — logs every input field's actual attributes so we
-                    # can see the real markup if selectors below don't match
-                    field_info = page.eval_on_selector_all(
-                        "input",
-                        "els => els.map(e => ({type: e.type, name: e.name, id: e.id, placeholder: e.placeholder}))"
-                    )
-                    print(f"🔎 Login page input fields detected: {field_info}", flush=True)
-
-                    email_field = page.locator(
-                        "input[type='email'], input[name*='email' i], input[name*='user' i], "
-                        "input[id*='email' i], input[id*='user' i], input[placeholder*='email' i]"
-                    ).first
+                    email_field = page.locator("input[type='email'], input[name*='user' i]").first
                     pass_field = page.locator("input[type='password']").first
 
                     if email_field.count() > 0 and pass_field.count() > 0:
                         email_field.fill(MERKATO_USER)
                         pass_field.fill(MERKATO_PASS)
-
-                        submit_btn = page.locator(
-                            "button[type='submit'], button:has-text('Login'), button:has-text('Sign in'), "
-                            "button:has-text('Log in'), input[type='submit']"
-                        ).first
-                        submit_btn.click()
-
-                        # Give the SPA a moment to process login + redirect
+                        page.locator("button[type='submit']").first.click()
                         page.wait_for_timeout(4000)
-                        current_url = page.url
-                        print(f"✅ Submitted login, current URL: {current_url}", flush=True)
-                    else:
-                        print(f"⚠️ Could not confidently identify email/username field among: {field_info}", flush=True)
                 except Exception as e:
-                    print(f"⚠️ Login attempt failed, continuing without auth: {e}", flush=True)
+                    print(f"⚠️ Login error: {e}", flush=True)
 
-            # --- Load tenders listing across multiple pages ---
             seen_this_scan = set()
             for page_num in range(1, MERKATO_MAX_PAGES + 1):
                 page_url = MERKATO_TENDERS_URL if page_num == 1 else f"{MERKATO_TENDERS_URL}?page={page_num}"
-                print(f"➡️ Loading 2merkato page {page_num}: {page_url}", flush=True)
                 page.goto(page_url, timeout=30000, wait_until="domcontentloaded")
-                page.wait_for_timeout(3000)
+                page.wait_for_timeout(2000)
 
                 links = page.locator("a[href*='/tenders/']").all()
-                print(f"Page {page_num}: found {len(links)} raw tender links", flush=True)
 
                 for link in links:
                     try:
@@ -426,7 +341,6 @@ def scrape_2merkato():
                             continue
 
                         full_link = href if href.startswith("http") else f"{MERKATO_BASE}{href}"
-
                         if full_link in seen_this_scan:
                             continue
                         seen_this_scan.add(full_link)
@@ -434,443 +348,184 @@ def scrape_2merkato():
                         if is_relevant_tender(title_text):
                             tender_id = f"merkato_{full_link.rstrip('/').split('/')[-1]}"
                             if not is_already_notified(tender_id):
-                                # Mark as notified immediately regardless of the AI
-                                # verdict — prevents re-checking (and re-spending
-                                # Gemini quota on) the same tender every 4 hours
-                                mark_as_notified(tender_id)
-
-                                if not ai_confirm_relevance(title_text):
-                                    print(f"🤖 AI rejected as not relevant, skipping alert: {title_text}", flush=True)
-                                    continue
-
-                                found += 1
-
-                                # Fetch the actual detail page — the listing title alone
-                                # never contains the submission deadline, which is why
-                                # closing date kept coming back "not specified." Open it
-                                # in a SEPARATE tab so we don't disturb pagination state
-                                # on the main listing page.
                                 detail_text = ""
                                 detail_page = None
                                 try:
                                     detail_page = context.new_page()
-                                    detail_page.goto(full_link, timeout=20000, wait_until="domcontentloaded")
-                                    try:
-                                        detail_page.wait_for_load_state("networkidle", timeout=10000)
-                                    except Exception:
-                                        pass
-                                    for poll_attempt in range(5):
-                                        detail_page.wait_for_timeout(1000)
-                                        try:
-                                            candidate = detail_page.locator("body").inner_text(timeout=5000)
-                                        except Exception:
-                                            candidate = ""
-                                        if len(candidate) > 300:
-                                            detail_text = candidate
-                                            break
-                                        detail_text = candidate
-                                    detail_text = detail_text[:6000]
-                                    print(f"📄 Captured {len(detail_text)} chars from 2merkato detail page", flush=True)
-                                except Exception as e:
-                                    print(f"⚠️ Could not read 2merkato detail page text: {e}", flush=True)
+                                    detail_page.goto(full_link, timeout=15000, wait_until="domcontentloaded")
+                                    detail_text = detail_page.locator("body").inner_text(timeout=3000)[:3000]
+                                except Exception:
+                                    pass
                                 finally:
-                                    if detail_page is not None:
-                                        try:
-                                            detail_page.close()
-                                        except Exception:
-                                            pass
+                                    if detail_page: detail_page.close()
 
-                                raw_text_payload = f"{title_text}\n\n{detail_text}".strip()
-                                ai_summary = analyze_tender_with_ai(raw_text_payload)
-                                alert = (
-                                    f"🔔 *New Medical Tender Found!*\n\n"
-                                    f"📋 *Title:* {title_text}\n"
-                                    f"🤖 *AI Summary:* {ai_summary}\n"
-                                    f"🔗 *Link:* {full_link}"
-                                )
-                                send_whatsapp(alert)
-                                time.sleep(2)
+                                pending_batch.append({
+                                    "id": tender_id,
+                                    "title": title_text,
+                                    "ref_no": "N/A",
+                                    "link": full_link,
+                                    "raw_text": f"{title_text}\n{detail_text}"
+                                })
                     except Exception:
                         continue
 
             browser.close()
 
-        print(f"2merkato engine complete. Discovered {found} active matches.", flush=True)
-        return found
+        # Batch analyze all candidates at once
+        if pending_batch:
+            print(f"🤖 Batch analyzing {len(pending_batch)} tenders from 2merkato...", flush=True)
+            analyzed_batch = batch_analyze_tenders(pending_batch)
+            
+            found_count = 0
+            for item in analyzed_batch:
+                mark_as_notified(item["id"])
+                if item.get("is_relevant"):
+                    found_count += 1
+                    alert = (
+                        f"🔔 *New Medical Tender Found! (2merkato)*\n\n"
+                        f"📋 *Title:* {item['title']}\n"
+                        f"🎯 *Match Score:* {item['match_score']}\n"
+                        f"⚠️ *Constraints:* {item['constraints']}\n"
+                        f"📅 *Closing Date:* {item['closing_date']}\n\n"
+                        f"🔗 *Link:* {item['link']}"
+                    )
+                    send_whatsapp(alert)
+                    time.sleep(1)
+            return found_count
+
+        return 0
 
     except Exception as e:
-        print(f"❌ 2merkato extraction engine down: {e}", flush=True)
+        print(f"❌ 2merkato error: {e}", flush=True)
         return 0
 
 
-# ==================== ENGINE: eGP (egp.gov.et) ====================
+# ==================== ENGINE: eGP ====================
 def scrape_egp():
-    print(f"[{datetime.now()}] 🔍 Running eGP Engine (Playwright)...", flush=True)
-    found = 0
+    print(f"[{datetime.now()}] 🔍 Running eGP Engine...", flush=True)
+    pending_batch = []
 
     try:
         with sync_playwright() as p:
-            browser = p.chromium.launch(
-                headless=True,
-                args=["--no-sandbox", "--disable-dev-shm-usage"]
-            )
-            context = browser.new_context(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-            )
+            browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
+            context = browser.new_context()
             page = context.new_page()
 
-            # --- Login (optional — only if credentials provided) ---
             if EGP_USER and EGP_PASS:
                 try:
                     page.goto(EGP_LOGIN_URL, timeout=30000, wait_until="domcontentloaded")
                     page.wait_for_selector("input[type='password']", timeout=20000)
-
-                    field_info = page.eval_on_selector_all(
-                        "input",
-                        "els => els.map(e => ({type: e.type, name: e.name, id: e.id, placeholder: e.placeholder}))"
-                    )
-                    print(f"🔎 eGP login page input fields detected: {field_info}", flush=True)
-
-                    user_field = page.locator(
-                        "input[type='email'], input[type='text'], input[name*='user' i], "
-                        "input[name*='email' i], input[id*='user' i], input[id*='email' i], "
-                        "input[placeholder*='user' i], input[placeholder*='email' i]"
-                    ).first
+                    user_field = page.locator("input[type='email'], input[type='text']").first
                     pass_field = page.locator("input[type='password']").first
 
                     if user_field.count() > 0 and pass_field.count() > 0:
                         user_field.fill(EGP_USER)
                         pass_field.fill(EGP_PASS)
-
-                        submit_btn = page.locator(
-                            "button[type='submit'], button:has-text('Login'), button:has-text('Sign in'), "
-                            "button:has-text('Log in'), input[type='submit']"
-                        ).first
-                        submit_btn.click()
-
-                        page.wait_for_timeout(4000)
-                        current_url = page.url
-                        print(f"✅ eGP login submitted, current URL: {current_url}", flush=True)
-
-                        if "/login" in current_url:
-                            # Still on the login page — the login itself
-                            # failed (bad credentials, site-side validation
-                            # error, etc). Surface whatever error message the
-                            # page is showing and abort this scan cleanly
-                            # rather than timing out repeatedly on a
-                            # "Tenders" link that will never appear.
-                            try:
-                                error_text = page.locator(
-                                    "[class*='error' i], [class*='alert' i], [role='alert'], "
-                                    "text=/invalid/i, text=/incorrect/i, text=/failed/i"
-                                ).first.inner_text(timeout=3000)
-                            except Exception:
-                                error_text = "(no visible error message found on page)"
-                            print(f"❌ eGP login failed — still on login page. On-page message: {error_text}", flush=True)
-                            browser.close()
-                            return 0
-
-                        if "organization-selector" in current_url:
-                            try:
-                                # Wait specifically for the org card to render — the
-                                # selector page loads the org list asynchronously, and
-                                # querying too early only finds the static Logout button
-                                page.wait_for_selector(f"text=/{EGP_ORG_NAME}/i", timeout=15000)
-
-                                clickable_info = page.eval_on_selector_all(
-                                    "button, a, li, [role='button']",
-                                    "els => els.slice(0, 30).map(e => ({tag: e.tagName, text: e.innerText.trim().slice(0,60), class: e.className}))"
-                                )
-                                print(f"🔎 Organization-selector clickable elements: {clickable_info}", flush=True)
-
-                                org_option = page.locator(f"text=/{EGP_ORG_NAME}/i").first
-                                print(f"🔎 Org name match count: {org_option.count()}", flush=True)
-                                if org_option.count() == 0:
-                                    # Fallback to generic heuristic if name match fails
-                                    org_option = page.locator(
-                                        "button:has-text('Continue'), button:has-text('Select'), "
-                                        "li:has-text('Continue'), a:has-text('Continue'), "
-                                        "[class*='organization' i], [class*='org-card' i], li, button"
-                                    ).first
-
-                                if org_option.count() > 0:
-                                    org_option.click()
-                                    page.wait_for_timeout(3000)
-                                    print(f"✅ Clicked organization option, now at: {page.url}", flush=True)
-                                else:
-                                    print("⚠️ No clickable organization option found", flush=True)
-                            except Exception as e:
-                                print(f"⚠️ Organization-selector handling failed: {e}", flush=True)
-                    else:
-                        print(f"⚠️ Could not confidently identify eGP username/password field among: {field_info}", flush=True)
+                        page.locator("button[type='submit']").first.click()
+                        page.wait_for_timeout(3000)
                 except Exception as e:
-                    print(f"⚠️ eGP login attempt failed, continuing without auth: {e}", flush=True)
+                    print(f"⚠️ eGP login error: {e}", flush=True)
 
-            # --- Dismiss any blocking modal (this app uses Ant Design/ng-zorro
-            # modals — one may pop up after org selection and intercept clicks).
-            # Logs showed an nz-modal-container sitting inside a
-            # cdk-overlay-container that our old .ant-modal-close selector
-            # didn't match, so we now target that structure directly too and
-            # retry Escape a few times since one press isn't always enough. ---
-            for attempt in range(3):
-                try:
-                    modal_close = page.locator(
-                        ".ant-modal-close, .nz-modal-close, [class*='modal-close' i], "
-                        "button:has-text('Close'), button:has-text('OK'), "
-                        "button:has-text('Got it'), button:has-text('Dismiss')"
-                    ).first
-                    if modal_close.count() > 0:
-                        modal_close.click(timeout=3000)
-                        page.wait_for_timeout(800)
-                        print(f"✅ Closed a blocking modal dialog (attempt {attempt + 1})", flush=True)
-                except Exception:
-                    pass
-
-                page.keyboard.press("Escape")
-                page.wait_for_timeout(500)
-
-                # If an overlay/modal container is still present, click its
-                # backdrop to force it closed rather than waiting on a
-                # specific button that may not exist for this modal type
-                try:
-                    overlay = page.locator(".cdk-overlay-backdrop, nz-modal-container").first
-                    if overlay.count() == 0:
-                        break  # nothing left blocking — stop retrying
-                    backdrop = page.locator(".cdk-overlay-backdrop").first
-                    if backdrop.count() > 0:
-                        backdrop.click(timeout=2000, force=True)
-                        page.wait_for_timeout(500)
-                        print(f"✅ Clicked overlay backdrop to dismiss modal (attempt {attempt + 1})", flush=True)
-                except Exception:
-                    pass
-
-            # --- Navigate to Bidding List via the Tenders nav link (client-side
-            # routing — direct URL navigation to /egp/bids/all doesn't load the
-            # real table, it just bounces back to the dashboard) ---
             try:
-                tenders_link = page.locator("text=Tenders").first
-                try:
-                    tenders_link.click(timeout=15000)
-                except Exception as click_err:
-                    # A leftover overlay can still intercept the click even
-                    # after the dismissal attempts above — force it through
-                    # rather than giving up the whole scan
-                    print(f"⚠️ Normal click on Tenders failed ({click_err}), forcing click", flush=True)
-                    tenders_link.click(timeout=10000, force=True)
+                page.locator("text=Tenders").first.click(timeout=10000, force=True)
                 page.wait_for_selector("text=/Bidding List/i", timeout=15000)
-                print("✅ Reached Bidding List view", flush=True)
-            except Exception as e:
-                print(f"❌ Could not reach Bidding List view: {e}", flush=True)
+            except Exception:
                 browser.close()
                 return 0
 
             search_box = page.locator("input[placeholder*='Search' i]").first
-
             seen_this_scan = set()
+
             for term in EGP_SEARCH_TERMS:
                 try:
                     search_box.click()
                     search_box.fill("")
-                    page.wait_for_timeout(300)
                     search_box.fill(term)
                     search_box.press("Enter")
-                    page.wait_for_timeout(2500)  # let the table filter update
+                    page.wait_for_timeout(2000)
 
-                    actual_value = search_box.input_value()
                     rows = page.locator("table tbody tr").all()
-                    first_row_preview = ""
-                    if rows:
-                        try:
-                            first_row_preview = rows[0].inner_text().replace("\n", " | ")[:100]
-                        except Exception:
-                            pass
-                    print(f"eGP search '{term}' | input value now: '{actual_value}' | {len(rows)} rows | first row: {first_row_preview!r}", flush=True)
-
                     for row in rows:
-                        try:
-                            cells = row.locator("td").all_inner_texts()
-                            if not cells:
-                                continue
-                            ref_no = cells[0].strip() if len(cells) > 0 else ""
-                            title_text = cells[2].strip() if len(cells) > 2 else " | ".join(cells)
+                        cells = row.locator("td").all_inner_texts()
+                        if not cells: continue
+                        ref_no = cells[0].strip() if len(cells) > 0 else ""
+                        title_text = cells[2].strip() if len(cells) > 2 else " ".join(cells)
 
-                            row_key = ref_no or title_text
-                            if row_key in seen_this_scan:
-                                continue
-                            seen_this_scan.add(row_key)
+                        row_key = ref_no or title_text
+                        if row_key in seen_this_scan: continue
+                        seen_this_scan.add(row_key)
 
-                            if is_relevant_tender(title_text):
-                                tender_id = f"egp_{ref_no or title_text}"
-                                if not is_already_notified(tender_id):
-                                    # Mark as notified immediately regardless of the
-                                    # AI verdict — prevents re-checking (and
-                                    # re-spending Gemini quota on) the same tender
-                                    # every 4 hours
-                                    mark_as_notified(tender_id)
-
-                                    if not ai_confirm_relevance(f"{title_text} {ref_no}"):
-                                        print(f"🤖 AI rejected as not relevant, skipping alert: {title_text}", flush=True)
-                                        continue
-
-                                    found += 1
-
-                                    # Try a plain anchor href inside the row first —
-                                    # cheap, no navigation needed
-                                    detail_link = EGP_BIDS_URL
-                                    try:
-                                        row_anchor = row.locator("a").first
-                                        if row_anchor.count() > 0:
-                                            href = row_anchor.get_attribute("href")
-                                            if href:
-                                                detail_link = href if href.startswith("http") else f"{EGP_BASE}{href}"
-                                                print(f"🔗 Found row anchor href: {detail_link}", flush=True)
-                                    except Exception:
-                                        pass
-
-                                    # No plain href — click the row to capture the
-                                    # real URL the SPA navigates to, then go back and
-                                    # restore the search filter
-                                    if detail_link == EGP_BIDS_URL:
-                                        try:
-                                            row.click(timeout=8000)
-                                            page.wait_for_timeout(2500)
-                                            detail_link = page.url
-                                            print(f"🔗 Captured detail URL via click-through: {detail_link}", flush=True)
-                                            page.go_back(timeout=8000)
-                                            page.wait_for_timeout(1500)
-                                            search_box = page.locator("input[placeholder*='Search' i]").first
-                                            search_box.click()
-                                            search_box.fill("")
-                                            page.wait_for_timeout(200)
-                                            search_box.fill(term)
-                                            search_box.press("Enter")
-                                            page.wait_for_timeout(2500)
-                                        except Exception as e:
-                                            print(f"⚠️ Click-through for detail link failed: {e}", flush=True)
-                                            detail_link = EGP_BIDS_URL
-
-                                    # 1. Fetch the actual detail page text — the title/ref_no
-                                    # alone never contain closing date, bid bond, or
-                                    # eligibility info, which is why those fields were
-                                    # always coming back "not specified." We open the
-                                    # detail page in a SEPARATE tab so we never disturb
-                                    # the main page's search box / filtered results.
-                                    detail_text = ""
-                                    if detail_link and detail_link != EGP_BIDS_URL:
-                                        detail_page = None
-                                        try:
-                                            detail_page = context.new_page()
-                                            detail_page.goto(detail_link, timeout=20000, wait_until="domcontentloaded")
-                                            # Angular SPA detail views render fields async — a
-                                            # fixed short wait was catching the loading skeleton
-                                            # (both captures logged an identical, suspiciously
-                                            # small 144 chars). Wait for network activity to
-                                            # settle, then poll for the text to actually grow
-                                            # past a "still loading" size before giving up.
-                                            try:
-                                                detail_page.wait_for_load_state("networkidle", timeout=10000)
-                                            except Exception:
-                                                pass  # some SPAs never go fully idle — fine, we still poll below
-
-                                            detail_text = ""
-                                            for poll_attempt in range(5):
-                                                detail_page.wait_for_timeout(1500)
-                                                try:
-                                                    candidate = detail_page.locator("body").inner_text(timeout=5000)
-                                                except Exception:
-                                                    candidate = ""
-                                                # Real detail content (title, ref, dates, scope,
-                                                # eligibility) runs to many hundreds of chars —
-                                                # treat anything under ~300 as still loading
-                                                if len(candidate) > 300:
-                                                    detail_text = candidate
-                                                    break
-                                                detail_text = candidate  # keep best-effort fallback
-
-                                            # Trim to a sane size — some detail pages include
-                                            # long boilerplate/nav text we don't need to send
-                                            # to Gemini, and it wastes tokens/quota
-                                            detail_text = detail_text[:6000]
-                                            print(f"📄 Captured {len(detail_text)} chars from eGP detail page", flush=True)
-                                        except Exception as e:
-                                            print(f"⚠️ Could not read eGP detail page text: {e}", flush=True)
-                                        finally:
-                                            if detail_page is not None:
-                                                try:
-                                                    detail_page.close()
-                                                except Exception:
-                                                    pass
-
-                                    # 2. Run the AI analysis using the function we built,
-                                    # now backed by real detail-page content instead of
-                                    # just the title and ref number
-                                    raw_text_payload = f"{title_text} {ref_no}\n\n{detail_text}".strip()
-                                    ai_summary = analyze_tender_with_ai(raw_text_payload)
-
-                                    # 3. Construct the properly formatted multi-line WhatsApp alert string
-                                    alert = (
-                                        f"🔔 *New Medical Tender Found (eGP)!*\n\n"
-                                        f"📋 *Title:* {title_text}\n"
-                                        f"📄 *Ref No:* {ref_no}\n\n"
-                                        f"🤖 *AI Analysis:*\n"
-                                        f"{ai_summary}\n\n"
-                                        f"🔗 *Link:* {detail_link}"
-                                    )
-
-                                    send_whatsapp(alert)
-                                    time.sleep(2)
-                        except Exception:
-                            continue
-
-                except Exception as e:
-                    print(f"⚠️ eGP search for '{term}' failed: {e}", flush=True)
+                        if is_relevant_tender(title_text):
+                            tender_id = f"egp_{ref_no or title_text}"
+                            if not is_already_notified(tender_id):
+                                pending_batch.append({
+                                    "id": tender_id,
+                                    "title": title_text,
+                                    "ref_no": ref_no,
+                                    "link": EGP_BIDS_URL,
+                                    "raw_text": f"Title: {title_text}, Ref: {ref_no}"
+                                })
+                except Exception:
                     continue
 
             browser.close()
 
-        print(f"eGP engine complete. Discovered {found} active matches.", flush=True)
-        return found
+        # Batch analyze eGP items
+        if pending_batch:
+            print(f"🤖 Batch analyzing {len(pending_batch)} tenders from eGP...", flush=True)
+            analyzed_batch = batch_analyze_tenders(pending_batch)
+            
+            found_count = 0
+            for item in analyzed_batch:
+                mark_as_notified(item["id"])
+                if item.get("is_relevant"):
+                    found_count += 1
+                    alert = (
+                        f"🔔 *New Medical Tender Found! (eGP)*\n\n"
+                        f"📋 *Title:* {item['title']}\n"
+                        f"📄 *Ref No:* {item['ref_no']}\n"
+                        f"🎯 *Match Score:* {item['match_score']}\n"
+                        f"⚠️ *Constraints:* {item['constraints']}\n"
+                        f"📅 *Closing Date:* {item['closing_date']}\n\n"
+                        f"🔗 *Link:* {item['link']}"
+                    )
+                    send_whatsapp(alert)
+                    time.sleep(1)
+            return found_count
+
+        return 0
 
     except Exception as e:
-        print(f"❌ eGP extraction engine down: {e}", flush=True)
+        print(f"❌ eGP error: {e}", flush=True)
         return 0
 
 
 # ==================== RUN COORDINATOR ====================
 def check_for_tenders():
     print("=================== STARTING SCAN CYCLE ===================", flush=True)
-    try:
-        merkato_total = scrape_2merkato()
-    except Exception:
-        print("❌ 2merkato engine crashed with an unhandled exception:", flush=True)
-        print(traceback.format_exc(), flush=True)
-        merkato_total = 0
-
-    try:
-        egp_total = scrape_egp()
-    except Exception:
-        print("❌ eGP engine crashed with an unhandled exception:", flush=True)
-        print(traceback.format_exc(), flush=True)
-        egp_total = 0
+    merkato_total = scrape_2merkato()
+    egp_total = scrape_egp()
 
     total = merkato_total + egp_total
-    print(f"=================== SCAN COMPLETE: {total} NEW FOUND ({merkato_total} 2merkato, {egp_total} eGP) ===================", flush=True)
+    print(f"=================== SCAN COMPLETE: {total} NEW FOUND ===================", flush=True)
 
     if total == 0:
-        send_whatsapp("🔍 *Tender Monitor Scan Completed.*\nNo new unique medical equipment or maintenance matches found on 2merkato or eGP.")
+        send_whatsapp("🔍 *Tender Monitor Scan Completed.*\nNo new unique medical equipment or maintenance matches found.")
 
 
 def monitoring_loop():
+    try:
+        interval_hours = float(os.environ.get("SCAN_INTERVAL_HOURS", "6"))
+    except ValueError:
+        interval_hours = 6
     while True:
         try:
             check_for_tenders()
         except Exception:
-            print("❌ check_for_tenders crashed at the top level:", flush=True)
             print(traceback.format_exc(), flush=True)
-        time.sleep(4 * 3600)
+        time.sleep(interval_hours * 3600)
 
 
-# ==================== FLASK ROUTES ====================
 @app.route('/')
 def home():
     return "Medical Tender Tracking Service Is Online!", 200
@@ -878,11 +533,8 @@ def home():
 
 @app.route('/test-check')
 def manual_test():
-    # SECURITY: without this check, anyone who finds the public Render URL
-    # could trigger a scan on demand — burning Gemini API quota and sending
-    # WhatsApp messages at will. Require a shared secret token to proceed.
     if not TEST_CHECK_TOKEN:
-        return "Manual trigger is disabled: TEST_CHECK_TOKEN is not configured.", 503
+        return "Manual trigger disabled", 503
 
     provided_token = request.args.get("token", "")
     if not hmac.compare_digest(provided_token, TEST_CHECK_TOKEN):
@@ -892,11 +544,10 @@ def manual_test():
     return "Scraper sync cycle triggered!", 200
 
 
-# Ensure the dedup table exists as soon as the module loads (covers both
-# `python app.py` local runs and gunicorn/production imports)
 init_db()
 
 if __name__ == "__main__":
     threading.Thread(target=monitoring_loop, daemon=True).start()
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
