@@ -214,7 +214,7 @@ STRONG_KEYWORDS = [
     "reverse osmosis", "ro system", "water treatment", "spare parts",
     "biomedical engineering", "medical imaging", "calibration",
     "diagnostic equipment", "medical equipment", "hospital equipment",
-    "medical device", "የህክምና", "ጥገና"
+    "medical device", "የህክምና", "የህክምና መሳሪያዎች ጥገና"
 ]
 
 # Generic medical-adjacent words — only count if paired with an equipment/
@@ -224,7 +224,7 @@ STRONG_KEYWORDS = [
 MEDICAL_CONTEXT = ["medical", "health", "hospital", "biomedical", "clinical"]
 EQUIPMENT_CONTEXT = ["equipment", "supplies", "supply", "device", "machine",
                      "instrument", "apparatus", "maintenance", "repair", "procurement",
-                     "calibration", "installation", "servicing", "spare parts",
+                     "calibration", "installation", "servicing", "medical equipment spare parts",
                      "consulting", "consultancy", "icb"]
 
 # Always excluded regardless of context — these categories are never
@@ -234,7 +234,7 @@ EQUIPMENT_CONTEXT = ["equipment", "supplies", "supply", "device", "machine",
 # biomedical engineering/technical-service company, not a drug supplier.
 HARD_EXCLUDE_TERMS = [
     "vehicle", "toyota", "car ", "motorbike", "insurance", "life insurance",
-    "term life", "gpa",
+    "term life", "gpa", "ተሽከርካሪ", "ተሽከርካሪዎች", "መድሐኒት", "የግብርና ምርቶች", "እንሰሳቶች",
     "laboratory", "lab reagent", "reagent", "lab equipment",
     "medicine", "medicines", "pharmaceutical", "pharmaceuticals",
     "drug", "drugs", "vaccine", "vaccines", "rdf medicine", "rdf medicines"
