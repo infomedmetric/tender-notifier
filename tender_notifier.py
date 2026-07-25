@@ -880,13 +880,15 @@ def check_for_tenders():
 
     total_sent = 0
     if candidates:
-        # ONE Groq call for the entire scan cycle, covering every candidate
-        # from both engines — instead of the old per-tender approach that
-        # could burn the whole day's free-tier quota (20 requests/day) in a
-        # single scan.
+        # ONE (or a handful of) Groq call(s) for the entire scan cycle, covering
+        # every candidate from both engines — instead of the old per-tender
+        # approach that could burn a day's free-tier quota in a single scan.
+        # NOTE: this only batches the AI ANALYSIS step, not the WhatsApp
+        # notifications — each tender still gets sent as its own message
+        # below, since that's easier to read/forward than one long combined
+        # message.
         batch_results = batch_analyze_tenders(candidates)
 
-        alert_blocks = []  # collected here, sent as a handful of BATCHED messages below
         for i, c in enumerate(candidates):
             result = batch_results.get(i) if batch_results is not None else None
 
@@ -919,55 +921,32 @@ def check_for_tenders():
                 ai_verified = True
 
             if not is_relevant:
-                print(f"🤖 AI rejected as not relevant, skipping alert: {c['title']}", flush=True)
+                # Log the AI's actual reasoning, not just the title — makes
+                # it possible to sanity-check a borderline rejection (e.g. a
+                # title that LOOKED relevant) without digging through the
+                # WhatsApp thread for context that was never sent there
+                print(f"🤖 AI rejected as not relevant, skipping alert: {c['title']} — reason: {reason or '(no reason returned)'}", flush=True)
                 continue
 
-            verification_note = "⚠️ *Unverified* (keyword match only)\n" if not ai_verified else ""
-            ref_line = f"📄 *Ref No:* {c['ref_no']}\n" if c.get("ref_no") else ""
+            verification_note = "⚠️ *Unverified* (AI review failed — keyword match only)\n\n" if not ai_verified else ""
+            ref_line = f"📄 *Ref No:* {c['ref_no']}\n\n" if c.get("ref_no") else ""
             source_label = "eGP" if c["source"] == "egp" else "2merkato"
+            label = f"New Medical Tender Found ({source_label})!"
 
-            block = (
+            alert = (
+                f"🔔 *{label}*\n\n"
                 f"{verification_note}"
                 f"📋 *Title:* {c['title']}\n"
                 f"{ref_line}"
-                f"🌐 *Source:* {source_label}\n"
+                f"🤖 *AI Analysis:*\n"
                 f"🎯 *Match Score:* {match_score}% - {reason}\n"
                 f"⚠️ *Constraints:* {constraints}\n"
-                f"📅 *Closing Date:* {closing_date}\n"
+                f"📅 *Closing Date:* {closing_date}\n\n"
                 f"🔗 *Link:* {c['link']}"
             )
-            alert_blocks.append(block)
+            send_whatsapp(alert)
             total_sent += 1
-
-        # Batch all individual tender blocks into a SMALL NUMBER of WhatsApp
-        # messages instead of one message per tender — a scan with 17 matches
-        # used to mean 17 separate notifications landing back-to-back.
-        # WhatsApp text messages comfortably handle a few thousand characters,
-        # so we group blocks together and only start a new message once the
-        # running length would get unwieldy on a phone screen.
-        if alert_blocks:
-            MAX_CHARS_PER_MESSAGE = 3000
-            chunks = []
-            current_chunk = []
-            current_len = 0
-            for block in alert_blocks:
-                block_len = len(block) + len("\n\n━━━━━━━━━━━━━━━\n\n")
-                if current_chunk and current_len + block_len > MAX_CHARS_PER_MESSAGE:
-                    chunks.append(current_chunk)
-                    current_chunk = []
-                    current_len = 0
-                current_chunk.append(block)
-                current_len += block_len
-            if current_chunk:
-                chunks.append(current_chunk)
-
-            total_chunks = len(chunks)
-            for idx, chunk in enumerate(chunks, start=1):
-                part_label = f" — part {idx}/{total_chunks}" if total_chunks > 1 else ""
-                header = f"🔔 *{len(alert_blocks)} New Medical Tender(s) Found{part_label}*\n\n"
-                message = header + "\n\n━━━━━━━━━━━━━━━\n\n".join(chunk)
-                send_whatsapp(message)
-                time.sleep(2)
+            time.sleep(2)
 
     total = total_sent
     print(f"=================== SCAN COMPLETE: {total} ALERTS SENT ({len(candidates)} candidates reviewed) ===================", flush=True)
