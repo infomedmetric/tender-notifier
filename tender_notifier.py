@@ -47,32 +47,13 @@ def _call_groq_with_retry(client, system_instruction, prompt, temperature=0.2, m
     raise last_error
 
 
-def batch_analyze_tenders(candidates: list):
-    """
-    Analyzes ALL candidate tenders from a scan cycle in a SINGLE Groq call,
-    instead of one (or two) calls per tender. Even free-tier LLM APIs cap
-    daily/per-minute requests — with even a handful of matching tenders per
-    scan, a per-tender approach can burn through a day's quota in one cycle.
-    Batching means a scan with 15 candidate tenders costs 1 request instead
-    of up to 30.
-
-    Returns a dict {index: {relevant, match_score, reason, constraints,
-    closing_date}} on success, or None if the AI call failed entirely (even
-    after retries) — the caller should then fall back to sending all
-    candidates flagged as unverified rather than silently dropping them.
-    """
-    if not candidates:
-        return {}
-
-    api_key = os.environ.get("GROQ_API_KEY")
-    if not api_key:
-        return None
-
+def _build_batch_prompt(chunk_with_indices):
+    """Builds the system + user prompt for one sub-batch of (index, candidate) pairs."""
     entries = []
-    for i, c in enumerate(candidates):
+    for i, c in chunk_with_indices:
         entries.append(
             f"[{i}] Source: {c['source']} | Title: {c['title']} | Ref No: {c.get('ref_no', '')}\n"
-            f"Detail: {c.get('detail_text', '')[:2000]}"
+            f"Detail: {c.get('detail_text', '')[:900]}"
         )
     joined_entries = "\n\n".join(entries)
 
@@ -94,32 +75,80 @@ def batch_analyze_tenders(candidates: list):
         '"closing_date": "Not specified in provided text"}, ...]}\n'
         "Respond with ONLY that JSON object — no markdown fences, no commentary."
     )
-
     prompt = f"Tenders to analyze:\n\n{joined_entries}"
+    return system_instruction, prompt
 
-    try:
-        client = Groq(api_key=api_key)
-        response = _call_groq_with_retry(client, system_instruction, prompt, temperature=0.2)
-        raw = (response.choices[0].message.content or "").strip()
-        # Strip markdown code fences if the model added them anyway
-        if raw.startswith("```"):
-            raw = raw.split("```")[1]
-            if raw.startswith("json"):
-                raw = raw[4:]
-            raw = raw.strip()
-        parsed = json.loads(raw)
-        # Accept either {"tenders": [...]} or a bare [...] array, in case
-        # the model doesn't follow the wrapper-object instruction exactly
-        items = parsed.get("tenders", []) if isinstance(parsed, dict) else parsed
-        results = {}
-        for item in items:
-            idx = item.get("index")
-            if idx is not None:
-                results[idx] = item
-        return results
-    except Exception as e:
-        print(f"⚠️ Batch AI analysis failed after retries: {e}", flush=True)
+
+def batch_analyze_tenders(candidates: list):
+    """
+    Analyzes ALL candidate tenders from a scan cycle in as FEW Groq calls as
+    possible — instead of one call per tender. Even free-tier LLM APIs cap
+    daily/per-minute requests (both a request count AND a tokens-per-minute
+    budget), so a per-tender approach can burn through a day's quota in one
+    scan.
+
+    A single-mega-request approach hit Groq's TPM (tokens per minute) limit
+    once there were 15-20+ candidates with detail text attached (413 "Request
+    too large"). So candidates are split into smaller sub-batches sized to
+    stay comfortably under the TPM limit, each sent as its own Groq call —
+    still far fewer calls than one per tender (e.g. 23 candidates becomes
+    ~3 calls instead of 23 or 46).
+
+    Returns a dict {index: {relevant, match_score, reason, constraints,
+    closing_date}} on success (possibly missing some indices if only some
+    sub-batches failed — the caller already treats a missing index as
+    "unverified, fall back to keyword match"), or None if EVERY sub-batch
+    failed (e.g. no API key, or Groq unreachable entirely).
+    """
+    if not candidates:
+        return {}
+
+    api_key = os.environ.get("GROQ_API_KEY")
+    if not api_key:
         return None
+
+    # Sized conservatively: with detail_text capped at 900 chars/candidate,
+    # ~7 candidates per chunk keeps prompt+completion tokens well under
+    # Groq's 12,000 TPM limit for llama-3.3-70b-versatile, even accounting
+    # for the system instruction and JSON completion overhead.
+    CHUNK_SIZE = 7
+
+    client = Groq(api_key=api_key)
+    indexed_candidates = list(enumerate(candidates))
+    chunks = [indexed_candidates[i:i + CHUNK_SIZE] for i in range(0, len(indexed_candidates), CHUNK_SIZE)]
+
+    all_results = {}
+    any_chunk_succeeded = False
+
+    for chunk_num, chunk in enumerate(chunks, start=1):
+        system_instruction, prompt = _build_batch_prompt(chunk)
+        try:
+            response = _call_groq_with_retry(client, system_instruction, prompt, temperature=0.2)
+            raw = (response.choices[0].message.content or "").strip()
+            if raw.startswith("```"):
+                raw = raw.split("```")[1]
+                if raw.startswith("json"):
+                    raw = raw[4:]
+                raw = raw.strip()
+            parsed = json.loads(raw)
+            items = parsed.get("tenders", []) if isinstance(parsed, dict) else parsed
+            for item in items:
+                idx = item.get("index")
+                if idx is not None:
+                    all_results[idx] = item
+            any_chunk_succeeded = True
+        except Exception as e:
+            print(f"⚠️ Batch AI analysis sub-batch {chunk_num}/{len(chunks)} failed after retries: {e}", flush=True)
+            # Leave this sub-batch's indices out of all_results — the caller
+            # already falls back to "unverified, keyword match only" for any
+            # index missing from the results dict
+
+        # Small pause between sub-batches so back-to-back chunks don't
+        # themselves stack up against the TPM window
+        if chunk_num < len(chunks):
+            time.sleep(3)
+
+    return all_results if any_chunk_succeeded else None
 
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
