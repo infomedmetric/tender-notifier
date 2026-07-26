@@ -1,4 +1,4 @@
-eimport os
+import os
 import time
 import json
 import requests
@@ -188,7 +188,7 @@ MERKATO_LOGIN_URL = f"{MERKATO_BASE}/login"
 MERKATO_TENDERS_URL = f"{MERKATO_BASE}/tenders"
 MERKATO_MAX_PAGES = int(os.environ.get("MERKATO_MAX_PAGES", "4"))
 
-ጥገናየ_BASE = "https://production.egp.gov.et"
+EGP_BASE = "https://production.egp.gov.et"
 EGP_LOGIN_URL = f"{EGP_BASE}/egp/login"
 EGP_BIDS_URL = f"{EGP_BASE}/egp/bids/all"
 EGP_USER = os.environ.get("EGP_USER")
@@ -218,7 +218,7 @@ STRONG_KEYWORDS = [
     "reverse osmosis", "ro system", "water treatment", "spare parts",
     "biomedical engineering", "medical imaging", "calibration",
     "diagnostic equipment", "medical equipment", "hospital equipment",
-    "medical device", "የህክምና", "የህክምና መሣሪያ ጥገና"
+    "medical device", "የህክምና", "ጥገና"
 ]
 
 # Generic medical-adjacent words — only count if paired with an equipment/
@@ -228,7 +228,7 @@ STRONG_KEYWORDS = [
 MEDICAL_CONTEXT = ["medical", "health", "hospital", "biomedical", "clinical"]
 EQUIPMENT_CONTEXT = ["equipment", "supplies", "supply", "device", "machine",
                      "instrument", "apparatus", "maintenance", "repair", "procurement",
-                     "calibration", "installation", "servicing", "medical equipment spare parts",
+                     "calibration", "installation", "servicing", "spare parts",
                      "consulting", "consultancy", "icb"]
 
 # Always excluded regardless of context — these categories are never
