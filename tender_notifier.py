@@ -71,7 +71,7 @@ def _build_batch_prompt(chunk_with_indices):
         "return a JSON object with a single key \"tenders\" whose value is an array — one "
         "object per tender, covering every index given, with EXACTLY this shape:\n"
         '{"tenders": [{"index": 0, "relevant": true, "match_score": 85, '
-        '"reason": "short sentence reason", "Object": "Object of Procurement types listed", '
+        '"reason": "short sentence reason", "Object": "Object of Procurement types listed on tendering page", '
         '"closing_date": "show Bid Submission Deadline"}, ...]}\n'
         "Respond with ONLY that JSON object — no markdown fences, no commentary."
     )
@@ -212,9 +212,9 @@ EGP_SEARCH_TERMS = [
 # calibration, spare parts, biomedical engineering) so tenders aren't
 # under-scored just because they're not dialysis-specific.
 STRONG_KEYWORDS = [
-    "ICB", "hemodialysis", "dialysis", "b.braun", "dialog", "SWS",
-    "x-ray", "xray", "ultrasound", "CT", "autoclave", "Water treatment",
-    "RO", "sterile processing", "cssd", "Corrective maintenance",
+    "ICB", "hemodialysis", "dialysis", "bbraun", "philips", "SWS",
+    "x-ray", "xray", "ultrasound", "CT Scan", "autoclave", "Water treatment",
+    "sterile processing", "cssd", "Corrective maintenance",
     "reverse osmosis", "ro system", "SPHMMC", "technical service",
     "biomedical engineering", "medical imaging", "calibration",
     "EPSA", "medical equipment", "hospital equipment",
@@ -227,9 +227,9 @@ STRONG_KEYWORDS = [
 # lab-only tenders are handled by HARD_EXCLUDE_TERMS below instead.
 MEDICAL_CONTEXT = ["medical", "health", "hospital", "biomedical", "clinical"]
 EQUIPMENT_CONTEXT = ["equipment", "supplies", "supply", "device", "machine",
-                     "ICB", "corrective", "maintenance", "repair", "procurement of medical equipment",
-                     "calibration", "installation", "servicing",
-                     "consulting", "medical consultancy", "icb"]
+                     "ICB", "corrective maintenance", "maintenance", "repair", "procurement of medical equipment",
+                     "calibration", "medical equipment installation", "servicing",
+                     "consulting", "medical consultancy" ]
 
 # Always excluded regardless of context — these categories are never
 # relevant to Medmetric no matter what else appears in the title.
@@ -238,7 +238,7 @@ EQUIPMENT_CONTEXT = ["equipment", "supplies", "supply", "device", "machine",
 # biomedical engineering/technical-service company, not a drug supplier.
 HARD_EXCLUDE_TERMS = [
     "vehicle", "toyota", "car ", "motorbike", "insurance", "life insurance",
-    "term life", "gpa", "spare part"
+    "term life", "gpa", "spare part", "construction",
     "laboratory", "lab reagent", "reagent", "lab equipment",
     "medicine", "medicines", "pharmaceutical", "pharmaceuticals",
     "drug", "drugs", "vaccine", "vaccines", "rdf medicine", "rdf medicines"
