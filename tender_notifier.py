@@ -59,20 +59,20 @@ def _build_batch_prompt(chunk_with_indices):
 
     system_instruction = (
         "You are an expert procurement analyst for medMETRIC Healthcare Service PLC, "
-        "an Ethiopian biomedical engineering and technical-services company. Their scope "
-        "covers: medical equipment maintenance & service contracts (including hemodialysis "
+        "an Ethiopian biomedical engineering and medical equipment technical-services provider. Their scope "
+        "covers: medical equipment Corrective and preventive maintenance & service contracts (including hemodialysis "
         "systems like B.Braun Dialog+ and SWS-4000A), RO/water treatment systems, CSSD & "
-        "sterilization equipment (e.g. Rivamed), calibration & compliance testing of "
-        "diagnostic/therapeutic equipment, medical imaging equipment, spare-parts sourcing, "
-        "and general medical equipment supply/consultancy. They do NOT supply medicines, "
+        "sterilization equipment (e.g. Rivamed or Aquaboss), corrective and preventive maintenance of "
+        " medical imaging equipment, also medmetric participates on International Competitive Bidding (ICB) which is related to medical equipment "
+        "and general medical equipment supply/consultancy. They do NOT supply medicines, must check since they don't work on "
         "pharmaceuticals, vaccines, or laboratory-only equipment/reagents/consumables — mark "
         "those NOT relevant even if they mention \"medical\" in passing. "
-        "You will be given a numbered list of tenders. Analyze EACH ONE independently and "
+        "You will be given a numbered list of tenders. Analyze EACH ONE independently as per the profiles and "
         "return a JSON object with a single key \"tenders\" whose value is an array — one "
         "object per tender, covering every index given, with EXACTLY this shape:\n"
         '{"tenders": [{"index": 0, "relevant": true, "match_score": 85, '
-        '"reason": "short 1-sentence reason", "constraints": "None identified", '
-        '"closing_date": "Not specified in provided text"}, ...]}\n'
+        '"reason": "short sentence reason", "Object": "Object of Procurement types listed", '
+        '"closing_date": "show Bid Submission Deadline"}, ...]}\n'
         "Respond with ONLY that JSON object — no markdown fences, no commentary."
     )
     prompt = f"Tenders to analyze:\n\n{joined_entries}"
@@ -94,7 +94,7 @@ def batch_analyze_tenders(candidates: list):
     still far fewer calls than one per tender (e.g. 23 candidates becomes
     ~3 calls instead of 23 or 46).
 
-    Returns a dict {index: {relevant, match_score, reason, constraints,
+    Returns a dict {index: {relevant, match_score, reason, object,
     closing_date}} on success (possibly missing some indices if only some
     sub-batches failed — the caller already treats a missing index as
     "unverified, fall back to keyword match"), or None if EVERY sub-batch
@@ -202,9 +202,9 @@ EGP_ORG_NAME = os.environ.get("EGP_ORG_NAME", "Medmetric")
 # and calibration — not just dialysis. "laboratory" intentionally dropped —
 # lab-only tenders are explicitly out of scope.
 EGP_SEARCH_TERMS = [
-    "medical equipment", "biomedical", "hemodialysis", "dialysis",
-    "calibration", "sterilization", "water treatment", "hospital equipment",
-    "x-ray", "ultrasound", "medical imaging", "spare parts"
+    "medical equipment maintenance", "Corrective maintenance", "hemodialysis", "dialysis",
+    "medical equipment", "sterilization", "water treatment", "Reverse osmosis", "RO",
+    "x-ray", "ultrasound", "medical imaging", "spare parts", "ICB", "International Competitive Bid",
 ]
 
 # Any ONE of these alone is specific enough to trigger a match.
@@ -212,13 +212,13 @@ EGP_SEARCH_TERMS = [
 # calibration, spare parts, biomedical engineering) so tenders aren't
 # under-scored just because they're not dialysis-specific.
 STRONG_KEYWORDS = [
-    "biomedical", "hemodialysis", "dialysis", "b.braun", "dialog+", "sws-4000a",
-    "x-ray", "xray", "ultrasound", "ventilator", "autoclave", "sterilizer",
-    "sterilization", "sterile processing", "cssd", "rivamed",
-    "reverse osmosis", "ro system", "water treatment", "spare parts",
+    "ICB", "hemodialysis", "dialysis", "b.braun", "dialog", "SWS",
+    "x-ray", "xray", "ultrasound", "CT", "autoclave", "Water treatment",
+    "RO", "sterile processing", "cssd", "Corrective maintenance",
+    "reverse osmosis", "ro system", "SPHMMC", "technical service",
     "biomedical engineering", "medical imaging", "calibration",
-    "diagnostic equipment", "medical equipment", "hospital equipment",
-    "medical device", "የህክምና", "ጥገና"
+    "EPSA", "medical equipment", "hospital equipment",
+    "medical device", "የህክምና ጥገና",
 ]
 
 # Generic medical-adjacent words — only count if paired with an equipment/
@@ -227,9 +227,9 @@ STRONG_KEYWORDS = [
 # lab-only tenders are handled by HARD_EXCLUDE_TERMS below instead.
 MEDICAL_CONTEXT = ["medical", "health", "hospital", "biomedical", "clinical"]
 EQUIPMENT_CONTEXT = ["equipment", "supplies", "supply", "device", "machine",
-                     "instrument", "apparatus", "maintenance", "repair", "procurement",
-                     "calibration", "installation", "servicing", "spare parts",
-                     "consulting", "consultancy", "icb"]
+                     "ICB", "corrective", "maintenance", "repair", "procurement of medical equipment",
+                     "calibration", "installation", "servicing",
+                     "consulting", "medical consultancy", "icb"]
 
 # Always excluded regardless of context — these categories are never
 # relevant to Medmetric no matter what else appears in the title.
@@ -238,7 +238,7 @@ EQUIPMENT_CONTEXT = ["equipment", "supplies", "supply", "device", "machine",
 # biomedical engineering/technical-service company, not a drug supplier.
 HARD_EXCLUDE_TERMS = [
     "vehicle", "toyota", "car ", "motorbike", "insurance", "life insurance",
-    "term life", "gpa",
+    "term life", "gpa", "spare part"
     "laboratory", "lab reagent", "reagent", "lab equipment",
     "medicine", "medicines", "pharmaceutical", "pharmaceuticals",
     "drug", "drugs", "vaccine", "vaccines", "rdf medicine", "rdf medicines"
