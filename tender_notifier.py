@@ -63,7 +63,7 @@ def _build_batch_prompt(chunk_with_indices):
         "covers: medical equipment Corrective and preventive maintenance & service contracts (including hemodialysis "
         "systems like B.Braun Dialog+ and SWS-4000A), RO/water treatment systems, CSSD & "
         "sterilization equipment (e.g. Rivamed or Aquaboss), corrective and preventive maintenance of "
-        " medical imaging equipment, also medmetric participates on International Competitive Bidding (ICB) which is related to medical equipment "
+        " medical imaging equipment,Procurement of Maintenance and Repair Service, also medmetric participates on International Competitive Bidding (ICB) which is related to medical equipment "
         "and general medical equipment supply/consultancy. They do NOT supply medicines, must check since they don't work on "
         "pharmaceuticals, vaccines, or laboratory-only equipment/reagents/consumables — mark "
         "those NOT relevant even if they mention \"medical\" in passing. "
@@ -202,9 +202,9 @@ EGP_ORG_NAME = os.environ.get("EGP_ORG_NAME", "Medmetric")
 # and calibration — not just dialysis. "laboratory" intentionally dropped —
 # lab-only tenders are explicitly out of scope.
 EGP_SEARCH_TERMS = [
-    "medical equipment maintenance", "Corrective maintenance", "hemodialysis", "dialysis",
-    "medical equipment", "sterilization", "water treatment", "Reverse osmosis", "RO",
-    "x-ray", "ultrasound", "medical imaging", "spare parts", "ICB", "International Competitive Bid",
+    "Procurement of Maintenance and Repair Service", "Procurement of Medical Equipment and Supplies", "hemodialysis", "dialysis",
+    "medical equipment", "sterilization", "water treatment", "Reverse osmosis", "filters",
+    "x-ray", "ultrasound", "medical imaging", "membrane", "ICB", "International Competitive Bid",
 ]
 
 # Any ONE of these alone is specific enough to trigger a match.
@@ -214,7 +214,7 @@ EGP_SEARCH_TERMS = [
 STRONG_KEYWORDS = [
     "ICB", "hemodialysis", "dialysis", "bbraun", "philips", "SWS",
     "x-ray", "xray", "ultrasound", "CT Scan", "autoclave", "Water treatment",
-    "sterile processing", "cssd", "Corrective maintenance",
+    "Procurement of Maintenance and Repair Service", "cssd", "Procurement of Medical Equipment and Supplies",
     "reverse osmosis", "ro system", "SPHMMC", "technical service",
     "biomedical engineering", "medical imaging", "calibration",
     "EPSA", "medical equipment", "hospital equipment",
@@ -229,7 +229,7 @@ MEDICAL_CONTEXT = ["medical", "health", "hospital", "biomedical", "clinical"]
 EQUIPMENT_CONTEXT = ["equipment", "supplies", "supply", "device", "machine",
                      "ICB", "corrective maintenance", "maintenance", "repair", "procurement of medical equipment",
                      "calibration", "medical equipment installation", "servicing",
-                     "consulting", "medical consultancy" ]
+                     "Maintenance and Repair Service", "medical consultancy" ]
 
 # Always excluded regardless of context — these categories are never
 # relevant to Medmetric no matter what else appears in the title.
@@ -238,7 +238,7 @@ EQUIPMENT_CONTEXT = ["equipment", "supplies", "supply", "device", "machine",
 # biomedical engineering/technical-service company, not a drug supplier.
 HARD_EXCLUDE_TERMS = [
     "vehicle", "toyota", "car ", "motorbike", "insurance", "life insurance",
-    "term life", "gpa", "spare part", "construction",
+    "term life", "gpa", "spare part", "construction","road"
     "laboratory", "lab reagent", "reagent", "lab equipment",
     "medicine", "medicines", "pharmaceutical", "pharmaceuticals",
     "drug", "drugs", "vaccine", "vaccines", "rdf medicine", "rdf medicines"
@@ -248,7 +248,7 @@ HARD_EXCLUDE_TERMS = [
 # generic "consultancy services" for HR/finance/etc. should be skipped, but
 # "medical equipment consultancy services" should NOT be, since Medmetric
 # offers exactly that
-CONTEXTUAL_EXCLUDE_TERMS = ["consultancy services", "consulting firm"]
+CONTEXTUAL_EXCLUDE_TERMS = ["car", "consulting firm"]
 
 
 def is_relevant_tender(title):
