@@ -7,6 +7,7 @@ import traceback
 import hmac
 import psycopg2
 from datetime import datetime
+from urllib.parse import quote
 from flask import Flask, request
 from playwright.sync_api import sync_playwright
 import urllib3
@@ -207,6 +208,19 @@ EGP_SEARCH_TERMS = [
     "x-ray", "ultrasound", "medical imaging", "membrane", "ICB", "International Competitive Bid",
 ]
 
+# Search terms fed one at a time into 2merkato's own search/filter UI —
+# same strategy as eGP: far more reliable than paging the general listing
+# (which surfaces mostly unrelated tenders and burns scan time).
+# Aligned with medMETRIC's service lines: maintenance/service contracts,
+# RO/water treatment, CSSD/sterilization, medical imaging, ICB.
+MERKATO_SEARCH_TERMS = [
+    "Procurement of Maintenance and Repair Service", "Procurement of Medical Equipment and Supplies",
+    "hemodialysis", "dialysis", "medical equipment", "sterilization",
+    "water treatment", "Reverse osmosis", "filters", "x-ray", "ultrasound",
+    "medical imaging", "membrane", "ICB", "International Competitive Bid",
+    "CSSD", "biomedical", "autoclave", "calibration",
+]
+
 # Any ONE of these alone is specific enough to trigger a match.
 # Includes medMETRIC's actual named service lines (CSSD, RO/water treatment,
 # calibration, spare parts, biomedical engineering) so tenders aren't
@@ -238,7 +252,7 @@ EQUIPMENT_CONTEXT = ["equipment", "supplies", "supply", "device", "machine",
 # biomedical engineering/technical-service company, not a drug supplier.
 HARD_EXCLUDE_TERMS = [
     "vehicle", "toyota", "car ", "motorbike", "insurance", "life insurance",
-    "term life", "gpa", "spare part", "construction","road"
+    "term life", "gpa", "spare part", "construction", "road",
     "laboratory", "lab reagent", "reagent", "lab equipment",
     "medicine", "medicines", "pharmaceutical", "pharmaceuticals",
     "drug", "drugs", "vaccine", "vaccines", "rdf medicine", "rdf medicines"
@@ -440,88 +454,142 @@ def scrape_2merkato(candidates: list):
                 except Exception as e:
                     print(f"⚠️ Login attempt failed, continuing without auth: {e}", flush=True)
 
-            # --- Load tenders listing across multiple pages ---
+            # --- Keyword search (mirrors eGP): drive the site's own search
+            # instead of paging the general listing. Paging only ever saw the
+            # newest N pages of ~380k tenders and missed older-but-still-open
+            # matches; keyword search surfaces relevant hits directly.
+            page.goto(MERKATO_TENDERS_URL, timeout=30000, wait_until="domcontentloaded")
+            page.wait_for_timeout(2500)
+
             seen_this_scan = set()
-            for page_num in range(1, MERKATO_MAX_PAGES + 1):
-                page_url = MERKATO_TENDERS_URL if page_num == 1 else f"{MERKATO_TENDERS_URL}?page={page_num}"
-                print(f"➡️ Loading 2merkato page {page_num}: {page_url}", flush=True)
-                page.goto(page_url, timeout=30000, wait_until="domcontentloaded")
-                page.wait_for_timeout(3000)
+            for term in MERKATO_SEARCH_TERMS:
+                try:
+                    # Prefer an on-page search box (placeholder/name/type heuristics).
+                    # Fall back to a query-string navigation if no box is found —
+                    # many 2merkato builds accept ?q= / ?search= / ?keyword=.
+                    search_box = page.locator(
+                        "input[placeholder*='Search' i], input[placeholder*='search' i], "
+                        "input[name*='search' i], input[name*='q' i], input[type='search'], "
+                        "input[id*='search' i], input[class*='search' i]"
+                    ).first
 
-                links = page.locator("a[href*='/tenders/']").all()
-                print(f"Page {page_num}: found {len(links)} raw tender links", flush=True)
+                    used_query_param = False
+                    if search_box.count() > 0:
+                        search_box.click()
+                        search_box.fill("")
+                        page.wait_for_timeout(300)
+                        search_box.fill(term)
+                        search_box.press("Enter")
+                        page.wait_for_timeout(2500)
+                    else:
+                        used_query_param = True
+                        for param in ("q", "search", "keyword", "query"):
+                            search_url = f"{MERKATO_TENDERS_URL}?{param}={quote(term)}"
+                            page.goto(search_url, timeout=30000, wait_until="domcontentloaded")
+                            page.wait_for_timeout(2500)
+                            # Stop at the first param that returns tender links
+                            if page.locator("a[href*='/tenders/']").count() > 0:
+                                print(f"🔎 2merkato search via ?{param}= for '{term}'", flush=True)
+                                break
 
-                for link in links:
-                    try:
-                        title_text = link.inner_text().strip()
-                        href = link.get_attribute("href")
-                        if not title_text or not href:
-                            continue
+                    links = page.locator("a[href*='/tenders/']").all()
+                    first_title_preview = ""
+                    if links:
+                        try:
+                            first_title_preview = links[0].inner_text().strip()[:80]
+                        except Exception:
+                            pass
+                    mode = "query-param" if used_query_param else "search-box"
+                    print(
+                        f"2merkato search '{term}' ({mode}) | {len(links)} links | first: {first_title_preview!r}",
+                        flush=True,
+                    )
 
-                        full_link = href if href.startswith("http") else f"{MERKATO_BASE}{href}"
+                    for link in links:
+                        try:
+                            title_text = link.inner_text().strip()
+                            href = link.get_attribute("href")
+                            if not title_text or not href:
+                                continue
 
-                        if full_link in seen_this_scan:
-                            continue
-                        seen_this_scan.add(full_link)
+                            full_link = href if href.startswith("http") else f"{MERKATO_BASE}{href}"
 
-                        if is_relevant_tender(title_text):
-                            tender_id = f"merkato_{full_link.rstrip('/').split('/')[-1]}"
-                            if not is_already_notified(tender_id):
-                                # Mark as notified immediately regardless of the eventual
-                                # AI verdict — prevents re-checking (and re-spending
-                                # AI quota on) the same tender on every scan cycle
-                                mark_as_notified(tender_id)
+                            if full_link in seen_this_scan:
+                                continue
+                            seen_this_scan.add(full_link)
 
-                                found += 1
+                            if is_relevant_tender(title_text):
+                                tender_id = f"merkato_{full_link.rstrip('/').split('/')[-1]}"
+                                if not is_already_notified(tender_id):
+                                    # Mark as notified immediately regardless of the eventual
+                                    # AI verdict — prevents re-checking (and re-spending
+                                    # AI quota on) the same tender on every scan cycle
+                                    mark_as_notified(tender_id)
 
-                                # Fetch the actual detail page — the listing title alone
-                                # never contains the submission deadline, which is why
-                                # closing date kept coming back "not specified." Open it
-                                # in a SEPARATE tab so we don't disturb pagination state
-                                # on the main listing page. This is a Playwright call, not
-                                # an AI call, so it doesn't touch the AI quota.
-                                detail_text = ""
-                                detail_page = None
-                                try:
-                                    detail_page = context.new_page()
-                                    detail_page.goto(full_link, timeout=20000, wait_until="domcontentloaded")
+                                    found += 1
+
+                                    # Fetch the actual detail page — the listing title alone
+                                    # never contains the submission deadline, which is why
+                                    # closing date kept coming back "not specified." Open it
+                                    # in a SEPARATE tab so we don't disturb search state
+                                    # on the main listing page. This is a Playwright call, not
+                                    # an AI call, so it doesn't touch the AI quota.
+                                    detail_text = ""
+                                    detail_page = None
                                     try:
-                                        detail_page.wait_for_load_state("networkidle", timeout=10000)
-                                    except Exception:
-                                        pass
-                                    for poll_attempt in range(5):
-                                        detail_page.wait_for_timeout(1000)
+                                        detail_page = context.new_page()
+                                        detail_page.goto(full_link, timeout=20000, wait_until="domcontentloaded")
                                         try:
-                                            candidate_text = detail_page.locator("body").inner_text(timeout=5000)
-                                        except Exception:
-                                            candidate_text = ""
-                                        if len(candidate_text) > 300:
-                                            detail_text = candidate_text
-                                            break
-                                        detail_text = candidate_text
-                                    detail_text = detail_text[:6000]
-                                    print(f"📄 Captured {len(detail_text)} chars from 2merkato detail page", flush=True)
-                                except Exception as e:
-                                    print(f"⚠️ Could not read 2merkato detail page text: {e}", flush=True)
-                                finally:
-                                    if detail_page is not None:
-                                        try:
-                                            detail_page.close()
+                                            detail_page.wait_for_load_state("networkidle", timeout=10000)
                                         except Exception:
                                             pass
+                                        for poll_attempt in range(5):
+                                            detail_page.wait_for_timeout(1000)
+                                            try:
+                                                candidate_text = detail_page.locator("body").inner_text(timeout=5000)
+                                            except Exception:
+                                                candidate_text = ""
+                                            if len(candidate_text) > 300:
+                                                detail_text = candidate_text
+                                                break
+                                            detail_text = candidate_text
+                                        detail_text = detail_text[:6000]
+                                        print(f"📄 Captured {len(detail_text)} chars from 2merkato detail page", flush=True)
+                                    except Exception as e:
+                                        print(f"⚠️ Could not read 2merkato detail page text: {e}", flush=True)
+                                    finally:
+                                        if detail_page is not None:
+                                            try:
+                                                detail_page.close()
+                                            except Exception:
+                                                pass
 
-                                # Collect for the single end-of-scan batch AI call rather
-                                # than calling the AI right here per-tender
-                                candidates.append({
-                                    "id": tender_id,
-                                    "source": "2merkato",
-                                    "title": title_text,
-                                    "ref_no": "",
-                                    "detail_text": detail_text,
-                                    "link": full_link,
-                                })
-                    except Exception:
-                        continue
+                                    # Collect for the single end-of-scan batch AI call rather
+                                    # than calling the AI right here per-tender
+                                    candidates.append({
+                                        "id": tender_id,
+                                        "source": "2merkato",
+                                        "title": title_text,
+                                        "ref_no": "",
+                                        "detail_text": detail_text,
+                                        "link": full_link,
+                                    })
+                        except Exception:
+                            continue
+
+                    # After a search-box term, return to the listing so the next
+                    # term starts from a clean state; after query-param mode the
+                    # next iteration will navigate again if needed.
+                    if not used_query_param:
+                        try:
+                            page.goto(MERKATO_TENDERS_URL, timeout=20000, wait_until="domcontentloaded")
+                            page.wait_for_timeout(1500)
+                        except Exception:
+                            pass
+
+                except Exception as e:
+                    print(f"⚠️ 2merkato search for '{term}' failed: {e}", flush=True)
+                    continue
 
             browser.close()
 
@@ -1001,3 +1069,4 @@ if __name__ == "__main__":
     threading.Thread(target=monitoring_loop, daemon=True).start()
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
