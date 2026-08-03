@@ -73,7 +73,12 @@ def _build_batch_prompt(chunk_with_indices):
         "object per tender, covering every index given, with EXACTLY this shape:\n"
         '{"tenders": [{"index": 0, "relevant": true, "match_score": 85, '
         '"reason": "short sentence reason", "Object": "Object of Procurement types listed on tendering page", '
-        '"closing_date": "show Bid Submission Deadline"}, ...]}\n'
+        '"closing_date": "YYYY-MM-DD or exact deadline text from the page", '
+        '"status": "open"}], ...]}\n'
+        "For status: use \"open\" if bidding is still open / deadline is in the future; "
+        "use \"closed\" if the page says Closed, Bidding closed, deadline passed, or expired. "
+        "If the detail text shows a past Bid Submission Deadline / closing date, status MUST be closed "
+        "and relevant should still be judged on scope (closed is filtered later by code). "
         "Respond with ONLY that JSON object — no markdown fences, no commentary."
     )
     prompt = f"Tenders to analyze:\n\n{joined_entries}"
@@ -283,6 +288,82 @@ def is_relevant_tender(title):
         return True
 
     return has_medical_context and has_equipment_context
+
+
+def _parse_closing_date(raw: str):
+    """Best-effort parse of AI/page closing-date strings into a date.
+    Returns a date object or None if unparseable."""
+    if not raw:
+        return None
+    s = str(raw).strip()
+    if not s or s.lower() in (
+        "not specified", "not specified in provided text",
+        "unknown", "unknown — ai unavailable", "n/a", "none",
+    ):
+        return None
+
+    # Prefer an ISO-ish date if present anywhere in the string
+    import re
+    from datetime import date, datetime
+
+    iso = re.search(r"(20\d{2})[-/](\d{1,2})[-/](\d{1,2})", s)
+    if iso:
+        try:
+            return date(int(iso.group(1)), int(iso.group(2)), int(iso.group(3)))
+        except ValueError:
+            pass
+
+    # Common English forms: "Jul 21, 2026", "21 July 2026", "July 21 2026 10:00 AM"
+    for fmt in (
+        "%b %d, %Y", "%B %d, %Y", "%d %b %Y", "%d %B %Y",
+        "%b %d %Y", "%B %d %Y",
+        "%Y-%m-%d", "%d/%m/%Y", "%m/%d/%Y",
+        "%d-%m-%Y", "%Y/%m/%d",
+    ):
+        # Try progressively shorter prefixes of the string
+        for length in (len(s), 30, 20, 16, 12):
+            chunk = s[:length].strip().rstrip(",.")
+            try:
+                return datetime.strptime(chunk, fmt).date()
+            except ValueError:
+                continue
+    return None
+
+
+def is_tender_still_open(closing_date_str: str, detail_text: str = "", ai_status: str = None) -> bool:
+    """Return False when the tender is clearly closed/expired so we don't alert."""
+    from datetime import date
+    import re
+
+    # Explicit AI status wins when provided
+    if ai_status:
+        st = str(ai_status).strip().lower()
+        if st in ("closed", "expired", "cancelled", "canceled", "awarded"):
+            return False
+        if st == "open":
+            # still verify against a parsed past deadline if we have one
+            pass
+
+    blob = f"{closing_date_str or ''}\n{detail_text or ''}".lower()
+
+    # Strong closed signals from page/AI text
+    closed_phrases = [
+        "bidding closed", "bid closed", "tender closed", "submission closed",
+        "deadline passed", "already closed", "status: closed", "status closed",
+        "bidding: closed", "closed for bidding", "no longer accepting",
+    ]
+    if any(p in blob for p in closed_phrases):
+        return False
+
+    # "0 days left" / "expired" near closing language
+    if re.search(r"\b0\s*days?\s*left\b", blob) or re.search(r"\bexpired\b", blob):
+        return False
+
+    parsed = _parse_closing_date(closing_date_str or "")
+    if parsed is not None and parsed < date.today():
+        return False
+
+    return True
 
 
 # ==================== PERSISTENT DEDUP (Postgres) ====================
@@ -1043,6 +1124,18 @@ def check_for_tenders():
                 # title that LOOKED relevant) without digging through the
                 # WhatsApp thread for context that was never sent there
                 print(f"🤖 AI rejected as not relevant, skipping alert: {c['title']} — reason: {reason or '(no reason returned)'}", flush=True)
+                continue
+
+            ai_status = None
+            if result is not None and isinstance(result, dict):
+                ai_status = result.get("status")
+
+            if not is_tender_still_open(closing_date, c.get("detail_text", ""), ai_status):
+                print(
+                    f"⏰ Skipping closed/expired tender: {c['title']} — "
+                    f"closing_date={closing_date!r} status={ai_status!r}",
+                    flush=True,
+                )
                 continue
 
             verification_note = "⚠️ *Unverified* (AI review failed — keyword match only)\n\n" if not ai_verified else ""
