@@ -7,7 +7,6 @@ import traceback
 import hmac
 import psycopg2
 from datetime import datetime
-from urllib.parse import quote
 from flask import Flask, request
 from playwright.sync_api import sync_playwright
 import urllib3
@@ -48,13 +47,70 @@ def _call_groq_with_retry(client, system_instruction, prompt, temperature=0.2, m
     raise last_error
 
 
+
+# Keywords used to locate the parts of a detail page worth keeping when the
+# full captured text (up to 6000 chars) is too long to send to the AI in
+# full. A blind [:N] truncation was cutting off the closing date and
+# eligibility/constraints info entirely whenever a page's nav/breadcrumb/menu
+# text ran long before the real content — which is exactly why those fields
+# kept coming back empty even though the scraper WAS capturing the text.
+_CLOSING_DATE_HINTS = [
+    "closing date", "submission deadline", "bid submission", "deadline",
+    "closing time", "bid closing", "last date", "due date", "valid until",
+    "validity", "opening date",
+]
+_CONSTRAINT_HINTS = [
+    "eligib", "bid bond", "bid security", "minimum requirement", "experience",
+    "similar contract", "qualification", "capital", "registration",
+    "local agent", "representative", "certificate", "license", "requirement",
+]
+
+
+def _build_detail_snippet(detail_text: str, max_chars: int = 2400) -> str:
+    """
+    Instead of blindly slicing the first N characters (which was silently
+    dropping the closing date and constraints whenever they appeared later
+    in the page than the cutoff), keep the front of the page for
+    title/scope context PLUS a window of text around any closing-date or
+    constraint-related keyword found anywhere in the full captured text.
+    This makes it far more likely the AI actually sees the relevant
+    sentence instead of nav/menu boilerplate.
+    """
+    if not detail_text:
+        return ""
+    if len(detail_text) <= max_chars:
+        return detail_text
+
+    lower = detail_text.lower()
+    front_budget = max_chars // 2
+    front = detail_text[:front_budget]
+
+    windows = []
+    remaining_budget = max_chars - front_budget
+    for hint in _CLOSING_DATE_HINTS + _CONSTRAINT_HINTS:
+        if remaining_budget <= 0:
+            break
+        idx = lower.find(hint)
+        if idx == -1 or idx < front_budget:
+            continue  # already covered by the front slice, or not present
+        start = max(0, idx - 60)
+        end = min(len(detail_text), idx + 240)
+        window = detail_text[start:end]
+        if window not in windows:
+            windows.append(window)
+            remaining_budget -= len(window)
+
+    return front + "\n[...]\n" + "\n[...]\n".join(windows) if windows else front
+
+
 def _build_batch_prompt(chunk_with_indices):
     """Builds the system + user prompt for one sub-batch of (index, candidate) pairs."""
     entries = []
     for i, c in chunk_with_indices:
+        snippet = _build_detail_snippet(c.get('detail_text', ''))
         entries.append(
             f"[{i}] Source: {c['source']} | Title: {c['title']} | Ref No: {c.get('ref_no', '')}\n"
-            f"Detail: {c.get('detail_text', '')[:900]}"
+            f"Detail: {snippet}"
         )
     joined_entries = "\n\n".join(entries)
 
@@ -64,25 +120,32 @@ def _build_batch_prompt(chunk_with_indices):
         "covers: medical equipment Corrective and preventive maintenance & service contracts (including hemodialysis "
         "systems like B.Braun Dialog+ and SWS-4000A), RO/water treatment systems, CSSD & "
         "sterilization equipment (e.g. Rivamed or Aquaboss), corrective and preventive maintenance of "
-        " medical imaging equipment,Procurement of Maintenance and Repair Service, also medmetric participates on International Competitive Bidding (ICB) which is related to medical equipment "
+        " medical imaging equipment, Procurement of Maintenance and Repair Service, also medmetric participates on International Competitive Bidding (ICB) which is related to medical equipment "
         "and general medical equipment supply/consultancy. They do NOT supply medicines, must check since they don't work on "
         "pharmaceuticals, vaccines, or laboratory-only equipment/reagents/consumables — mark "
-        "those NOT relevant even if they mention \"medical\" in passing. "
-        "You will be given a numbered list of tenders. Analyze EACH ONE independently as per the profiles and "
-        "return a JSON object with a single key \"tenders\" whose value is an array — one "
-        "object per tender, covering every index given, with EXACTLY this shape:\n"
-        '{"tenders": [{"index": 0, "relevant": true, "match_score": 85, '
-        '"reason": "short sentence reason", "Object": "Object of Procurement types listed on tendering page", '
-        '"closing_date": "YYYY-MM-DD or exact deadline text from the page", '
-        '"status": "open"}], ...]}\n'
-        "For status: use \"open\" if bidding is still open / deadline is in the future; "
-        "use \"closed\" if the page says Closed, Bidding closed, deadline passed, or expired. "
-        "If the detail text shows a past Bid Submission Deadline / closing date, status MUST be closed "
-        "and relevant should still be judged on scope (closed is filtered later by code). "
+        "those NOT relevant even if they mention \"medical\" in passing.\n\n"
+        "You will be given a numbered list of tenders, each with a Detail excerpt taken from the tender's "
+        "own detail page (it may include a front section plus separate windows of text pulled from around "
+        "date/eligibility keywords elsewhere on the page, joined by [...] markers — treat each window as "
+        "real page text, not as connected prose).\n\n"
+        "Analyze EACH tender independently and return a JSON object with a single key \"tenders\" whose "
+        "value is an array — one object per tender, covering every index given, with EXACTLY this shape:\n"
+        '{"tenders": [{'
+        '"index": 0, '
+        '"relevant": true, '
+        '"match_score": 85, '
+        '"reason": "short sentence on why it matches or not", '
+        '"procurement_object": "the object/type of procurement as stated on the page, e.g. \'Supply and installation of hemodialysis machines\'", '
+        '"constraints": "key eligibility/bid requirements actually stated in the text — e.g. bid bond amount, minimum years of similar experience, required certifications, local representation requirement. '
+        'If the provided excerpt does not contain this info, respond exactly with \'Not stated in provided text\' — do NOT say \'None\' or \'None identified\', since that implies you confirmed there are none.", '
+        '"closing_date": "the bid submission deadline / closing date (and time, if given) EXACTLY as it appears in the text, including the date format used. '
+        'If no such date appears anywhere in the excerpt, respond exactly with \'Not stated in provided text\'. Do not confuse this with a publish date, site-visit date, or clarification-request date."'
+        "}, ...]}\n"
         "Respond with ONLY that JSON object — no markdown fences, no commentary."
     )
     prompt = f"Tenders to analyze:\n\n{joined_entries}"
     return system_instruction, prompt
+
 
 
 def batch_analyze_tenders(candidates: list):
@@ -113,11 +176,13 @@ def batch_analyze_tenders(candidates: list):
     if not api_key:
         return None
 
-    # Sized conservatively: with detail_text capped at 900 chars/candidate,
-    # ~7 candidates per chunk keeps prompt+completion tokens well under
-    # Groq's 12,000 TPM limit for llama-3.3-70b-versatile, even accounting
-    # for the system instruction and JSON completion overhead.
-    CHUNK_SIZE = 7
+    # Sized conservatively: detail snippets now run up to ~2,400 chars/
+    # candidate (up from 900) so the AI can actually see closing dates and
+    # constraints that appear later in the page rather than always seeing
+    # blank space. ~6 candidates per chunk keeps prompt+completion tokens
+    # comfortably under Groq's 12,000 TPM limit for llama-3.3-70b-versatile,
+    # even accounting for the system instruction and JSON completion overhead.
+    CHUNK_SIZE = 6
 
     client = Groq(api_key=api_key)
     indexed_candidates = list(enumerate(candidates))
@@ -213,18 +278,24 @@ EGP_SEARCH_TERMS = [
     "x-ray", "ultrasound", "medical imaging", "membrane", "ICB", "International Competitive Bid",
 ]
 
-# Search terms fed one at a time into 2merkato's own search/filter UI —
-# same strategy as eGP: far more reliable than paging the general listing
-# (which surfaces mostly unrelated tenders and burns scan time).
-# Aligned with medMETRIC's service lines: maintenance/service contracts,
-# RO/water treatment, CSSD/sterilization, medical imaging, ICB.
+# Search terms fed one at a time into 2merkato's own "Search by keyword" filter
+# panel — mirrors the EGP_SEARCH_TERMS approach above. 2merkato's general
+# listing has 25,000+ pages, so paging through the first few of those (the
+# old approach) only ever saw whatever happened to be posted most recently
+# across ALL categories, not specifically medical/biomedical tenders. Reusing
+# the site's own keyword search narrows results down to a handful of pages
+# per term, the same way it does on eGP.
 MERKATO_SEARCH_TERMS = [
-    "Procurement of Maintenance and Repair Service", "Procurement of Medical Equipment and Supplies",
     "hemodialysis", "dialysis", "medical equipment", "sterilization",
-    "water treatment", "Reverse osmosis", "filters", "x-ray", "ultrasound",
-    "medical imaging", "membrane", "ICB", "International Competitive Bid",
-    "CSSD", "biomedical", "autoclave", "calibration",
+    "water treatment", "reverse osmosis", "x-ray", "ultrasound",
+    "medical imaging", "biomedical", "CSSD", "autoclave", "ICB",
+    "medical equipment maintenance", "hospital equipment",
 ]
+
+# How many result pages to walk PER search term (not per whole catalog) —
+# a filtered keyword search returns far fewer pages than the full listing,
+# so a small number here is plenty and keeps the scan fast.
+MERKATO_MAX_PAGES_PER_TERM = int(os.environ.get("MERKATO_MAX_PAGES_PER_TERM", "3"))
 
 # Any ONE of these alone is specific enough to trigger a match.
 # Includes medMETRIC's actual named service lines (CSSD, RO/water treatment,
@@ -257,7 +328,7 @@ EQUIPMENT_CONTEXT = ["equipment", "supplies", "supply", "device", "machine",
 # biomedical engineering/technical-service company, not a drug supplier.
 HARD_EXCLUDE_TERMS = [
     "vehicle", "toyota", "car ", "motorbike", "insurance", "life insurance",
-    "term life", "gpa", "spare part", "construction", "road",
+    "term life", "gpa", "spare part", "construction","road"
     "laboratory", "lab reagent", "reagent", "lab equipment",
     "medicine", "medicines", "pharmaceutical", "pharmaceuticals",
     "drug", "drugs", "vaccine", "vaccines", "rdf medicine", "rdf medicines"
@@ -288,82 +359,6 @@ def is_relevant_tender(title):
         return True
 
     return has_medical_context and has_equipment_context
-
-
-def _parse_closing_date(raw: str):
-    """Best-effort parse of AI/page closing-date strings into a date.
-    Returns a date object or None if unparseable."""
-    if not raw:
-        return None
-    s = str(raw).strip()
-    if not s or s.lower() in (
-        "not specified", "not specified in provided text",
-        "unknown", "unknown — ai unavailable", "n/a", "none",
-    ):
-        return None
-
-    # Prefer an ISO-ish date if present anywhere in the string
-    import re
-    from datetime import date, datetime
-
-    iso = re.search(r"(20\d{2})[-/](\d{1,2})[-/](\d{1,2})", s)
-    if iso:
-        try:
-            return date(int(iso.group(1)), int(iso.group(2)), int(iso.group(3)))
-        except ValueError:
-            pass
-
-    # Common English forms: "Jul 21, 2026", "21 July 2026", "July 21 2026 10:00 AM"
-    for fmt in (
-        "%b %d, %Y", "%B %d, %Y", "%d %b %Y", "%d %B %Y",
-        "%b %d %Y", "%B %d %Y",
-        "%Y-%m-%d", "%d/%m/%Y", "%m/%d/%Y",
-        "%d-%m-%Y", "%Y/%m/%d",
-    ):
-        # Try progressively shorter prefixes of the string
-        for length in (len(s), 30, 20, 16, 12):
-            chunk = s[:length].strip().rstrip(",.")
-            try:
-                return datetime.strptime(chunk, fmt).date()
-            except ValueError:
-                continue
-    return None
-
-
-def is_tender_still_open(closing_date_str: str, detail_text: str = "", ai_status: str = None) -> bool:
-    """Return False when the tender is clearly closed/expired so we don't alert."""
-    from datetime import date
-    import re
-
-    # Explicit AI status wins when provided
-    if ai_status:
-        st = str(ai_status).strip().lower()
-        if st in ("closed", "expired", "cancelled", "canceled", "awarded"):
-            return False
-        if st == "open":
-            # still verify against a parsed past deadline if we have one
-            pass
-
-    blob = f"{closing_date_str or ''}\n{detail_text or ''}".lower()
-
-    # Strong closed signals from page/AI text
-    closed_phrases = [
-        "bidding closed", "bid closed", "tender closed", "submission closed",
-        "deadline passed", "already closed", "status: closed", "status closed",
-        "bidding: closed", "closed for bidding", "no longer accepting",
-    ]
-    if any(p in blob for p in closed_phrases):
-        return False
-
-    # "0 days left" / "expired" near closing language
-    if re.search(r"\b0\s*days?\s*left\b", blob) or re.search(r"\bexpired\b", blob):
-        return False
-
-    parsed = _parse_closing_date(closing_date_str or "")
-    if parsed is not None and parsed < date.today():
-        return False
-
-    return True
 
 
 # ==================== PERSISTENT DEDUP (Postgres) ====================
@@ -535,187 +530,124 @@ def scrape_2merkato(candidates: list):
                 except Exception as e:
                     print(f"⚠️ Login attempt failed, continuing without auth: {e}", flush=True)
 
-            # --- Keyword search (mirrors eGP): drive the site's own search
-            # instead of paging the general listing. Paging only ever saw the
-            # newest N pages of ~380k tenders and missed older-but-still-open
-            # matches; keyword search surfaces relevant hits directly.
+            # --- Search by keyword instead of paging the general listing ---
+            # The old approach walked the first few pages of "All Tenders"
+            # (25,000+ pages total, sorted by recency across every category
+            # on the site) — meaning it only ever saw whatever happened to
+            # be posted most recently regardless of relevance. Using the
+            # site's own "Search by keyword" filter, one term at a time,
+            # mirrors the eGP engine and actually targets medical/biomedical
+            # tenders specifically.
             page.goto(MERKATO_TENDERS_URL, timeout=30000, wait_until="domcontentloaded")
-            page.wait_for_timeout(2500)
+            page.wait_for_timeout(2000)
+
+            # The keyword field may already be visible on the page, or it may
+            # live inside a filter panel that only appears after tapping a
+            # search icon in the header (this is what the site's mobile view
+            # shows). Try the direct selector first; only hunt for a toggle
+            # if that comes up empty.
+            search_input = page.locator(
+                "input[placeholder*='Search by keyword' i], input[placeholder*='keyword' i]"
+            ).first
+
+            if search_input.count() == 0:
+                # Diagnostic dump so that if this guess is wrong, the logs
+                # show exactly what's clickable in the header to open the
+                # search/filter panel — same pattern used for the eGP modal
+                # dismissal logic above.
+                header_clickables = page.eval_on_selector_all(
+                    "header *, nav *",
+                    "els => els.slice(0, 40).map(e => ({tag: e.tagName, "
+                    "aria: e.getAttribute('aria-label'), cls: e.className, "
+                    "text: (e.innerText || '').trim().slice(0, 30)}))"
+                )
+                print(f"🔎 2merkato search input not immediately visible. Header elements: {header_clickables}", flush=True)
+
+                toggle = page.locator(
+                    "[aria-label*='search' i], button:has-text('Search'), "
+                    "header svg, nav svg, [class*='search-icon' i], [class*='search-toggle' i]"
+                ).first
+                if toggle.count() > 0:
+                    try:
+                        toggle.click(timeout=5000)
+                        page.wait_for_timeout(1000)
+                        print("✅ Clicked a probable search-toggle icon in the header", flush=True)
+                    except Exception as e:
+                        print(f"⚠️ Could not click search-toggle candidate: {e}", flush=True)
+
+                search_input = page.locator(
+                    "input[placeholder*='Search by keyword' i], input[placeholder*='keyword' i]"
+                ).first
+
+            if search_input.count() == 0:
+                print("❌ 2merkato search-by-keyword input never appeared — falling back to the old first-page listing so this scan isn't a total loss.", flush=True)
+                links = page.locator("a[href*='/tenders/']").all()
+                print(f"Fallback listing page: found {len(links)} raw tender links", flush=True)
+                found += _process_merkato_links(links, context, candidates, seen_this_scan=set())
+                browser.close()
+                print(f"2merkato engine complete. Collected {found} candidate matches for AI review.", flush=True)
+                return found
+
+            print("✅ Found 2merkato 'Search by keyword' input — proceeding with keyword-driven search", flush=True)
 
             seen_this_scan = set()
             for term in MERKATO_SEARCH_TERMS:
                 try:
-                    # Prefer an on-page search box (placeholder/name/type heuristics).
-                    # Fall back to a query-string navigation if no box is found —
-                    # many 2merkato builds accept ?q= / ?search= / ?keyword=.
-                    search_box = page.locator(
-                        "input[placeholder*='Search' i], input[placeholder*='search' i], "
-                        "input[name*='search' i], input[name*='q' i], input[type='search'], "
-                        "input[id*='search' i], input[class*='search' i]"
-                    ).first
+                    # The filter panel may auto-close after the previous term's
+                    # search was applied. If the input isn't visible/attached
+                    # anymore, try the same toggle click used to open it the
+                    # first time before giving up on this term.
+                    if search_input.count() == 0 or not search_input.is_visible():
+                        toggle = page.locator(
+                            "[aria-label*='search' i], button:has-text('Search'), "
+                            "header svg, nav svg, [class*='search-icon' i], [class*='search-toggle' i]"
+                        ).first
+                        if toggle.count() > 0:
+                            try:
+                                toggle.click(timeout=5000)
+                                page.wait_for_timeout(1000)
+                            except Exception:
+                                pass
+                        search_input = page.locator(
+                            "input[placeholder*='Search by keyword' i], input[placeholder*='keyword' i]"
+                        ).first
 
-                    used_query_param = False
-                    if search_box.count() > 0:
-                        search_box.click()
-                        search_box.fill("")
-                        page.wait_for_timeout(300)
-                        search_box.fill(term)
-                        search_box.press("Enter")
-                        page.wait_for_timeout(2500)
+                    search_input.click()
+                    search_input.fill("")
+                    page.wait_for_timeout(200)
+                    search_input.fill(term)
+
+                    # Prefer an explicit "Filter" submit button (seen in the
+                    # site's filter panel) over just pressing Enter, since
+                    # some filter panels only apply on an explicit submit.
+                    filter_btn = page.locator("button:has-text('Filter')").first
+                    if filter_btn.count() > 0:
+                        filter_btn.click(timeout=5000)
                     else:
-                        used_query_param = True
-                        for param in ("q", "search", "keyword", "query"):
-                            search_url = f"{MERKATO_TENDERS_URL}?{param}={quote(term)}"
-                            page.goto(search_url, timeout=30000, wait_until="domcontentloaded")
-                            page.wait_for_timeout(2500)
-                            # Stop at the first param that returns real tender links
-                            # (href slug after /tenders/ longer than 8 chars = real id)
-                            probe_count = page.evaluate(
-                                "() => Array.from(document.querySelectorAll(\"a[href*='/tenders/']\")).filter(e => {"
-                                "  let h = (e.getAttribute('href') || '').split('?')[0];"
-                                "  if (h.endsWith('/')) h = h.slice(0, -1);"
-                                "  const parts = h.split('/tenders/');"
-                                "  const slug = parts.length > 1 ? parts[parts.length - 1] : '';"
-                                "  return slug.length > 8;"
-                                "}).length"
-                            )
-                            if probe_count and probe_count > 0:
-                                print(f"🔎 2merkato search via ?{param}= for '{term}'", flush=True)
+                        search_input.press("Enter")
+
+                    page.wait_for_timeout(2500)
+                    print(f"➡️ 2merkato search '{term}' submitted, current URL: {page.url}", flush=True)
+
+                    for page_num in range(1, MERKATO_MAX_PAGES_PER_TERM + 1):
+                        if page_num > 1:
+                            next_btn = page.locator(
+                                "button:has-text('Next'), a:has-text('Next'), [aria-label*='next' i]"
+                            ).first
+                            if next_btn.count() == 0:
+                                break
+                            try:
+                                next_btn.click(timeout=5000)
+                                page.wait_for_timeout(2000)
+                            except Exception:
                                 break
 
-                    # Real tender detail URLs look like /tenders/<id> (e.g. 24-char
-                    # hex ObjectIds). Nav links such as "My Tenders" → /tenders or
-                    # /tenders?page=1 must be excluded or the scraper wastes time
-                    # on menu chrome and mis-reports "48 links" for every term.
-                    raw_links = page.locator(
-                        "a[href*='/tenders/']:not([href$='/tenders']):not([href$='/tenders/'])"
-                    ).all()
+                        links = page.locator("a[href*='/tenders/']").all()
+                        print(f"2merkato search '{term}' page {page_num}: found {len(links)} raw tender links", flush=True)
+                        if not links:
+                            break
 
-                    NAV_TITLES = {
-                        "my tenders", "tenders", "all tenders", "free tenders",
-                        "posted today", "home", "login", "logout", "profile",
-                        "documents", "categories", "filter", "clear",
-                    }
-
-                    links = []
-                    for link in raw_links:
-                        try:
-                            href = (link.get_attribute("href") or "").strip()
-                            title_text = (link.inner_text() or "").strip()
-                            if not href or not title_text:
-                                continue
-                            # Must have a non-empty path segment after /tenders/
-                            # e.g. /tenders/69dce1e70a538a0ee7000001 — not /tenders
-                            # and not /tenders?page=2
-                            path_part = href.split("?")[0].rstrip("/")
-                            if "/tenders/" not in path_part:
-                                continue
-                            tender_slug = path_part.split("/tenders/")[-1]
-                            if not tender_slug or tender_slug.lower() in ("tenders",):
-                                continue
-                            if title_text.lower() in NAV_TITLES:
-                                continue
-                            if len(title_text) < 12:
-                                # Real tender titles are long; short labels are chrome
-                                continue
-                            links.append(link)
-                        except Exception:
-                            continue
-
-                    first_title_preview = ""
-                    if links:
-                        try:
-                            first_title_preview = links[0].inner_text().strip()[:80]
-                        except Exception:
-                            pass
-                    mode = "query-param" if used_query_param else "search-box"
-                    print(
-                        f"2merkato search '{term}' ({mode}) | {len(links)} tender links "
-                        f"(from {len(raw_links)} raw) | first: {first_title_preview!r}",
-                        flush=True,
-                    )
-
-                    for link in links:
-                        try:
-                            title_text = link.inner_text().strip()
-                            href = link.get_attribute("href")
-                            if not title_text or not href:
-                                continue
-
-                            full_link = href if href.startswith("http") else f"{MERKATO_BASE}{href}"
-
-                            if full_link in seen_this_scan:
-                                continue
-                            seen_this_scan.add(full_link)
-
-                            if is_relevant_tender(title_text):
-                                tender_id = f"merkato_{full_link.rstrip('/').split('/')[-1]}"
-                                if not is_already_notified(tender_id):
-                                    # Mark as notified immediately regardless of the eventual
-                                    # AI verdict — prevents re-checking (and re-spending
-                                    # AI quota on) the same tender on every scan cycle
-                                    mark_as_notified(tender_id)
-
-                                    found += 1
-
-                                    # Fetch the actual detail page — the listing title alone
-                                    # never contains the submission deadline, which is why
-                                    # closing date kept coming back "not specified." Open it
-                                    # in a SEPARATE tab so we don't disturb search state
-                                    # on the main listing page. This is a Playwright call, not
-                                    # an AI call, so it doesn't touch the AI quota.
-                                    detail_text = ""
-                                    detail_page = None
-                                    try:
-                                        detail_page = context.new_page()
-                                        detail_page.goto(full_link, timeout=20000, wait_until="domcontentloaded")
-                                        try:
-                                            detail_page.wait_for_load_state("networkidle", timeout=10000)
-                                        except Exception:
-                                            pass
-                                        for poll_attempt in range(5):
-                                            detail_page.wait_for_timeout(1000)
-                                            try:
-                                                candidate_text = detail_page.locator("body").inner_text(timeout=5000)
-                                            except Exception:
-                                                candidate_text = ""
-                                            if len(candidate_text) > 300:
-                                                detail_text = candidate_text
-                                                break
-                                            detail_text = candidate_text
-                                        detail_text = detail_text[:6000]
-                                        print(f"📄 Captured {len(detail_text)} chars from 2merkato detail page", flush=True)
-                                    except Exception as e:
-                                        print(f"⚠️ Could not read 2merkato detail page text: {e}", flush=True)
-                                    finally:
-                                        if detail_page is not None:
-                                            try:
-                                                detail_page.close()
-                                            except Exception:
-                                                pass
-
-                                    # Collect for the single end-of-scan batch AI call rather
-                                    # than calling the AI right here per-tender
-                                    candidates.append({
-                                        "id": tender_id,
-                                        "source": "2merkato",
-                                        "title": title_text,
-                                        "ref_no": "",
-                                        "detail_text": detail_text,
-                                        "link": full_link,
-                                    })
-                        except Exception:
-                            continue
-
-                    # After a search-box term, return to the listing so the next
-                    # term starts from a clean state; after query-param mode the
-                    # next iteration will navigate again if needed.
-                    if not used_query_param:
-                        try:
-                            page.goto(MERKATO_TENDERS_URL, timeout=20000, wait_until="domcontentloaded")
-                            page.wait_for_timeout(1500)
-                        except Exception:
-                            pass
+                        found += _process_merkato_links(links, context, candidates, seen_this_scan)
 
                 except Exception as e:
                     print(f"⚠️ 2merkato search for '{term}' failed: {e}", flush=True)
@@ -729,6 +661,139 @@ def scrape_2merkato(candidates: list):
     except Exception as e:
         print(f"❌ 2merkato extraction engine down: {e}", flush=True)
         return 0
+
+
+def _get_merkato_card_status(link) -> str:
+    """
+    Reads the "Bidding: Open/Closed" status badge from the tender card
+    containing this listing link, so 2merkato results can skip tenders that
+    are already closed (eGP isn't touched here — eGP removes closed tenders
+    from its own listing automatically, so this check would be redundant
+    there and risks nothing but wasted effort).
+
+    Fails safe: if the badge can't be confidently located for any reason,
+    returns "unknown" rather than guessing — a missed selector should never
+    cause a genuinely open tender to be silently dropped, only cause us to
+    fall back to the old always-alert behavior for that one row.
+    """
+    try:
+        # Walk up to the nearest ancestor element whose text contains
+        # "Bidding" — on 2merkato's card layout this is the tender card
+        # itself, which also contains the "Open"/"Closed" status pill.
+        container = link.locator("xpath=ancestor::*[contains(., 'Bidding')][1]").first
+        if container.count() == 0:
+            return "unknown"
+        card_text = container.inner_text(timeout=3000)
+    except Exception:
+        return "unknown"
+
+    lower = card_text.lower()
+    idx = lower.find("bidding")
+    if idx == -1:
+        return "unknown"
+    # The status word/pill sits right after the "Bidding" label — a small
+    # window here avoids false positives from the word "closed" appearing
+    # elsewhere in the card's body text (e.g. "closed bids" in a description).
+    window = lower[idx: idx + 40]
+    if "closed" in window:
+        return "closed"
+    if "open" in window:
+        return "open"
+    return "unknown"
+
+
+def _process_merkato_links(links, context, candidates: list, seen_this_scan: set) -> int:
+    """
+    Shared per-link handling for the 2merkato engine: dedup, keyword
+    relevance check (untouched — same is_relevant_tender used everywhere
+    else), detail-page fetch, and candidate collection. Factored out so both
+    the keyword-search path and the listing-page fallback path use identical
+    logic instead of two copies drifting apart over time.
+    """
+    found = 0
+    for link in links:
+        try:
+            title_text = link.inner_text().strip()
+            href = link.get_attribute("href")
+            if not title_text or not href:
+                continue
+
+            full_link = href if href.startswith("http") else f"{MERKATO_BASE}{href}"
+
+            if full_link in seen_this_scan:
+                continue
+            seen_this_scan.add(full_link)
+
+            if is_relevant_tender(title_text):
+                tender_id = f"merkato_{full_link.rstrip('/').split('/')[-1]}"
+                if not is_already_notified(tender_id):
+                    status = _get_merkato_card_status(link)
+                    if status == "closed":
+                        # Mark as notified so a closed tender doesn't get
+                        # rechecked every single scan cycle forever, but
+                        # skip the detail-page fetch and AI review entirely
+                        # — no point spending either on a tender you can no
+                        # longer bid on.
+                        print(f"⏭️ Skipping closed 2merkato tender (Bidding: Closed): {title_text}", flush=True)
+                        mark_as_notified(tender_id)
+                        continue
+
+                    # Mark as notified immediately regardless of the eventual
+                    # AI verdict — prevents re-checking (and re-spending
+                    # AI quota on) the same tender on every scan cycle
+                    mark_as_notified(tender_id)
+
+                    found += 1
+
+                    # Fetch the actual detail page — the listing title alone
+                    # never contains the submission deadline, which is why
+                    # closing date kept coming back "not specified." Open it
+                    # in a SEPARATE tab so we don't disturb pagination state
+                    # on the main listing page. This is a Playwright call, not
+                    # an AI call, so it doesn't touch the AI quota.
+                    detail_text = ""
+                    detail_page = None
+                    try:
+                        detail_page = context.new_page()
+                        detail_page.goto(full_link, timeout=20000, wait_until="domcontentloaded")
+                        try:
+                            detail_page.wait_for_load_state("networkidle", timeout=10000)
+                        except Exception:
+                            pass
+                        for poll_attempt in range(5):
+                            detail_page.wait_for_timeout(1000)
+                            try:
+                                candidate_text = detail_page.locator("body").inner_text(timeout=5000)
+                            except Exception:
+                                candidate_text = ""
+                            if len(candidate_text) > 300:
+                                detail_text = candidate_text
+                                break
+                            detail_text = candidate_text
+                        detail_text = detail_text[:6000]
+                        print(f"📄 Captured {len(detail_text)} chars from 2merkato detail page", flush=True)
+                    except Exception as e:
+                        print(f"⚠️ Could not read 2merkato detail page text: {e}", flush=True)
+                    finally:
+                        if detail_page is not None:
+                            try:
+                                detail_page.close()
+                            except Exception:
+                                pass
+
+                    # Collect for the single end-of-scan batch AI call rather
+                    # than calling the AI right here per-tender
+                    candidates.append({
+                        "id": tender_id,
+                        "source": "2merkato",
+                        "title": title_text,
+                        "ref_no": "",
+                        "detail_text": detail_text,
+                        "link": full_link,
+                    })
+        except Exception:
+            continue
+    return found
 
 
 # ==================== ENGINE: eGP (egp.gov.et) ====================
@@ -1098,6 +1163,7 @@ def check_for_tenders():
                 is_relevant = True
                 match_score = "?"
                 reason = "AI batch analysis unavailable — keyword match only"
+                procurement_object = ""
                 constraints = "Unknown — AI unavailable"
                 closing_date = "Unknown — AI unavailable"
                 ai_verified = False
@@ -1107,6 +1173,7 @@ def check_for_tenders():
                 is_relevant = True
                 match_score = "?"
                 reason = "Missing from AI batch response — keyword match only"
+                procurement_object = ""
                 constraints = "Unknown — AI unavailable"
                 closing_date = "Unknown — AI unavailable"
                 ai_verified = False
@@ -1114,8 +1181,13 @@ def check_for_tenders():
                 is_relevant = bool(result.get("relevant", True))
                 match_score = result.get("match_score", "?")
                 reason = result.get("reason", "")
-                constraints = result.get("constraints", "None identified")
-                closing_date = result.get("closing_date", "Not specified in provided text")
+                procurement_object = result.get("procurement_object", "")
+                # "Not stated in provided text" (not "None identified") is the
+                # correct fallback here — the AI was only shown an excerpt of
+                # the page, so an empty result means "not found in what we
+                # sent it", not "confirmed there are none".
+                constraints = result.get("constraints") or "Not stated in provided text"
+                closing_date = result.get("closing_date") or "Not stated in provided text"
                 ai_verified = True
 
             if not is_relevant:
@@ -1126,20 +1198,9 @@ def check_for_tenders():
                 print(f"🤖 AI rejected as not relevant, skipping alert: {c['title']} — reason: {reason or '(no reason returned)'}", flush=True)
                 continue
 
-            ai_status = None
-            if result is not None and isinstance(result, dict):
-                ai_status = result.get("status")
-
-            if not is_tender_still_open(closing_date, c.get("detail_text", ""), ai_status):
-                print(
-                    f"⏰ Skipping closed/expired tender: {c['title']} — "
-                    f"closing_date={closing_date!r} status={ai_status!r}",
-                    flush=True,
-                )
-                continue
-
             verification_note = "⚠️ *Unverified* (AI review failed — keyword match only)\n\n" if not ai_verified else ""
             ref_line = f"📄 *Ref No:* {c['ref_no']}\n\n" if c.get("ref_no") else ""
+            object_line = f"🏷️ *Procurement Object:* {procurement_object}\n" if procurement_object else ""
             source_label = "eGP" if c["source"] == "egp" else "2merkato"
             label = f"New Medical Tender Found ({source_label})!"
 
@@ -1148,6 +1209,7 @@ def check_for_tenders():
                 f"{verification_note}"
                 f"📋 *Title:* {c['title']}\n"
                 f"{ref_line}"
+                f"{object_line}"
                 f"🤖 *AI Analysis:*\n"
                 f"🎯 *Match Score:* {match_score}% - {reason}\n"
                 f"⚠️ *Constraints:* {constraints}\n"
