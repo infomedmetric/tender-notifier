@@ -487,12 +487,60 @@ def scrape_2merkato(candidates: list):
                             search_url = f"{MERKATO_TENDERS_URL}?{param}={quote(term)}"
                             page.goto(search_url, timeout=30000, wait_until="domcontentloaded")
                             page.wait_for_timeout(2500)
-                            # Stop at the first param that returns tender links
-                            if page.locator("a[href*='/tenders/']").count() > 0:
+                            # Stop at the first param that returns real tender links
+                            # (href slug after /tenders/ longer than 8 chars = real id)
+                            probe_count = page.evaluate(
+                                "() => Array.from(document.querySelectorAll(\"a[href*='/tenders/']\")).filter(e => {"
+                                "  let h = (e.getAttribute('href') || '').split('?')[0];"
+                                "  if (h.endsWith('/')) h = h.slice(0, -1);"
+                                "  const parts = h.split('/tenders/');"
+                                "  const slug = parts.length > 1 ? parts[parts.length - 1] : '';"
+                                "  return slug.length > 8;"
+                                "}).length"
+                            )
+                            if probe_count and probe_count > 0:
                                 print(f"🔎 2merkato search via ?{param}= for '{term}'", flush=True)
                                 break
 
-                    links = page.locator("a[href*='/tenders/']").all()
+                    # Real tender detail URLs look like /tenders/<id> (e.g. 24-char
+                    # hex ObjectIds). Nav links such as "My Tenders" → /tenders or
+                    # /tenders?page=1 must be excluded or the scraper wastes time
+                    # on menu chrome and mis-reports "48 links" for every term.
+                    raw_links = page.locator(
+                        "a[href*='/tenders/']:not([href$='/tenders']):not([href$='/tenders/'])"
+                    ).all()
+
+                    NAV_TITLES = {
+                        "my tenders", "tenders", "all tenders", "free tenders",
+                        "posted today", "home", "login", "logout", "profile",
+                        "documents", "categories", "filter", "clear",
+                    }
+
+                    links = []
+                    for link in raw_links:
+                        try:
+                            href = (link.get_attribute("href") or "").strip()
+                            title_text = (link.inner_text() or "").strip()
+                            if not href or not title_text:
+                                continue
+                            # Must have a non-empty path segment after /tenders/
+                            # e.g. /tenders/69dce1e70a538a0ee7000001 — not /tenders
+                            # and not /tenders?page=2
+                            path_part = href.split("?")[0].rstrip("/")
+                            if "/tenders/" not in path_part:
+                                continue
+                            tender_slug = path_part.split("/tenders/")[-1]
+                            if not tender_slug or tender_slug.lower() in ("tenders",):
+                                continue
+                            if title_text.lower() in NAV_TITLES:
+                                continue
+                            if len(title_text) < 12:
+                                # Real tender titles are long; short labels are chrome
+                                continue
+                            links.append(link)
+                        except Exception:
+                            continue
+
                     first_title_preview = ""
                     if links:
                         try:
@@ -501,7 +549,8 @@ def scrape_2merkato(candidates: list):
                             pass
                     mode = "query-param" if used_query_param else "search-box"
                     print(
-                        f"2merkato search '{term}' ({mode}) | {len(links)} links | first: {first_title_preview!r}",
+                        f"2merkato search '{term}' ({mode}) | {len(links)} tender links "
+                        f"(from {len(raw_links)} raw) | first: {first_title_preview!r}",
                         flush=True,
                     )
 
