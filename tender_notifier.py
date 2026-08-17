@@ -1,5 +1,6 @@
 import os
 import time
+import json
 import requests
 import threading
 import traceback
@@ -9,61 +10,216 @@ from datetime import datetime
 from flask import Flask, request
 from playwright.sync_api import sync_playwright
 import urllib3
-from google import genai
-from google.genai import types
+from groq import Groq
 
-def analyze_tender_with_ai(raw_tender_text: str) -> str:
+def _call_groq_with_retry(client, system_instruction, prompt, temperature=0.2, max_retries=3, base_delay=2):
     """
-    Passes raw tender data to Gemini to handle translation, match scoring,
-    and constraint extraction in a single step.
-    """
-    # Fallback structure if the API call fails
-    fallback_text = "⚠️ [AI Analysis Unavailable due to a connection error]"
-    
-    api_key = os.environ.get("GEMINI_API_KEY")
-    if not api_key:
-        print("Error: GEMINI_API_KEY environment variable is missing.")
-        return fallback_text
+    Wraps a Groq chat.completions.create call with retries + exponential
+    backoff, mirroring the same reliability pattern used before with
+    Gemini — a single transient network blip shouldn't immediately produce
+    a fallback/degraded result.
 
-    try:
-        # Initialize the official current client
-        client = genai.Client(api_key=api_key)
-        
-        # System instructions force the AI to behave like a strict procurement bot
-        system_instruction = (
-            "You are an expert procurement analyst specializing in Ethiopian medical equipment and medical equipment maintenance tenders. "
-            "Analyze the provided raw text and return a structured analysis matching the requested format. "
-            "Keep answers extremely concise so they fit perfectly on a mobile phone WhatsApp screen."
-        )
-        
-        prompt = f"""
-        Analyze this raw tender data and extract the details precisely. 
-        
-        Format your response exactly like this:
-        🎯 **Match Score:** [X% - Provide a 1 line-sentence reason focusing on medical devices, medical equipment maintenance, Hemodialysis machines maintenance or service or water treatement systems or any other related fields.]
-        ⚠️ **Constraints:** [List any crucial requirements like bid security amount or bank guarantees/bid bonds, Eligibility Documents, or specific manufacturer authorizations. If none, write "None"]
-        📅 **Closing Date:** [Extract Bid submission deadline date and time. Keep it in East Africa Time (EAT)]
-        
-        Raw Tender Data:
-        {raw_tender_text}
-        """
-        
-        # Using gemini-latest-flash as it is lightning fast, cheap, and has a huge context window for long texts
-        response = client.models.generate_content(
-            model='gemini-flash-latest',
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                system_instruction=system_instruction,
-                temperature=0.2, # Low temperature ensures factual extraction instead of creative guessing
+    Model is configurable via GROQ_MODEL (defaults to llama-3.3-70b-versatile,
+    a solid, widely-available free-tier Groq model). Groq's free tier also
+    has its own rate limits, so batching everything into one call per scan
+    cycle (see batch_analyze_tenders below) still matters just as much here
+    as it did with Gemini.
+    """
+    model_name = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
+    last_error = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            return client.chat.completions.create(
+                model=model_name,
+                messages=[
+                    {"role": "system", "content": system_instruction},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=temperature,
+                response_format={"type": "json_object"},
             )
+        except Exception as e:
+            last_error = e
+            if attempt < max_retries:
+                delay = base_delay * attempt  # 2s, 4s, 6s...
+                print(f"⚠️ Groq call failed (attempt {attempt}/{max_retries}): {e} — retrying in {delay}s", flush=True)
+                time.sleep(delay)
+    raise last_error
+
+
+
+# Keywords used to locate the parts of a detail page worth keeping when the
+# full captured text (up to 6000 chars) is too long to send to the AI in
+# full. A blind [:N] truncation was cutting off the closing date and
+# eligibility/constraints info entirely whenever a page's nav/breadcrumb/menu
+# text ran long before the real content — which is exactly why those fields
+# kept coming back empty even though the scraper WAS capturing the text.
+_CLOSING_DATE_HINTS = [
+    "closing date", "submission deadline", "bid submission", "deadline",
+    "closing time", "bid closing", "last date", "due date", "valid until",
+    "validity", "opening date",
+]
+_CONSTRAINT_HINTS = [
+    "eligib", "bid bond", "bid security", "minimum requirement", "experience",
+    "similar contract", "qualification", "capital", "registration",
+    "local agent", "representative", "certificate", "license", "requirement",
+]
+
+
+def _build_detail_snippet(detail_text: str, max_chars: int = 2400) -> str:
+    """
+    Instead of blindly slicing the first N characters (which was silently
+    dropping the closing date and constraints whenever they appeared later
+    in the page than the cutoff), keep the front of the page for
+    title/scope context PLUS a window of text around any closing-date or
+    constraint-related keyword found anywhere in the full captured text.
+    This makes it far more likely the AI actually sees the relevant
+    sentence instead of nav/menu boilerplate.
+    """
+    if not detail_text:
+        return ""
+    if len(detail_text) <= max_chars:
+        return detail_text
+
+    lower = detail_text.lower()
+    front_budget = max_chars // 2
+    front = detail_text[:front_budget]
+
+    windows = []
+    remaining_budget = max_chars - front_budget
+    for hint in _CLOSING_DATE_HINTS + _CONSTRAINT_HINTS:
+        if remaining_budget <= 0:
+            break
+        idx = lower.find(hint)
+        if idx == -1 or idx < front_budget:
+            continue  # already covered by the front slice, or not present
+        start = max(0, idx - 60)
+        end = min(len(detail_text), idx + 240)
+        window = detail_text[start:end]
+        if window not in windows:
+            windows.append(window)
+            remaining_budget -= len(window)
+
+    return front + "\n[...]\n" + "\n[...]\n".join(windows) if windows else front
+
+
+def _build_batch_prompt(chunk_with_indices):
+    """Builds the system + user prompt for one sub-batch of (index, candidate) pairs."""
+    entries = []
+    for i, c in chunk_with_indices:
+        snippet = _build_detail_snippet(c.get('detail_text', ''))
+        entries.append(
+            f"[{i}] Source: {c['source']} | Title: {c['title']} | Ref No: {c.get('ref_no', '')}\n"
+            f"Detail: {snippet}"
         )
-        
-        return response.text if response.text else fallback_text
+    joined_entries = "\n\n".join(entries)
 
-    except Exception as e:
-        print(f"AI Generation failed: {e}")
-        return fallback_text
+    system_instruction = (
+        "You are an expert procurement analyst for medMETRIC Healthcare Service PLC, "
+        "an Ethiopian biomedical engineering and medical equipment technical-services provider. Their scope "
+        "covers: medical equipment Corrective and preventive maintenance & service contracts (including hemodialysis "
+        "systems like B.Braun Dialog+ and SWS-4000A), RO/water treatment systems, CSSD & "
+        "sterilization equipment (e.g. Rivamed or Aquaboss), corrective and preventive maintenance of "
+        " medical imaging equipment, Procurement of Maintenance and Repair Service, also medmetric participates on International Competitive Bidding (ICB) which is related to medical equipment "
+        "and general medical equipment supply/consultancy. They do NOT supply medicines, must check since they don't work on "
+        "pharmaceuticals, vaccines, or laboratory-only equipment/reagents/consumables — mark "
+        "those NOT relevant even if they mention \"medical\" in passing.\n\n"
+        "You will be given a numbered list of tenders, each with a Detail excerpt taken from the tender's "
+        "own detail page (it may include a front section plus separate windows of text pulled from around "
+        "date/eligibility keywords elsewhere on the page, joined by [...] markers — treat each window as "
+        "real page text, not as connected prose).\n\n"
+        "Analyze EACH tender independently and return a JSON object with a single key \"tenders\" whose "
+        "value is an array — one object per tender, covering every index given, with EXACTLY this shape:\n"
+        '{"tenders": [{'
+        '"index": 0, '
+        '"relevant": true, '
+        '"match_score": 85, '
+        '"reason": "short sentence on why it matches or not", '
+        '"procurement_object": "the object/type of procurement as stated on the page, e.g. \'Supply and installation of hemodialysis machines\'", '
+        '"constraints": "key eligibility/bid requirements actually stated in the text — e.g. bid bond amount, minimum years of similar experience, required certifications, local representation requirement. '
+        'If the provided excerpt does not contain this info, respond exactly with \'Not stated in provided text\' — do NOT say \'None\' or \'None identified\', since that implies you confirmed there are none.", '
+        '"closing_date": "the bid submission deadline / closing date (and time, if given) EXACTLY as it appears in the text, including the date format used. '
+        'If no such date appears anywhere in the excerpt, respond exactly with \'Not stated in provided text\'. Do not confuse this with a publish date, site-visit date, or clarification-request date."'
+        "}, ...]}\n"
+        "Respond with ONLY that JSON object — no markdown fences, no commentary."
+    )
+    prompt = f"Tenders to analyze:\n\n{joined_entries}"
+    return system_instruction, prompt
 
+
+
+def batch_analyze_tenders(candidates: list):
+    """
+    Analyzes ALL candidate tenders from a scan cycle in as FEW Groq calls as
+    possible — instead of one call per tender. Even free-tier LLM APIs cap
+    daily/per-minute requests (both a request count AND a tokens-per-minute
+    budget), so a per-tender approach can burn through a day's quota in one
+    scan.
+
+    A single-mega-request approach hit Groq's TPM (tokens per minute) limit
+    once there were 15-20+ candidates with detail text attached (413 "Request
+    too large"). So candidates are split into smaller sub-batches sized to
+    stay comfortably under the TPM limit, each sent as its own Groq call —
+    still far fewer calls than one per tender (e.g. 23 candidates becomes
+    ~3 calls instead of 23 or 46).
+
+    Returns a dict {index: {relevant, match_score, reason, object,
+    closing_date}} on success (possibly missing some indices if only some
+    sub-batches failed — the caller already treats a missing index as
+    "unverified, fall back to keyword match"), or None if EVERY sub-batch
+    failed (e.g. no API key, or Groq unreachable entirely).
+    """
+    if not candidates:
+        return {}
+
+    api_key = os.environ.get("GROQ_API_KEY")
+    if not api_key:
+        return None
+
+    # Sized conservatively: detail snippets now run up to ~2,400 chars/
+    # candidate (up from 900) so the AI can actually see closing dates and
+    # constraints that appear later in the page rather than always seeing
+    # blank space. ~6 candidates per chunk keeps prompt+completion tokens
+    # comfortably under Groq's 12,000 TPM limit for llama-3.3-70b-versatile,
+    # even accounting for the system instruction and JSON completion overhead.
+    CHUNK_SIZE = 6
+
+    client = Groq(api_key=api_key)
+    indexed_candidates = list(enumerate(candidates))
+    chunks = [indexed_candidates[i:i + CHUNK_SIZE] for i in range(0, len(indexed_candidates), CHUNK_SIZE)]
+
+    all_results = {}
+    any_chunk_succeeded = False
+
+    for chunk_num, chunk in enumerate(chunks, start=1):
+        system_instruction, prompt = _build_batch_prompt(chunk)
+        try:
+            response = _call_groq_with_retry(client, system_instruction, prompt, temperature=0.2)
+            raw = (response.choices[0].message.content or "").strip()
+            if raw.startswith("```"):
+                raw = raw.split("```")[1]
+                if raw.startswith("json"):
+                    raw = raw[4:]
+                raw = raw.strip()
+            parsed = json.loads(raw)
+            items = parsed.get("tenders", []) if isinstance(parsed, dict) else parsed
+            for item in items:
+                idx = item.get("index")
+                if idx is not None:
+                    all_results[idx] = item
+            any_chunk_succeeded = True
+        except Exception as e:
+            print(f"⚠️ Batch AI analysis sub-batch {chunk_num}/{len(chunks)} failed after retries: {e}", flush=True)
+            # Leave this sub-batch's indices out of all_results — the caller
+            # already falls back to "unverified, keyword match only" for any
+            # index missing from the results dict
+
+        # Small pause between sub-batches so back-to-back chunks don't
+        # themselves stack up against the TPM window
+        if chunk_num < len(chunks):
+            time.sleep(3)
+
+    return all_results if any_chunk_succeeded else None
 
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -79,7 +235,7 @@ INSTANCE_NAME = os.environ.get("INSTANCE_NAME", "Tender-Notifier.")
 # at startup rather than silently sending requests with an empty key.
 GLOBAL_API_KEY = os.environ.get("GLOBAL_API_KEY")
 if not GLOBAL_API_KEY:
-    print("⚠️ GLOBAL_API_KEY is not set — WhatsApp sends will fail until it's configured in VPS environment variables.", flush=True)
+    print("⚠️ GLOBAL_API_KEY is not set — WhatsApp sends will fail until it's configured in Render's environment variables.", flush=True)
 
 # SECURITY/PRIVACY: no hardcoded phone number — recipients must be supplied
 # via the WHATSAPP_NUMBERS env var (comma-separated).
@@ -91,7 +247,7 @@ if not WHATSAPP_NUMBERS:
 
 # Shared secret required to trigger a manual scan via /test-check. Without
 # this, anyone who discovers the public Render URL could trigger scans on
-# demand, burning your Gemini quota and spamming your WhatsApp numbers.
+# demand, burning your Groq quota and spamming your WhatsApp numbers.
 TEST_CHECK_TOKEN = os.environ.get("TEST_CHECK_TOKEN")
 
 MERKATO_USER = os.environ.get("MERKATO_USER")
@@ -101,7 +257,7 @@ MERKATO_PASS = os.environ.get("MERKATO_PASS")
 MERKATO_BASE = "https://tender.2merkato.com"
 MERKATO_LOGIN_URL = f"{MERKATO_BASE}/login"
 MERKATO_TENDERS_URL = f"{MERKATO_BASE}/tenders"
-MERKATO_MAX_PAGES = int(os.environ.get("MERKATO_MAX_PAGES", "5"))
+MERKATO_MAX_PAGES = int(os.environ.get("MERKATO_MAX_PAGES", "4"))
 
 EGP_BASE = "https://production.egp.gov.et"
 EGP_LOGIN_URL = f"{EGP_BASE}/egp/login"
@@ -111,46 +267,96 @@ EGP_PASS = os.environ.get("EGP_PASS")
 EGP_ORG_NAME = os.environ.get("EGP_ORG_NAME", "Medmetric")
 
 # Search terms fed one at a time into eGP's own built-in table search box —
-# far more reliable than scraping every row across 13+ pages
+# far more reliable than scraping every row across 13+ pages.
+# Rebuilt around medMETRIC's actual service lines (medmetrichealthcare.com):
+# maintenance/service contracts, RO water treatment, CSSD/sterilization,
+# and calibration — not just dialysis. "laboratory" intentionally dropped —
+# lab-only tenders are explicitly out of scope.
 EGP_SEARCH_TERMS = [
-    "medical", "biomedical", "hemodialysis", "dialysis", "medical equipment maintenance",
-    "medical equipment", "hospital equipment", "x-ray", "ultrasound", "ICB", "water tratement" 
+    "Procurement of Maintenance and Repair Service", "Procurement of Medical Equipment and Supplies", "hemodialysis", "dialysis",
+    "medical equipment", "sterilization", "water treatment", "Reverse osmosis", "filters",
+    "x-ray", "ultrasound", "medical imaging", "membrane", "ICB", "International Competitive Bid",
 ]
 
-# Any ONE of these alone is specific enough to trigger a match
+# Search terms fed one at a time into 2merkato's own "Search by keyword" filter
+# panel — mirrors the EGP_SEARCH_TERMS approach above. 2merkato's general
+# listing has 25,000+ pages, so paging through the first few of those (the
+# old approach) only ever saw whatever happened to be posted most recently
+# across ALL categories, not specifically medical/biomedical tenders. Reusing
+# the site's own keyword search narrows results down to a handful of pages
+# per term, the same way it does on eGP.
+MERKATO_SEARCH_TERMS = [
+    "hemodialysis", "dialysis", "medical equipment", "sterilization",
+    "water treatment", "reverse osmosis", "x-ray", "ultrasound",
+    "medical imaging", "biomedical", "CSSD", "autoclave", "ICB",
+    "medical equipment maintenance", "hospital equipment",
+]
+
+# How many result pages to walk PER search term (not per whole catalog) —
+# a filtered keyword search returns far fewer pages than the full listing,
+# so a small number here is plenty and keeps the scan fast.
+MERKATO_MAX_PAGES_PER_TERM = int(os.environ.get("MERKATO_MAX_PAGES_PER_TERM", "3"))
+
+# Any ONE of these alone is specific enough to trigger a match.
+# Includes medMETRIC's actual named service lines (CSSD, RO/water treatment,
+# calibration, spare parts, biomedical engineering) so tenders aren't
+# under-scored just because they're not dialysis-specific.
 STRONG_KEYWORDS = [
-    "biomedical", "hemodialysis", "dialysis", "bbraun", "dialog", "radiology","ICB", "Water Treatment",
-    "x-ray", "xray", "ultrasound", "ventilator", "autoclave", "sterilizer",
-    "diagnostic equipment", "medical equipment", "hospital equipment",
-    "medical equipment maintenance", "medical device", "የህክምና", "ጥገና"
+    "ICB", "hemodialysis", "dialysis", "bbraun", "philips", "SWS",
+    "x-ray", "xray", "ultrasound", "CT Scan", "autoclave", "Water treatment",
+    "Procurement of Maintenance and Repair Service", "cssd", "Procurement of Medical Equipment and Supplies",
+    "reverse osmosis", "ro system", "SPHMMC", "technical service",
+    "biomedical engineering", "medical imaging", "calibration",
+    "EPSA", "medical equipment", "hospital equipment",
+    "medical device", "የህክምና ጥገና",
 ]
 
 # Generic medical-adjacent words — only count if paired with an equipment/
 # procurement-type word in the same title (avoids matching HR/insurance/
-# consulting tenders that merely mention "health")
-MEDICAL_CONTEXT = ["medical", "health", "hospital", "biomedical", "clinical", "Corrective maintenance"]
+# consulting tenders that merely mention "health"). "laboratory" removed —
+# lab-only tenders are handled by HARD_EXCLUDE_TERMS below instead.
+MEDICAL_CONTEXT = ["medical", "health", "hospital", "biomedical", "clinical"]
 EQUIPMENT_CONTEXT = ["equipment", "supplies", "supply", "device", "machine",
-                     "instrument", "apparatus", "maintenance", "repair", "procurement"]
+                     "ICB", "corrective maintenance", "maintenance", "repair", "procurement of medical equipment",
+                     "calibration", "medical equipment installation", "servicing",
+                     "Maintenance and Repair Service", "medical consultancy" ]
 
-# If any of these appear, skip regardless of other matches — these are the
-# recurring false-positive categories (vehicle maintenance, insurance, consulting)
-EXCLUDE_TERMS = [
+# Always excluded regardless of context — these categories are never
+# relevant to Medmetric no matter what else appears in the title.
+# Laboratory-only tenders and pure medicine/pharmaceutical supply tenders
+# (e.g. "RDF Medicines...") are explicitly out of scope — medMETRIC is a
+# biomedical engineering/technical-service company, not a drug supplier.
+HARD_EXCLUDE_TERMS = [
     "vehicle", "toyota", "car ", "motorbike", "insurance", "life insurance",
-    "term life", "gpa", "laboratory", "consulting firm"
+    "term life", "gpa", "spare part", "construction","road"
+    "laboratory", "lab reagent", "reagent", "lab equipment",
+    "medicine", "medicines", "pharmaceutical", "pharmaceuticals",
+    "drug", "drugs", "vaccine", "vaccines", "rdf medicine", "rdf medicines"
 ]
+
+# Excluded UNLESS the title also shows clear medical + equipment context —
+# generic "consultancy services" for HR/finance/etc. should be skipped, but
+# "medical equipment consultancy services" should NOT be, since Medmetric
+# offers exactly that
+CONTEXTUAL_EXCLUDE_TERMS = ["car", "consulting firm"]
 
 
 def is_relevant_tender(title):
     title_lower = title.lower()
 
-    if any(term in title_lower for term in EXCLUDE_TERMS):
+    if any(term in title_lower for term in HARD_EXCLUDE_TERMS):
         return False
-
-    if any(term in title_lower for term in STRONG_KEYWORDS):
-        return True
 
     has_medical_context = any(term in title_lower for term in MEDICAL_CONTEXT)
     has_equipment_context = any(term in title_lower for term in EQUIPMENT_CONTEXT)
+
+    if any(term in title_lower for term in CONTEXTUAL_EXCLUDE_TERMS):
+        if not (has_medical_context and has_equipment_context):
+            return False
+        # else: it's medical-equipment consultancy — fall through, don't exclude
+
+    if any(term in title_lower for term in STRONG_KEYWORDS):
+        return True
 
     return has_medical_context and has_equipment_context
 
@@ -265,7 +471,7 @@ def send_whatsapp(message):
 
 
 # ==================== ENGINE: 2MERKATO (Playwright) ====================
-def scrape_2merkato():
+def scrape_2merkato(candidates: list):
     print(f"[{datetime.now()}] 🔍 Running 2merkato Engine (Playwright)...", flush=True)
     found = 0
 
@@ -324,44 +530,132 @@ def scrape_2merkato():
                 except Exception as e:
                     print(f"⚠️ Login attempt failed, continuing without auth: {e}", flush=True)
 
-            # --- Load tenders listing across multiple pages ---
-            seen_this_scan = set()
-            for page_num in range(1, MERKATO_MAX_PAGES + 1):
-                page_url = MERKATO_TENDERS_URL if page_num == 1 else f"{MERKATO_TENDERS_URL}?page={page_num}"
-                print(f"➡️ Loading 2merkato page {page_num}: {page_url}", flush=True)
-                page.goto(page_url, timeout=30000, wait_until="domcontentloaded")
-                page.wait_for_timeout(3000)
+            # --- Search by keyword instead of paging the general listing ---
+            # The old approach walked the first few pages of "All Tenders"
+            # (25,000+ pages total, sorted by recency across every category
+            # on the site) — meaning it only ever saw whatever happened to
+            # be posted most recently regardless of relevance. Using the
+            # site's own "Search by keyword" filter, one term at a time,
+            # mirrors the eGP engine and actually targets medical/biomedical
+            # tenders specifically.
+            page.goto(MERKATO_TENDERS_URL, timeout=30000, wait_until="domcontentloaded")
+            page.wait_for_timeout(2000)
 
-                links = page.locator("a[href*='/tenders/']").all()
-                print(f"Page {page_num}: found {len(links)} raw tender links", flush=True)
+            # The keyword field may already be visible on the page, or it may
+            # live inside a filter panel that only appears after tapping a
+            # search icon in the header (this is what the site's mobile view
+            # shows). Try the direct selector first; only hunt for a toggle
+            # if that comes up empty.
+            search_input = page.locator(
+                "input[placeholder*='Search by keyword' i], input[placeholder*='keyword' i]"
+            ).first
 
-                for link in links:
+            if search_input.count() == 0:
+                # Diagnostic dump so that if this guess is wrong, the logs
+                # show exactly what's clickable in the header to open the
+                # search/filter panel — same pattern used for the eGP modal
+                # dismissal logic above.
+                header_clickables = page.eval_on_selector_all(
+                    "header *, nav *",
+                    "els => els.slice(0, 40).map(e => ({tag: e.tagName, "
+                    "aria: e.getAttribute('aria-label'), cls: e.className, "
+                    "text: (e.innerText || '').trim().slice(0, 30)}))"
+                )
+                print(f"🔎 2merkato search input not immediately visible. Header elements: {header_clickables}", flush=True)
+
+                toggle = page.locator(
+                    "[aria-label*='search' i], button:has-text('Search'), "
+                    "header svg, nav svg, [class*='search-icon' i], [class*='search-toggle' i]"
+                ).first
+                if toggle.count() > 0:
                     try:
-                        title_text = link.inner_text().strip()
-                        href = link.get_attribute("href")
-                        if not title_text or not href:
-                            continue
+                        toggle.click(timeout=5000)
+                        page.wait_for_timeout(1000)
+                        print("✅ Clicked a probable search-toggle icon in the header", flush=True)
+                    except Exception as e:
+                        print(f"⚠️ Could not click search-toggle candidate: {e}", flush=True)
 
-                        full_link = href if href.startswith("http") else f"{MERKATO_BASE}{href}"
+                search_input = page.locator(
+                    "input[placeholder*='Search by keyword' i], input[placeholder*='keyword' i]"
+                ).first
 
-                        if full_link in seen_this_scan:
-                            continue
-                        seen_this_scan.add(full_link)
+            if search_input.count() == 0:
+                print("❌ 2merkato search-by-keyword input never appeared — falling back to the old first-page listing so this scan isn't a total loss.", flush=True)
+                links = page.locator("a[href*='/tenders/']").all()
+                print(f"Fallback listing page: found {len(links)} raw tender links", flush=True)
+                found += _process_merkato_links(links, context, candidates, seen_this_scan=set())
+                browser.close()
+                print(f"2merkato engine complete. Collected {found} candidate matches for AI review.", flush=True)
+                return found
 
-                        if is_relevant_tender(title_text):
-                            tender_id = f"merkato_{full_link.rstrip('/').split('/')[-1]}"
-                            if not is_already_notified(tender_id):
-                                found += 1
-                                mark_as_notified(tender_id)
-                                alert = f"🔔 *New Medical Tender Found!*\n\n📋 *Title:* {title_text}\n🔗 *Link:* {full_link}"
-                                send_whatsapp(alert)
-                                time.sleep(2)
-                    except Exception:
-                        continue
+            print("✅ Found 2merkato 'Search by keyword' input — proceeding with keyword-driven search", flush=True)
+
+            seen_this_scan = set()
+            for term in MERKATO_SEARCH_TERMS:
+                try:
+                    # The filter panel may auto-close after the previous term's
+                    # search was applied. If the input isn't visible/attached
+                    # anymore, try the same toggle click used to open it the
+                    # first time before giving up on this term.
+                    if search_input.count() == 0 or not search_input.is_visible():
+                        toggle = page.locator(
+                            "[aria-label*='search' i], button:has-text('Search'), "
+                            "header svg, nav svg, [class*='search-icon' i], [class*='search-toggle' i]"
+                        ).first
+                        if toggle.count() > 0:
+                            try:
+                                toggle.click(timeout=5000)
+                                page.wait_for_timeout(1000)
+                            except Exception:
+                                pass
+                        search_input = page.locator(
+                            "input[placeholder*='Search by keyword' i], input[placeholder*='keyword' i]"
+                        ).first
+
+                    search_input.click()
+                    search_input.fill("")
+                    page.wait_for_timeout(200)
+                    search_input.fill(term)
+
+                    # Prefer an explicit "Filter" submit button (seen in the
+                    # site's filter panel) over just pressing Enter, since
+                    # some filter panels only apply on an explicit submit.
+                    filter_btn = page.locator("button:has-text('Filter')").first
+                    if filter_btn.count() > 0:
+                        filter_btn.click(timeout=5000)
+                    else:
+                        search_input.press("Enter")
+
+                    page.wait_for_timeout(2500)
+                    print(f"➡️ 2merkato search '{term}' submitted, current URL: {page.url}", flush=True)
+
+                    for page_num in range(1, MERKATO_MAX_PAGES_PER_TERM + 1):
+                        if page_num > 1:
+                            next_btn = page.locator(
+                                "button:has-text('Next'), a:has-text('Next'), [aria-label*='next' i]"
+                            ).first
+                            if next_btn.count() == 0:
+                                break
+                            try:
+                                next_btn.click(timeout=5000)
+                                page.wait_for_timeout(2000)
+                            except Exception:
+                                break
+
+                        links = page.locator("a[href*='/tenders/']").all()
+                        print(f"2merkato search '{term}' page {page_num}: found {len(links)} raw tender links", flush=True)
+                        if not links:
+                            break
+
+                        found += _process_merkato_links(links, context, candidates, seen_this_scan)
+
+                except Exception as e:
+                    print(f"⚠️ 2merkato search for '{term}' failed: {e}", flush=True)
+                    continue
 
             browser.close()
 
-        print(f"2merkato engine complete. Discovered {found} active matches.", flush=True)
+        print(f"2merkato engine complete. Collected {found} candidate matches for AI review.", flush=True)
         return found
 
     except Exception as e:
@@ -369,8 +663,141 @@ def scrape_2merkato():
         return 0
 
 
+def _get_merkato_card_status(link) -> str:
+    """
+    Reads the "Bidding: Open/Closed" status badge from the tender card
+    containing this listing link, so 2merkato results can skip tenders that
+    are already closed (eGP isn't touched here — eGP removes closed tenders
+    from its own listing automatically, so this check would be redundant
+    there and risks nothing but wasted effort).
+
+    Fails safe: if the badge can't be confidently located for any reason,
+    returns "unknown" rather than guessing — a missed selector should never
+    cause a genuinely open tender to be silently dropped, only cause us to
+    fall back to the old always-alert behavior for that one row.
+    """
+    try:
+        # Walk up to the nearest ancestor element whose text contains
+        # "Bidding" — on 2merkato's card layout this is the tender card
+        # itself, which also contains the "Open"/"Closed" status pill.
+        container = link.locator("xpath=ancestor::*[contains(., 'Bidding')][1]").first
+        if container.count() == 0:
+            return "unknown"
+        card_text = container.inner_text(timeout=3000)
+    except Exception:
+        return "unknown"
+
+    lower = card_text.lower()
+    idx = lower.find("bidding")
+    if idx == -1:
+        return "unknown"
+    # The status word/pill sits right after the "Bidding" label — a small
+    # window here avoids false positives from the word "closed" appearing
+    # elsewhere in the card's body text (e.g. "closed bids" in a description).
+    window = lower[idx: idx + 40]
+    if "closed" in window:
+        return "closed"
+    if "open" in window:
+        return "open"
+    return "unknown"
+
+
+def _process_merkato_links(links, context, candidates: list, seen_this_scan: set) -> int:
+    """
+    Shared per-link handling for the 2merkato engine: dedup, keyword
+    relevance check (untouched — same is_relevant_tender used everywhere
+    else), detail-page fetch, and candidate collection. Factored out so both
+    the keyword-search path and the listing-page fallback path use identical
+    logic instead of two copies drifting apart over time.
+    """
+    found = 0
+    for link in links:
+        try:
+            title_text = link.inner_text().strip()
+            href = link.get_attribute("href")
+            if not title_text or not href:
+                continue
+
+            full_link = href if href.startswith("http") else f"{MERKATO_BASE}{href}"
+
+            if full_link in seen_this_scan:
+                continue
+            seen_this_scan.add(full_link)
+
+            if is_relevant_tender(title_text):
+                tender_id = f"merkato_{full_link.rstrip('/').split('/')[-1]}"
+                if not is_already_notified(tender_id):
+                    status = _get_merkato_card_status(link)
+                    if status == "closed":
+                        # Mark as notified so a closed tender doesn't get
+                        # rechecked every single scan cycle forever, but
+                        # skip the detail-page fetch and AI review entirely
+                        # — no point spending either on a tender you can no
+                        # longer bid on.
+                        print(f"⏭️ Skipping closed 2merkato tender (Bidding: Closed): {title_text}", flush=True)
+                        mark_as_notified(tender_id)
+                        continue
+
+                    # Mark as notified immediately regardless of the eventual
+                    # AI verdict — prevents re-checking (and re-spending
+                    # AI quota on) the same tender on every scan cycle
+                    mark_as_notified(tender_id)
+
+                    found += 1
+
+                    # Fetch the actual detail page — the listing title alone
+                    # never contains the submission deadline, which is why
+                    # closing date kept coming back "not specified." Open it
+                    # in a SEPARATE tab so we don't disturb pagination state
+                    # on the main listing page. This is a Playwright call, not
+                    # an AI call, so it doesn't touch the AI quota.
+                    detail_text = ""
+                    detail_page = None
+                    try:
+                        detail_page = context.new_page()
+                        detail_page.goto(full_link, timeout=20000, wait_until="domcontentloaded")
+                        try:
+                            detail_page.wait_for_load_state("networkidle", timeout=10000)
+                        except Exception:
+                            pass
+                        for poll_attempt in range(5):
+                            detail_page.wait_for_timeout(1000)
+                            try:
+                                candidate_text = detail_page.locator("body").inner_text(timeout=5000)
+                            except Exception:
+                                candidate_text = ""
+                            if len(candidate_text) > 300:
+                                detail_text = candidate_text
+                                break
+                            detail_text = candidate_text
+                        detail_text = detail_text[:6000]
+                        print(f"📄 Captured {len(detail_text)} chars from 2merkato detail page", flush=True)
+                    except Exception as e:
+                        print(f"⚠️ Could not read 2merkato detail page text: {e}", flush=True)
+                    finally:
+                        if detail_page is not None:
+                            try:
+                                detail_page.close()
+                            except Exception:
+                                pass
+
+                    # Collect for the single end-of-scan batch AI call rather
+                    # than calling the AI right here per-tender
+                    candidates.append({
+                        "id": tender_id,
+                        "source": "2merkato",
+                        "title": title_text,
+                        "ref_no": "",
+                        "detail_text": detail_text,
+                        "link": full_link,
+                    })
+        except Exception:
+            continue
+    return found
+
+
 # ==================== ENGINE: eGP (egp.gov.et) ====================
-def scrape_egp():
+def scrape_egp(candidates: list):
     print(f"[{datetime.now()}] 🔍 Running eGP Engine (Playwright)...", flush=True)
     found = 0
 
@@ -417,6 +844,24 @@ def scrape_egp():
                         page.wait_for_timeout(4000)
                         current_url = page.url
                         print(f"✅ eGP login submitted, current URL: {current_url}", flush=True)
+
+                        if "/login" in current_url:
+                            # Still on the login page — the login itself
+                            # failed (bad credentials, site-side validation
+                            # error, etc). Surface whatever error message the
+                            # page is showing and abort this scan cleanly
+                            # rather than timing out repeatedly on a
+                            # "Tenders" link that will never appear.
+                            try:
+                                error_text = page.locator(
+                                    "[class*='error' i], [class*='alert' i], [role='alert'], "
+                                    "text=/invalid/i, text=/incorrect/i, text=/failed/i"
+                                ).first.inner_text(timeout=3000)
+                            except Exception:
+                                error_text = "(no visible error message found on page)"
+                            print(f"❌ eGP login failed — still on login page. On-page message: {error_text}", flush=True)
+                            browser.close()
+                            return 0
 
                         if "organization-selector" in current_url:
                             try:
@@ -550,8 +995,13 @@ def scrape_egp():
                             if is_relevant_tender(title_text):
                                 tender_id = f"egp_{ref_no or title_text}"
                                 if not is_already_notified(tender_id):
-                                    found += 1
+                                    # Mark as notified immediately regardless of the
+                                    # eventual AI verdict — prevents re-checking (and
+                                    # re-spending AI quota on) the same tender
+                                    # on every scan cycle
                                     mark_as_notified(tender_id)
+
+                                    found += 1
 
                                     # Try a plain anchor href inside the row first —
                                     # cheap, no navigation needed
@@ -567,9 +1017,6 @@ def scrape_egp():
                                         pass
 
                                     # No plain href — click the row to capture the
-                                    # real URL the SPA navigates to, then go back and
-                                    # restore the search filter
-                                                                        # No plain href — click the row to capture the
                                     # real URL the SPA navigates to, then go back and
                                     # restore the search filter
                                     if detail_link == EGP_BIDS_URL:
@@ -591,22 +1038,70 @@ def scrape_egp():
                                             print(f"⚠️ Click-through for detail link failed: {e}", flush=True)
                                             detail_link = EGP_BIDS_URL
 
-                                    # 1. Run the AI analysis using the function we built (passing the tender details)
-                                    raw_text_payload = f"{title_text} {ref_no}"
-                                    ai_summary = analyze_tender_with_ai(raw_text_payload)
+                                    # Fetch the actual detail page text — the title/ref_no
+                                    # alone never contain closing date, bid bond, or
+                                    # eligibility info, which is why those fields were
+                                    # always coming back "not specified." We open the
+                                    # detail page in a SEPARATE tab so we never disturb
+                                    # the main page's search box / filtered results.
+                                    # This is a Playwright call, not an AI call, so it
+                                    # doesn't touch the AI quota.
+                                    detail_text = ""
+                                    if detail_link and detail_link != EGP_BIDS_URL:
+                                        detail_page = None
+                                        try:
+                                            detail_page = context.new_page()
+                                            detail_page.goto(detail_link, timeout=20000, wait_until="domcontentloaded")
+                                            # Angular SPA detail views render fields async — a
+                                            # fixed short wait was catching the loading skeleton
+                                            # (both captures logged an identical, suspiciously
+                                            # small 144 chars). Wait for network activity to
+                                            # settle, then poll for the text to actually grow
+                                            # past a "still loading" size before giving up.
+                                            try:
+                                                detail_page.wait_for_load_state("networkidle", timeout=10000)
+                                            except Exception:
+                                                pass  # some SPAs never go fully idle — fine, we still poll below
 
-                                    # 2. Construct the properly formatted multi-line WhatsApp alert string
-                                    alert = (
-                                        f"🔔 *New Medical Tender Found (eGP)!*\n\n"
-                                        f"📋 *Title:* {title_text}\n"
-                                        f"📄 *Ref No:* {ref_no}\n\n"
-                                        f"🤖 *AI Analysis:*\n"
-                                        f"{ai_summary}\n\n"
-                                        f"🔗 *Link:* {detail_link}"
-                                    )
+                                            detail_text = ""
+                                            for poll_attempt in range(5):
+                                                detail_page.wait_for_timeout(1500)
+                                                try:
+                                                    candidate_text = detail_page.locator("body").inner_text(timeout=5000)
+                                                except Exception:
+                                                    candidate_text = ""
+                                                # Real detail content (title, ref, dates, scope,
+                                                # eligibility) runs to many hundreds of chars —
+                                                # treat anything under ~300 as still loading
+                                                if len(candidate_text) > 300:
+                                                    detail_text = candidate_text
+                                                    break
+                                                detail_text = candidate_text  # keep best-effort fallback
 
-                                    send_whatsapp(alert)
-                                    time.sleep(2)
+                                            # Trim to a sane size — some detail pages include
+                                            # long boilerplate/nav text we don't need to send
+                                            # to the AI, and it wastes tokens/quota
+                                            detail_text = detail_text[:6000]
+                                            print(f"📄 Captured {len(detail_text)} chars from eGP detail page", flush=True)
+                                        except Exception as e:
+                                            print(f"⚠️ Could not read eGP detail page text: {e}", flush=True)
+                                        finally:
+                                            if detail_page is not None:
+                                                try:
+                                                    detail_page.close()
+                                                except Exception:
+                                                    pass
+
+                                    # Collect for the single end-of-scan batch AI call
+                                    # rather than calling the AI right here per-tender
+                                    candidates.append({
+                                        "id": tender_id,
+                                        "source": "egp",
+                                        "title": title_text,
+                                        "ref_no": ref_no,
+                                        "detail_text": detail_text,
+                                        "link": detail_link,
+                                    })
                         except Exception:
                             continue
 
@@ -616,7 +1111,7 @@ def scrape_egp():
 
             browser.close()
 
-        print(f"eGP engine complete. Discovered {found} active matches.", flush=True)
+        print(f"eGP engine complete. Collected {found} candidate matches for AI review.", flush=True)
         return found
 
     except Exception as e:
@@ -627,35 +1122,125 @@ def scrape_egp():
 # ==================== RUN COORDINATOR ====================
 def check_for_tenders():
     print("=================== STARTING SCAN CYCLE ===================", flush=True)
+
+    candidates = []  # populated by both scrapers; analyzed in ONE batch AI call below
+
     try:
-        merkato_total = scrape_2merkato()
+        merkato_found = scrape_2merkato(candidates)
     except Exception:
         print("❌ 2merkato engine crashed with an unhandled exception:", flush=True)
         print(traceback.format_exc(), flush=True)
-        merkato_total = 0
+        merkato_found = 0
 
     try:
-        egp_total = scrape_egp()
+        egp_found = scrape_egp(candidates)
     except Exception:
         print("❌ eGP engine crashed with an unhandled exception:", flush=True)
         print(traceback.format_exc(), flush=True)
-        egp_total = 0
+        egp_found = 0
 
-    total = merkato_total + egp_total
-    print(f"=================== SCAN COMPLETE: {total} NEW FOUND ({merkato_total} 2merkato, {egp_total} eGP) ===================", flush=True)
+    print(f"🧮 {len(candidates)} total candidate tenders collected ({merkato_found} 2merkato, {egp_found} eGP) — running one batch AI review", flush=True)
+
+    total_sent = 0
+    if candidates:
+        # ONE (or a handful of) Groq call(s) for the entire scan cycle, covering
+        # every candidate from both engines — instead of the old per-tender
+        # approach that could burn a day's free-tier quota in a single scan.
+        # NOTE: this only batches the AI ANALYSIS step, not the WhatsApp
+        # notifications — each tender still gets sent as its own message
+        # below, since that's easier to read/forward than one long combined
+        # message.
+        batch_results = batch_analyze_tenders(candidates)
+
+        for i, c in enumerate(candidates):
+            result = batch_results.get(i) if batch_results is not None else None
+
+            if batch_results is None:
+                # The whole batch call failed even after retries (e.g. quota
+                # exhausted). Fall back to sending everything that passed the
+                # keyword filter, clearly flagged as unverified, rather than
+                # silently dropping legitimate tenders.
+                is_relevant = True
+                match_score = "?"
+                reason = "AI batch analysis unavailable — keyword match only"
+                procurement_object = ""
+                constraints = "Unknown — AI unavailable"
+                closing_date = "Unknown — AI unavailable"
+                ai_verified = False
+            elif result is None:
+                # Batch call succeeded but this particular index was missing
+                # from the response — same fallback, just for one item
+                is_relevant = True
+                match_score = "?"
+                reason = "Missing from AI batch response — keyword match only"
+                procurement_object = ""
+                constraints = "Unknown — AI unavailable"
+                closing_date = "Unknown — AI unavailable"
+                ai_verified = False
+            else:
+                is_relevant = bool(result.get("relevant", True))
+                match_score = result.get("match_score", "?")
+                reason = result.get("reason", "")
+                procurement_object = result.get("procurement_object", "")
+                # "Not stated in provided text" (not "None identified") is the
+                # correct fallback here — the AI was only shown an excerpt of
+                # the page, so an empty result means "not found in what we
+                # sent it", not "confirmed there are none".
+                constraints = result.get("constraints") or "Not stated in provided text"
+                closing_date = result.get("closing_date") or "Not stated in provided text"
+                ai_verified = True
+
+            if not is_relevant:
+                # Log the AI's actual reasoning, not just the title — makes
+                # it possible to sanity-check a borderline rejection (e.g. a
+                # title that LOOKED relevant) without digging through the
+                # WhatsApp thread for context that was never sent there
+                print(f"🤖 AI rejected as not relevant, skipping alert: {c['title']} — reason: {reason or '(no reason returned)'}", flush=True)
+                continue
+
+            verification_note = "⚠️ *Unverified* (AI review failed — keyword match only)\n\n" if not ai_verified else ""
+            ref_line = f"📄 *Ref No:* {c['ref_no']}\n\n" if c.get("ref_no") else ""
+            object_line = f"🏷️ *Procurement Object:* {procurement_object}\n" if procurement_object else ""
+            source_label = "eGP" if c["source"] == "egp" else "2merkato"
+            label = f"New Medical Tender Found ({source_label})!"
+
+            alert = (
+                f"🔔 *{label}*\n\n"
+                f"{verification_note}"
+                f"📋 *Title:* {c['title']}\n"
+                f"{ref_line}"
+                f"{object_line}"
+                f"🤖 *AI Analysis:*\n"
+                f"🎯 *Match Score:* {match_score}% - {reason}\n"
+                f"⚠️ *Constraints:* {constraints}\n"
+                f"📅 *Closing Date:* {closing_date}\n\n"
+                f"🔗 *Link:* {c['link']}"
+            )
+            send_whatsapp(alert)
+            total_sent += 1
+            time.sleep(2)
+
+    total = total_sent
+    print(f"=================== SCAN COMPLETE: {total} ALERTS SENT ({len(candidates)} candidates reviewed) ===================", flush=True)
 
     if total == 0:
         send_whatsapp("🔍 *Tender Monitor Scan Completed.*\nNo new unique medical equipment or maintenance matches found on 2merkato or eGP.")
 
 
 def monitoring_loop():
+    # Configurable via Render env var so this doesn't need a code change next time —
+    # defaults to 6 hours if SCAN_INTERVAL_HOURS isn't set
+    try:
+        interval_hours = float(os.environ.get("SCAN_INTERVAL_HOURS", "6"))
+    except ValueError:
+        interval_hours = 6
     while True:
         try:
             check_for_tenders()
         except Exception:
             print("❌ check_for_tenders crashed at the top level:", flush=True)
             print(traceback.format_exc(), flush=True)
-        time.sleep(4 * 3600)
+        time.sleep(interval_hours * 3600)
 
 
 # ==================== FLASK ROUTES ====================
@@ -667,7 +1252,7 @@ def home():
 @app.route('/test-check')
 def manual_test():
     # SECURITY: without this check, anyone who finds the public Render URL
-    # could trigger a scan on demand — burning Gemini API quota and sending
+    # could trigger a scan on demand — burning Groq API quota and sending
     # WhatsApp messages at will. Require a shared secret token to proceed.
     if not TEST_CHECK_TOKEN:
         return "Manual trigger is disabled: TEST_CHECK_TOKEN is not configured.", 503
