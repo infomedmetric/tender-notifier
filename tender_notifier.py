@@ -3,6 +3,7 @@ import time
 import json
 import requests
 import threading
+import multiprocessing
 import traceback
 import hmac
 import psycopg2
@@ -264,7 +265,7 @@ EGP_LOGIN_URL = f"{EGP_BASE}/egp/login"
 EGP_BIDS_URL = f"{EGP_BASE}/egp/bids/all"
 EGP_USER = os.environ.get("EGP_USER")
 EGP_PASS = os.environ.get("EGP_PASS")
-EGP_ORG_NAME = os.environ.get("EGP_ORG_NAME", "Medmetric")
+EGP_ORG_NAME = os.environ.get("EGP_ORG_NAME", "medMETRIC Healthcare Service PLC")
 
 # Search terms fed one at a time into eGP's own built-in table search box —
 # far more reliable than scraping every row across 13+ pages.
@@ -617,14 +618,31 @@ def scrape_2merkato(candidates: list):
                     page.wait_for_timeout(200)
                     search_input.fill(term)
 
-                    # Prefer an explicit "Filter" submit button (seen in the
-                    # site's filter panel) over just pressing Enter, since
-                    # some filter panels only apply on an explicit submit.
-                    filter_btn = page.locator("button:has-text('Filter')").first
-                    if filter_btn.count() > 0:
-                        filter_btn.click(timeout=5000)
-                    else:
-                        search_input.press("Enter")
+                    # Press Enter first. This was previously secondary to
+                    # clicking the "Filter" button, but the logs show a fixed
+                    # header (`<div class="flex h-16 ... pt-2 lg:h-32">`)
+                    # sitting on top of that button at some scroll positions —
+                    # Playwright correctly refuses to click through it, which
+                    # is why some terms ('hemodialysis', 'autoclave', etc.)
+                    # were failing with "intercepts pointer events" while
+                    # others worked fine depending on scroll state. Enter
+                    # submits the same form without needing to click anything
+                    # that could be obscured.
+                    url_before = page.url
+                    search_input.press("Enter")
+                    page.wait_for_timeout(2000)
+
+                    if page.url == url_before:
+                        # Enter alone didn't trigger navigation on this
+                        # layout — fall back to the Filter button, but with
+                        # force=True so a fixed header overlapping it doesn't
+                        # block the click the way it did before.
+                        filter_btn = page.locator("button:has-text('Filter')").first
+                        if filter_btn.count() > 0:
+                            try:
+                                filter_btn.click(timeout=5000, force=True)
+                            except Exception as e:
+                                print(f"⚠️ Forced Filter click also failed for '{term}': {e}", flush=True)
 
                     page.wait_for_timeout(2500)
                     print(f"➡️ 2merkato search '{term}' submitted, current URL: {page.url}", flush=True)
@@ -796,6 +814,73 @@ def _process_merkato_links(links, context, candidates: list, seen_this_scan: set
     return found
 
 
+def _egp_worker(result_queue):
+    """
+    Runs in a separate process (see run_egp_with_timeout below). Collects
+    into its own local candidates list and reports back through the queue,
+    since the parent process's candidates list can't be shared directly
+    with a spawned child.
+    """
+    local_candidates = []
+    try:
+        found = scrape_egp(local_candidates)
+        result_queue.put({"error": None, "candidates": local_candidates, "found": found})
+    except Exception as e:
+        result_queue.put({"error": str(e), "candidates": local_candidates, "found": 0})
+
+
+def run_egp_with_timeout(candidates: list, timeout_seconds: int = 300) -> int:
+    """
+    Runs the eGP engine in its own process with a hard wall-clock timeout,
+    instead of calling scrape_egp() directly in the scan thread.
+
+    Why: after switching eGP to Firefox, a run hung indefinitely somewhere
+    past "Running eGP Engine (Playwright)..." with no exception ever
+    raised — no timeout fired, nothing was logged for over an hour. Since
+    scrape_egp() runs inside the same background thread as the whole
+    scan loop, that hang didn't just fail eGP for one cycle, it froze
+    2merkato and every future scheduled scan too, with no way to recover
+    short of manually restarting the service. Python can't forcibly kill a
+    stuck thread, but it CAN forcibly kill a stuck child process — running
+    eGP out-of-process means whatever hangs inside it (this Firefox launch,
+    or anything else in the future), the rest of the scanner keeps running
+    on schedule regardless.
+
+    Uses the 'spawn' start method deliberately (not the default 'fork' on
+    Linux): forking would duplicate the parent's already-open Postgres
+    connection file descriptor into the child, which is unsafe for
+    concurrent/sequential use across two processes. Spawn gives the child a
+    completely fresh interpreter (and its own fresh DB connection when it
+    calls is_already_notified/mark_as_notified), avoiding that entirely.
+    """
+    ctx = multiprocessing.get_context("spawn")
+    result_queue = ctx.Queue()
+    proc = ctx.Process(target=_egp_worker, args=(result_queue,))
+    proc.start()
+    proc.join(timeout=timeout_seconds)
+
+    if proc.is_alive():
+        print(f"⏱️ eGP engine exceeded {timeout_seconds}s and appears hung — terminating it so the rest of the scan cycle isn't blocked. Will retry next cycle.", flush=True)
+        proc.terminate()
+        proc.join(timeout=10)
+        if proc.is_alive():
+            proc.kill()
+            proc.join()
+        return 0
+
+    try:
+        result = result_queue.get_nowait()
+    except Exception:
+        print("⚠️ eGP worker process exited without returning a result (likely crashed before reporting back).", flush=True)
+        return 0
+
+    if result["error"]:
+        print(f"❌ eGP engine failed in subprocess: {result['error']}", flush=True)
+
+    candidates.extend(result["candidates"])
+    return result["found"]
+
+
 # ==================== ENGINE: eGP (egp.gov.et) ====================
 def scrape_egp(candidates: list):
     print(f"[{datetime.now()}] 🔍 Running eGP Engine (Playwright)...", flush=True)
@@ -803,20 +888,51 @@ def scrape_egp(candidates: list):
 
     try:
         with sync_playwright() as p:
+            # NOTE: eGP's login is still blocked (either by the
+            # /egp/inspect-not-allowed devtools-detection page, or something
+            # upstream of it) — that part is NOT solved. This is back on
+            # Chromium rather than Firefox: Firefox was tried specifically to
+            # sidestep the CDP-based devtools detection, but it introduced a
+            # worse problem — an unexplained indefinite hang with no
+            # exception ever raised, which froze the entire scan loop
+            # (2merkato included) until the service was manually restarted.
+            # Chromium's failure mode, by contrast, is clean: it fails fast,
+            # logs a clear reason, and lets the scan cycle finish normally.
+            # A clean, understood failure beats a silent hang — reverting to
+            # this known-stable state until the login itself is solved.
+            # The run_egp_with_timeout() wrapper around this whole function
+            # stays in place regardless, as a no-cost safety net against any
+            # future hang, whatever the cause.
             browser = p.chromium.launch(
                 headless=True,
-                args=["--no-sandbox", "--disable-dev-shm-usage"]
+                args=[
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-blink-features=AutomationControlled",
+                ]
             )
             context = browser.new_context(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+                ),
+                viewport={"width": 1366, "height": 768},
+                locale="en-US",
+                timezone_id="Africa/Addis_Ababa",
             )
+            context.add_init_script("""
+                Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+                Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+                Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+                window.chrome = window.chrome || { runtime: {} };
+            """)
             page = context.new_page()
 
             # --- Login (optional — only if credentials provided) ---
             if EGP_USER and EGP_PASS:
                 try:
                     page.goto(EGP_LOGIN_URL, timeout=30000, wait_until="domcontentloaded")
-                    page.wait_for_selector("input[type='password']", timeout=20000)
+                    page.wait_for_selector("input[type='password']", timeout=30000)
 
                     field_info = page.eval_on_selector_all(
                         "input",
@@ -835,6 +951,19 @@ def scrape_egp(candidates: list):
                         user_field.fill(EGP_USER)
                         pass_field.fill(EGP_PASS)
 
+                        # Confirm the fields actually hold what we just typed
+                        # before submitting — if the site's JS resets/masks
+                        # them on some load states, a login "failure" could
+                        # really be an empty-field submission, not bad
+                        # credentials, and this log line is the only way
+                        # we'd ever know the difference.
+                        try:
+                            actual_user = user_field.input_value(timeout=2000)
+                            actual_pass_len = len(pass_field.input_value(timeout=2000))
+                            print(f"🔎 eGP fields before submit — user field: '{actual_user}' | password length: {actual_pass_len}", flush=True)
+                        except Exception:
+                            pass
+
                         submit_btn = page.locator(
                             "button[type='submit'], button:has-text('Login'), button:has-text('Sign in'), "
                             "button:has-text('Log in'), input[type='submit']"
@@ -848,18 +977,53 @@ def scrape_egp(candidates: list):
                         if "/login" in current_url:
                             # Still on the login page — the login itself
                             # failed (bad credentials, site-side validation
-                            # error, etc). Surface whatever error message the
-                            # page is showing and abort this scan cleanly
-                            # rather than timing out repeatedly on a
-                            # "Tenders" link that will never appear.
+                            # error, CAPTCHA, account lockout, etc). Surface
+                            # whatever error message the page is showing and
+                            # abort this scan cleanly rather than timing out
+                            # repeatedly on a "Tenders" link that will never
+                            # appear.
+                            error_text = "(no visible error message found on page)"
                             try:
-                                error_text = page.locator(
-                                    "[class*='error' i], [class*='alert' i], [role='alert'], "
-                                    "text=/invalid/i, text=/incorrect/i, text=/failed/i"
-                                ).first.inner_text(timeout=3000)
+                                css_hit = page.locator("[class*='error' i], [class*='alert' i], [role='alert']").first
+                                if css_hit.count() > 0:
+                                    error_text = css_hit.inner_text(timeout=3000)
                             except Exception:
-                                error_text = "(no visible error message found on page)"
+                                pass
+
+                            if error_text == "(no visible error message found on page)":
+                                # CSS-based error containers found nothing —
+                                # separately check for common failure-related
+                                # words anywhere in the visible text (kept as
+                                # its own pass since Playwright doesn't allow
+                                # mixing the "text=" engine into a plain CSS
+                                # selector list — that's what was silently
+                                # breaking this check before).
+                                for keyword in ("invalid", "incorrect", "failed", "locked", "attempts"):
+                                    try:
+                                        hit = page.get_by_text(keyword, exact=False).first
+                                        if hit.count() > 0:
+                                            error_text = hit.inner_text(timeout=2000)
+                                            break
+                                    except Exception:
+                                        continue
+
+                            # A narrow selector can miss error text the site
+                            # renders in an unexpected element, so also dump a
+                            # broader slice of the page body — cheap insurance
+                            # against another silent "no message found" log.
+                            try:
+                                body_snippet = page.locator("body").inner_text(timeout=3000)[:500]
+                            except Exception:
+                                body_snippet = ""
+
+                            captcha_present = (
+                                page.locator("iframe[src*='recaptcha' i], iframe[title*='captcha' i]").count() > 0
+                                or page.get_by_text("captcha", exact=False).count() > 0
+                            )
+
                             print(f"❌ eGP login failed — still on login page. On-page message: {error_text}", flush=True)
+                            print(f"🔎 CAPTCHA detected on page: {captcha_present}", flush=True)
+                            print(f"🔎 Page body snippet at failure: {body_snippet}", flush=True)
                             browser.close()
                             return 0
 
@@ -898,6 +1062,24 @@ def scrape_egp(candidates: list):
                         print(f"⚠️ Could not confidently identify eGP username/password field among: {field_info}", flush=True)
                 except Exception as e:
                     print(f"⚠️ eGP login attempt failed, continuing without auth: {e}", flush=True)
+                    # A bare exception message (e.g. a wait_for_selector
+                    # timeout) doesn't say WHAT the page actually showed
+                    # instead of the expected login form — capture that now
+                    # rather than guessing from the exception type alone.
+                    try:
+                        print(f"🔎 eGP page URL at failure: {page.url}", flush=True)
+                        print(f"🔎 eGP page body snippet at failure: {page.locator('body').inner_text(timeout=3000)[:500]}", flush=True)
+                    except Exception:
+                        print("🔎 Could not capture page state at failure (page may be unresponsive)", flush=True)
+
+                    # Login itself threw (rather than gracefully landing back
+                    # on /login) — this previously fell through to attempt
+                    # org selection and the "Tenders" click anyway while not
+                    # actually logged in, which could only ever time out.
+                    # Stop cleanly here instead of cascading into a second,
+                    # unrelated-looking failure a few seconds later.
+                    browser.close()
+                    return 0
 
             # --- Dismiss any blocking modal (this app uses Ant Design/ng-zorro
             # modals — one may pop up after org selection and intercept clicks).
@@ -1133,7 +1315,7 @@ def check_for_tenders():
         merkato_found = 0
 
     try:
-        egp_found = scrape_egp(candidates)
+        egp_found = run_egp_with_timeout(candidates)
     except Exception:
         print("❌ eGP engine crashed with an unhandled exception:", flush=True)
         print(traceback.format_exc(), flush=True)
