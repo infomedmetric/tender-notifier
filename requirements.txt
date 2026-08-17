@@ -6,3 +6,4 @@ psycopg2-binary
 google-genai
 python-dotenv
 groq
+openai
