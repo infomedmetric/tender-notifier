@@ -281,7 +281,7 @@ MERKATO_MAX_PAGES = int(os.environ.get("MERKATO_MAX_PAGES", "4"))
 # .rstrip("/") guards against a trailing slash in the env var producing
 # doubled slashes in every derived URL below (e.g. "https://egp.gov.et/"
 # + "/egp/login" would otherwise become ".../egp.gov.et//egp/login").
-EGP_BASE = os.environ.get("EGP_BASE", "https://egp.gov.et").rstrip("/")
+EGP_BASE = os.environ.get("EGP_BASE", "https://production.egp.gov.et").rstrip("/")
 EGP_LOGIN_URL = f"{EGP_BASE}/egp/login"
 EGP_BIDS_URL = f"{EGP_BASE}/egp/bids/all"
 EGP_USER = os.environ.get("EGP_USER")
@@ -298,7 +298,7 @@ EGP_SEARCH_TERMS = [
     "Procurement of Maintenance and Repair Service", "Procurement of Medical Equipment and Supplies", "hemodialysis", "dialysis",
     "medical equipment", "sterilization", "water treatment", "Reverse osmosis", "filters",
     "x-ray", "ultrasound", "medical imaging", "membrane", "ICB", "International Competitive Bid",
-    "B Braun", "Dialog+", "ዲያሊሲስ",
+    "BBraun", "Dialog+", "ዲያሊሲስ",
 ]
 
 # Search terms fed one at a time into 2merkato's own "Search by keyword" filter
@@ -313,7 +313,7 @@ MERKATO_SEARCH_TERMS = [
     "water treatment", "reverse osmosis", "x-ray", "ultrasound",
     "medical imaging", "biomedical", "CSSD", "autoclave", "ICB",
     "medical equipment maintenance", "hospital equipment",
-    "B Braun", "Dialog+", "ዲያሊሲስ",
+    "BBraun", "Dialog+", "ዲያሊሲስ",
 ]
 
 # How many result pages to walk PER search term (not per whole catalog) —
