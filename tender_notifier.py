@@ -11,7 +11,7 @@ from datetime import datetime
 from flask import Flask, request
 from playwright.sync_api import sync_playwright
 import urllib3
-from openai import OpenAI
+from groq import Groq
 
 def _call_groq_with_retry(client, system_instruction, prompt, temperature=0.2, max_retries=3, base_delay=2):
     """
@@ -20,16 +20,13 @@ def _call_groq_with_retry(client, system_instruction, prompt, temperature=0.2, m
     Gemini — a single transient network blip shouldn't immediately produce
     a fallback/degraded result.
 
-    Model is configurable via GROQ_MODEL (defaults to openai/gpt-oss-120b).
-    Groq deprecated and removed llama-3.3-70b-versatile — every call to it
-    now fails with a 404 model_not_found error, confirmed across multiple
-    scans even with a valid API key, so this isn't a transient issue.
-    openai/gpt-oss-120b is Groq's own current recommended replacement.
-    Groq's free tier also has its own rate limits, so batching everything
-    into one call per scan cycle (see batch_analyze_tenders below) still
-    matters just as much here as it did with Gemini.
+    Model is configurable via GROQ_MODEL (defaults to llama-3.3-70b-versatile,
+    a solid, widely-available free-tier Groq model). Groq's free tier also
+    has its own rate limits, so batching everything into one call per scan
+    cycle (see batch_analyze_tenders below) still matters just as much here
+    as it did with Gemini.
     """
-    model_name = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
+    model_name = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
     last_error = None
     for attempt in range(1, max_retries + 1):
         try:
@@ -184,20 +181,11 @@ def batch_analyze_tenders(candidates: list):
     # candidate (up from 900) so the AI can actually see closing dates and
     # constraints that appear later in the page rather than always seeing
     # blank space. ~6 candidates per chunk keeps prompt+completion tokens
-    # comfortably under Groq's 12,000 TPM limit for openai/gpt-oss-120b,
+    # comfortably under Groq's 12,000 TPM limit for llama-3.3-70b-versatile,
     # even accounting for the system instruction and JSON completion overhead.
     CHUNK_SIZE = 6
 
-    # Uses the standard OpenAI client pointed at Groq's OpenAI-compatible
-    # endpoint (per Groq's own current setup instructions), rather than the
-    # dedicated groq package. Deliberately still calling
-    # chat.completions.create() with response_format={"type": "json_object"}
-    # below (not the newer client.responses.create()) — Groq's Responses API
-    # is explicitly marked "currently in beta" in their docs, and this
-    # pipeline runs unattended and depends on getting valid, parseable JSON
-    # back every single time. Chat Completions + JSON mode is the
-    # well-established path for that; nothing here needed the beta endpoint.
-    client = OpenAI(api_key=api_key, base_url="https://api.groq.com/openai/v1")
+    client = Groq(api_key=api_key)
     indexed_candidates = list(enumerate(candidates))
     chunks = [indexed_candidates[i:i + CHUNK_SIZE] for i in range(0, len(indexed_candidates), CHUNK_SIZE)]
 
@@ -272,16 +260,24 @@ MERKATO_LOGIN_URL = f"{MERKATO_BASE}/login"
 MERKATO_TENDERS_URL = f"{MERKATO_BASE}/tenders"
 MERKATO_MAX_PAGES = int(os.environ.get("MERKATO_MAX_PAGES", "4"))
 
-# The eGP domain has moved/varied before (production.egp.gov.et vs plain
-# egp.gov.et, and there's a real chance it could live at something like
-# egp.ppa.gov.et in the future). Making this a single env-var-driven
-# constant means switching domains is a Render dashboard change, not a
-# code change — every URL below (login, bids listing, home-navigation
-# recovery, detail-page link resolution) derives from this one value.
-# .rstrip("/") guards against a trailing slash in the env var producing
-# doubled slashes in every derived URL below (e.g. "https://egp.gov.et/"
-# + "/egp/login" would otherwise become ".../egp.gov.et//egp/login").
-EGP_BASE = os.environ.get("EGP_BASE", "https://production.egp.gov.et").rstrip("/")
+# Habesha Tender publishes tenders as plain server-rendered pages (no
+# login required to browse), organized into site-side categories. Rather
+# than paging through the entire general listing (81+ pages across every
+# category) and relying on a title keyword match — which would miss most
+# tenders here since many titles are written in Amharic — we go straight to
+# the site's own "Medical Equipment and Supplies" and "Health" category
+# pages. That's a stronger relevance signal than a keyword match on an
+# Amharic title would ever be, so final relevance is left to the batch AI
+# review (same as the keyword-match-failure fallback path on the other
+# engines) instead of an upfront is_relevant_tender() gate.
+HABESHA_BASE = "https://www.habeshatender.com"
+HABESHA_CATEGORIES = [
+    "Medical Equipment and Supplies",
+    "Health",
+]
+HABESHA_MAX_PAGES_PER_CATEGORY = int(os.environ.get("HABESHA_MAX_PAGES_PER_CATEGORY", "3"))
+
+EGP_BASE = "https://production.egp.gov.et"
 EGP_LOGIN_URL = f"{EGP_BASE}/egp/login"
 EGP_BIDS_URL = f"{EGP_BASE}/egp/bids/all"
 EGP_USER = os.environ.get("EGP_USER")
@@ -298,7 +294,6 @@ EGP_SEARCH_TERMS = [
     "Procurement of Maintenance and Repair Service", "Procurement of Medical Equipment and Supplies", "hemodialysis", "dialysis",
     "medical equipment", "sterilization", "water treatment", "Reverse osmosis", "filters",
     "x-ray", "ultrasound", "medical imaging", "membrane", "ICB", "International Competitive Bid",
-    "BBraun", "Dialog+", "ዲያሊሲስ",
 ]
 
 # Search terms fed one at a time into 2merkato's own "Search by keyword" filter
@@ -313,7 +308,6 @@ MERKATO_SEARCH_TERMS = [
     "water treatment", "reverse osmosis", "x-ray", "ultrasound",
     "medical imaging", "biomedical", "CSSD", "autoclave", "ICB",
     "medical equipment maintenance", "hospital equipment",
-    "BBraun", "Dialog+", "ዲያሊሲስ",
 ]
 
 # How many result pages to walk PER search term (not per whole catalog) —
@@ -837,6 +831,175 @@ def _process_merkato_links(links, context, candidates: list, seen_this_scan: set
     return found
 
 
+# ==================== ENGINE: HABESHA TENDER (Playwright) ====================
+def scrape_habeshatender(candidates: list):
+    print(f"[{datetime.now()}] 🔍 Running Habesha Tender Engine (Playwright)...", flush=True)
+    found = 0
+
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-dev-shm-usage"]
+            )
+            context = browser.new_context(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                           "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+            )
+            page = context.new_page()
+
+            # Load the homepage first and navigate into each category via a
+            # real link click rather than a direct goto() to a category URL —
+            # this site appears to sit behind some kind of bot-check that
+            # rejects cold direct requests to inner pages, so we let the
+            # homepage load establish whatever cookies/session it needs
+            # before we ever navigate deeper.
+            page.goto(HABESHA_BASE, timeout=30000, wait_until="domcontentloaded")
+            page.wait_for_timeout(1500)
+
+            seen_this_scan = set()
+            for category in HABESHA_CATEGORIES:
+                try:
+                    cat_link = page.locator(f"a[href*='category={category}']").first
+                    if cat_link.count() == 0:
+                        # Fall back to a text match in case the href's query
+                        # string is encoded differently than our plain string
+                        cat_link = page.get_by_role("link", name=category, exact=False).first
+
+                    if cat_link.count() == 0:
+                        print(f"⚠️ Habesha Tender category link not found for '{category}', skipping", flush=True)
+                        continue
+
+                    cat_link.click(timeout=10000)
+                    page.wait_for_timeout(2000)
+                    print(f"➡️ Habesha Tender category '{category}' opened, current URL: {page.url}", flush=True)
+
+                    for page_num in range(1, HABESHA_MAX_PAGES_PER_CATEGORY + 1):
+                        if page_num > 1:
+                            next_link = page.locator("a:has-text('next')").first
+                            if next_link.count() == 0:
+                                break
+                            try:
+                                next_link.click(timeout=8000)
+                                page.wait_for_timeout(2000)
+                            except Exception:
+                                break
+
+                        links = page.locator("a[href*='habeshatender.php?ref=']").all()
+                        print(f"Habesha Tender '{category}' page {page_num}: found {len(links)} raw tender links", flush=True)
+                        if not links:
+                            break
+
+                        found += _process_habesha_links(links, context, candidates, seen_this_scan)
+
+                    # Reset to the homepage before the next category so each
+                    # one starts its click from a known-good page rather than
+                    # compounding off wherever pagination left us
+                    page.goto(HABESHA_BASE, timeout=30000, wait_until="domcontentloaded")
+                    page.wait_for_timeout(1500)
+                except Exception as e:
+                    print(f"⚠️ Habesha Tender category '{category}' failed: {e}", flush=True)
+                    continue
+
+            browser.close()
+
+        print(f"Habesha Tender engine complete. Collected {found} candidate matches for AI review.", flush=True)
+        return found
+
+    except Exception as e:
+        print(f"❌ Habesha Tender extraction engine down: {e}", flush=True)
+        return 0
+
+
+def _process_habesha_links(links, context, candidates: list, seen_this_scan: set) -> int:
+    """
+    Shared per-link handling for the Habesha Tender engine: dedup, detail-page
+    fetch, and candidate collection. Deliberately skips the is_relevant_tender()
+    keyword gate used by the other engines — these links already come from a
+    site-side category page ("Medical Equipment and Supplies" / "Health"),
+    which is a stronger relevance signal than a title keyword match, and many
+    titles here are in Amharic so STRONG_KEYWORDS wouldn't match them anyway.
+    Final relevance is decided by the batch AI review, same as everywhere else.
+    """
+    found = 0
+    for link in links:
+        try:
+            title_text = link.inner_text().strip()
+            href = link.get_attribute("href")
+            if not title_text or not href:
+                continue
+
+            full_link = href if href.startswith("http") else f"{HABESHA_BASE}/{href.lstrip('/')}"
+
+            if full_link in seen_this_scan:
+                continue
+            seen_this_scan.add(full_link)
+
+            # The ref number lives in the URL's ?ref= query param — use it
+            # directly as the dedup key since titles are often long/Amharic
+            ref_no = ""
+            if "ref=" in full_link:
+                ref_no = full_link.split("ref=")[-1].split("&")[0]
+
+            tender_id = f"habesha_{ref_no or full_link}"
+            if is_already_notified(tender_id):
+                continue
+
+            # Mark as notified immediately regardless of the eventual AI
+            # verdict — prevents re-checking (and re-spending AI quota on)
+            # the same tender on every scan cycle
+            mark_as_notified(tender_id)
+
+            found += 1
+
+            # Fetch the actual detail page — the listing title alone is
+            # often just the Amharic tender description with no separate
+            # closing-date/eligibility text, so the AI needs the full page
+            detail_text = ""
+            detail_page = None
+            try:
+                detail_page = context.new_page()
+                detail_page.goto(full_link, timeout=20000, wait_until="domcontentloaded")
+                try:
+                    detail_page.wait_for_load_state("networkidle", timeout=10000)
+                except Exception:
+                    pass
+                for poll_attempt in range(5):
+                    detail_page.wait_for_timeout(1000)
+                    try:
+                        candidate_text = detail_page.locator("body").inner_text(timeout=5000)
+                    except Exception:
+                        candidate_text = ""
+                    if len(candidate_text) > 300:
+                        detail_text = candidate_text
+                        break
+                    detail_text = candidate_text
+                detail_text = detail_text[:6000]
+                print(f"📄 Captured {len(detail_text)} chars from Habesha Tender detail page", flush=True)
+            except Exception as e:
+                print(f"⚠️ Could not read Habesha Tender detail page text: {e}", flush=True)
+            finally:
+                if detail_page is not None:
+                    try:
+                        detail_page.close()
+                    except Exception:
+                        pass
+
+            # Collect for the single end-of-scan batch AI call rather than
+            # calling the AI right here per-tender
+            candidates.append({
+                "id": tender_id,
+                "source": "habeshatender",
+                "title": title_text,
+                "ref_no": ref_no,
+                "detail_text": detail_text,
+                "link": full_link,
+            })
+        except Exception:
+            continue
+    return found
+
+
 def _egp_worker(result_queue):
     """
     Runs in a separate process (see run_egp_with_timeout below). Collects
@@ -1077,29 +1240,6 @@ def scrape_egp(candidates: list):
                                     org_option.click()
                                     page.wait_for_timeout(3000)
                                     print(f"✅ Clicked organization option, now at: {page.url}", flush=True)
-
-                                    if "/login" in page.url:
-                                        # Bounced back to login instead of landing on
-                                        # /egp/home — this has been observed
-                                        # intermittently (worked one run, didn't the
-                                        # next), which points to a redirect timing
-                                        # race rather than a real auth failure, since
-                                        # the org WAS just selected successfully.
-                                        # Give it a bit longer, then try navigating
-                                        # directly to /egp/home as a recovery step
-                                        # before treating this as a real failure —
-                                        # cheap to try, and avoids wasting the rest
-                                        # of the scan on a doomed "click Tenders
-                                        # while logged out" attempt.
-                                        print("⚠️ Bounced back to /login after org selection — waiting and retrying via direct navigation to /egp/home", flush=True)
-                                        page.wait_for_timeout(3000)
-                                        if "/login" in page.url:
-                                            try:
-                                                page.goto(f"{EGP_BASE}/egp/home", timeout=20000, wait_until="domcontentloaded")
-                                                page.wait_for_timeout(2000)
-                                            except Exception as e:
-                                                print(f"⚠️ Recovery navigation to /egp/home failed: {e}", flush=True)
-                                        print(f"🔎 URL after recovery attempt: {page.url}", flush=True)
                                 else:
                                     print("⚠️ No clickable organization option found", flush=True)
                             except Exception as e:
@@ -1169,17 +1309,7 @@ def scrape_egp(candidates: list):
             # routing — direct URL navigation to /egp/bids/all doesn't load the
             # real table, it just bounces back to the dashboard) ---
             try:
-                # Prefer the actual nav-bar link (confirmed via screen recording:
-                # top nav reads "Home | Tenders | ...") over a bare text match —
-                # a generic "text=Tenders" can latch onto the wrong element if
-                # the page hasn't fully settled into the authenticated layout
-                # yet (e.g. a "Tenders" card elsewhere on a still-loading page).
-                tenders_link = page.locator("nav a:has-text('Tenders'), header a:has-text('Tenders')").first
-                if tenders_link.count() == 0:
-                    tenders_link = page.get_by_role("link", name="Tenders", exact=True)
-                if tenders_link.count() == 0:
-                    tenders_link = page.locator("text=Tenders").first
-
+                tenders_link = page.locator("text=Tenders").first
                 try:
                     tenders_link.click(timeout=15000)
                 except Exception as click_err:
@@ -1377,7 +1507,14 @@ def check_for_tenders():
         print(traceback.format_exc(), flush=True)
         egp_found = 0
 
-    print(f"🧮 {len(candidates)} total candidate tenders collected ({merkato_found} 2merkato, {egp_found} eGP) — running one batch AI review", flush=True)
+    try:
+        habesha_found = scrape_habeshatender(candidates)
+    except Exception:
+        print("❌ Habesha Tender engine crashed with an unhandled exception:", flush=True)
+        print(traceback.format_exc(), flush=True)
+        habesha_found = 0
+
+    print(f"🧮 {len(candidates)} total candidate tenders collected ({merkato_found} 2merkato, {egp_found} eGP, {habesha_found} Habesha Tender) — running one batch AI review", flush=True)
 
     total_sent = 0
     if candidates:
@@ -1439,7 +1576,7 @@ def check_for_tenders():
             verification_note = "⚠️ *Unverified* (AI review failed — keyword match only)\n\n" if not ai_verified else ""
             ref_line = f"📄 *Ref No:* {c['ref_no']}\n\n" if c.get("ref_no") else ""
             object_line = f"🏷️ *Procurement Object:* {procurement_object}\n" if procurement_object else ""
-            source_label = "eGP" if c["source"] == "egp" else "2merkato"
+            source_label = {"egp": "eGP", "habeshatender": "Habesha Tender"}.get(c["source"], "2merkato")
             label = f"New Medical Tender Found ({source_label})!"
 
             alert = (
@@ -1462,7 +1599,7 @@ def check_for_tenders():
     print(f"=================== SCAN COMPLETE: {total} ALERTS SENT ({len(candidates)} candidates reviewed) ===================", flush=True)
 
     if total == 0:
-        send_whatsapp("🔍 *Tender Monitor Scan Completed.*\nNo new unique medical equipment or maintenance matches found on 2merkato or eGP.")
+        send_whatsapp("🔍 *Tender Monitor Scan Completed.*\nNo new unique medical equipment or maintenance matches found on 2merkato, eGP, or Habesha Tender.")
 
 
 def monitoring_loop():
