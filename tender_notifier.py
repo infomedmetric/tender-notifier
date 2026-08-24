@@ -20,16 +20,13 @@ def _call_groq_with_retry(client, system_instruction, prompt, temperature=0.2, m
     Gemini — a single transient network blip shouldn't immediately produce
     a fallback/degraded result.
 
-    Model is configurable via GROQ_MODEL (defaults to openai/gpt-oss-120b).
-    NOTE: llama-3.3-70b-versatile — the previous default — was deprecated by
-    Groq on 2026-06-17 and now hard-fails every call with a
-    model_decommissioned error. gpt-oss-120b is Groq's own recommended
-    replacement and still supports the json_object response_format used
-    below. Groq's free tier also has its own rate limits, so batching
-    everything into one call per scan cycle (see batch_analyze_tenders below)
-    still matters just as much here as it did with Gemini.
+    Model is configurable via GROQ_MODEL (defaults to llama-3.3-70b-versatile,
+    a solid, widely-available free-tier Groq model). Groq's free tier also
+    has its own rate limits, so batching everything into one call per scan
+    cycle (see batch_analyze_tenders below) still matters just as much here
+    as it did with Gemini.
     """
-    model_name = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
+    model_name = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
     last_error = None
     for attempt in range(1, max_retries + 1):
         try:
@@ -180,14 +177,13 @@ def batch_analyze_tenders(candidates: list):
     if not api_key:
         return None
 
-    # Sized conservatively: detail snippets run up to ~2,400 chars/candidate
-    # so the AI can actually see closing dates and constraints that appear
-    # later in the page rather than always seeing blank space. openai/gpt-oss-120b's
-    # free-tier limit is 8,000 TPM (lower than llama-3.3-70b-versatile's old
-    # 12,000 TPM) — 4 candidates per chunk keeps prompt+completion tokens
-    # comfortably under that, even accounting for the system instruction and
-    # JSON completion overhead.
-    CHUNK_SIZE = 4
+    # Sized conservatively: detail snippets now run up to ~2,400 chars/
+    # candidate (up from 900) so the AI can actually see closing dates and
+    # constraints that appear later in the page rather than always seeing
+    # blank space. ~6 candidates per chunk keeps prompt+completion tokens
+    # comfortably under Groq's 12,000 TPM limit for llama-3.3-70b-versatile,
+    # even accounting for the system instruction and JSON completion overhead.
+    CHUNK_SIZE = 6
 
     client = Groq(api_key=api_key)
     indexed_candidates = list(enumerate(candidates))
