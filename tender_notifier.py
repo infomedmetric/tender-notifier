@@ -760,77 +760,51 @@ def _process_merkato_links(links, context, candidates: list, seen_this_scan: set
     return found
 
 
-def _egp_get_tokens():
-    """
-    Obtain access_token + refresh_token via the Resource Owner Password
-    Credentials grant. This is exactly what the official Angular SPA does
-    on login, so it is a supported (and currently working) path.
-    """
-    if not EGP_USER or not EGP_PASS:
-        print("⚠️ EGP_USER / EGP_PASS not set — cannot obtain tokens", flush=True)
-        return None
 
-    data = {
-        "grant_type": "password",
-        "username": EGP_USER,
-        "password": EGP_PASS,
-        "client_id": EGP_CLIENT_ID,
-        "client_secret": EGP_CLIENT_SECRET,
-        "scope": EGP_SCOPES,
-    }
+def _egp_api_get(path_and_query: str, timeout: int = 30):
+    """GET from the public eGP gateway (/po-gw/...). Returns parsed JSON or None."""
+    url = f"{EGP_BASE}/po-gw{path_and_query}" if path_and_query.startswith("/") else f"{EGP_BASE}/po-gw/{path_and_query}"
     try:
-        r = requests.post(
-            EGP_TOKEN_URL,
-            data=data,
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
-            timeout=30,
-            verify=False,
-        )
+        r = requests.get(url, timeout=timeout, verify=False)
         if r.status_code != 200:
-            print(f"❌ eGP token request failed ({r.status_code}): {r.text[:300]}", flush=True)
+            print(f"⚠️ eGP API {r.status_code} for {path_and_query[:80]}", flush=True)
             return None
-        tokens = r.json()
-        if "access_token" not in tokens:
-            print(f"❌ eGP token response missing access_token: {tokens}", flush=True)
-            return None
-        print(f"✅ eGP tokens obtained (expires_in={tokens.get('expires_in')}s, scope={tokens.get('scope')})", flush=True)
-        return tokens
+        return r.json()
     except Exception as e:
-        print(f"❌ eGP token request exception: {e}", flush=True)
+        print(f"⚠️ eGP API error for {path_and_query[:60]}: {e}", flush=True)
         return None
 
 
-def _egp_inject_tokens(context, page, tokens):
-    """Inject OIDC tokens into browser localStorage so the SPA is authenticated."""
-    import time as _time
-    now_ms = int(_time.time() * 1000)
-    expires_in = int(tokens.get("expires_in", 3600))
-    expires_at = now_ms + (expires_in * 1000)
+def _egp_build_detail_text(item: dict) -> str:
+    """Build a text snippet the AI can use from the rich API item (no detail-page fetch needed)."""
+    parts = []
+    parts.append(f"Title: {item.get('lotName', '')}")
+    parts.append(f"Description: {item.get('lotDescription', '')}")
+    parts.append(f"Reference: {item.get('procurementReferenceNo') or item.get('lotReferenceNo', '')}")
+    parts.append(f"Category: {item.get('procurementCategory', '')}")
+    parts.append(f"Method: {item.get('method', '')}")
+    parts.append(f"Market: {item.get('marketPlace', '')}")
+    parts.append(f"Procuring Entity: {item.get('procuringEntity', '')}")
+    parts.append(f"Submission Deadline / Closing Date: {item.get('submissionDeadline', '')}")
+    parts.append(f"Invitation Date: {item.get('invitationDate', '')}")
+    parts.append(f"Is Submittable: {item.get('isSubmittable', '')}")
 
-    page.goto(f"{EGP_BASE}/egp/", timeout=30000, wait_until="domcontentloaded")
-    page.wait_for_timeout(1500)
+    pkg = item.get("packageInformation") or {}
+    if pkg:
+        parts.append(f"Package Name: {pkg.get('name', '')}")
+        parts.append(f"Package Description: {pkg.get('description', '')}")
+        parts.append(f"Procurement Method: {pkg.get('procurement_method', '')}")
+        parts.append(f"Procurement Type: {pkg.get('procurement_type', '')}")
+        parts.append(f"Award Type: {pkg.get('award_type', '')}")
+        parts.append(f"Bid Security Amount: {pkg.get('bid_security_amount', '')}")
+        parts.append(f"Bid Security Form: {pkg.get('bid_security_form', '')}")
+        parts.append(f"Package Submission Deadline: {pkg.get('submission_deadline', '')}")
+        parts.append(f"Clarification Deadline: {pkg.get('clarification_deadline', '')}")
+        addr = pkg.get("address") or {}
+        if addr:
+            parts.append(f"Location: {addr.get('town', '')}, {addr.get('street', '')}")
 
-    access_token = tokens["access_token"]
-    refresh_token = tokens.get("refresh_token", "")
-    id_token = tokens.get("id_token", "")
-    scope = tokens.get("scope", EGP_SCOPES)
-
-    script = f"""
-    () => {{
-        localStorage.setItem('access_token', {json.dumps(access_token)});
-        localStorage.setItem('refresh_token', {json.dumps(refresh_token)});
-        localStorage.setItem('id_token', {json.dumps(id_token)});
-        localStorage.setItem('expires_at', '{expires_at}');
-        localStorage.setItem('access_token_stored_at', '{now_ms}');
-        localStorage.setItem('granted_scopes', {json.dumps(scope.split())});
-        localStorage.setItem('ps/store/access_token', {json.dumps(access_token)});
-        try {{ sessionStorage.setItem('access_token', {json.dumps(access_token)}); }} catch (e) {{}}
-        return true;
-    }}
-    """
-    page.evaluate(script)
-    print("✅ Injected eGP tokens into browser localStorage", flush=True)
-    context.set_extra_http_headers({"Authorization": f"Bearer {access_token}"})
+    return "\n".join(p for p in parts if p and not p.endswith(": "))
 
 
 def _egp_worker(result_queue):
@@ -843,6 +817,7 @@ def _egp_worker(result_queue):
 
 
 def run_egp_with_timeout(candidates: list, timeout_seconds: int = 300) -> int:
+    """Runs the eGP engine in its own process with a hard wall-clock timeout."""
     ctx = multiprocessing.get_context("spawn")
     result_queue = ctx.Queue()
     proc = ctx.Process(target=_egp_worker, args=(result_queue,))
@@ -871,275 +846,90 @@ def run_egp_with_timeout(candidates: list, timeout_seconds: int = 300) -> int:
     return result["found"]
 
 
-# ==================== ENGINE: eGP (egp.gov.et) ====================
+# ==================== ENGINE: eGP (API — no browser) ====================
 def scrape_egp(candidates: list):
-    print(f"[{datetime.now()}] 🔍 Running eGP Engine (Playwright)...", flush=True)
+    """
+    Scrape eGP via the public /po-gw/cms-v2/api/sourcing/get-sourcing API.
+
+    Playwright is intentionally NOT used here: the site detects CDP/automation
+    and redirects every browser session to /egp/inspect-not-allowed. The
+    sourcing API is public (no login required) and already returns title,
+    reference, closing date, bid security, description, and procuring entity.
+    """
+    print(f"[{datetime.now()}] 🔍 Running eGP Engine (API)...", flush=True)
     found = 0
+    seen_this_scan = set()
+
+    # How many results to pull per search term
+    TOP_PER_TERM = int(os.environ.get("EGP_TOP_PER_TERM", "40"))
 
     try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(
-                headless=True,
-                args=[
-                    "--no-sandbox",
-                    "--disable-dev-shm-usage",
-                    "--disable-blink-features=AutomationControlled",
-                ]
-            )
-            context = browser.new_context(
-                user_agent=(
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-                ),
-                viewport={"width": 1366, "height": 768},
-                locale="en-US",
-                timezone_id="Africa/Addis_Ababa",
-            )
-            context.add_init_script("""
-                Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-                Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
-                Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
-                window.chrome = window.chrome || { runtime: {} };
-            """)
-            page = context.new_page()
-
-            # --- Token-based login (bypasses inspect-not-allowed) ---
-            if EGP_USER and EGP_PASS:
-                tokens = _egp_get_tokens()
-                if not tokens:
-                    print("❌ Could not obtain eGP tokens — aborting eGP engine for this cycle", flush=True)
-                    browser.close()
-                    return 0
-
-                try:
-                    _egp_inject_tokens(context, page, tokens)
-
-                    page.goto(f"{EGP_BASE}/egp/home", timeout=30000, wait_until="domcontentloaded")
-                    page.wait_for_timeout(3000)
-                    print(f"✅ Post-token navigation URL: {page.url}", flush=True)
-
-                    # Organization selection
-                    try:
-                        print("🏢 Checking for organization selection prompt...", flush=True)
-                        try:
-                            page.wait_for_selector(
-                                f"text=/{EGP_ORG_NAME}/i, text=MEDMETRIC HEALTHCARE SERVICE PLC, "
-                                ".card, [class*='org' i], [role='button']",
-                                timeout=12000
-                            )
-                        except Exception:
-                            pass
-
-                        org_card = page.locator(f"text=/{EGP_ORG_NAME}/i").first
-                        if org_card.count() == 0:
-                            org_card = page.locator("text=MEDMETRIC HEALTHCARE SERVICE PLC").first
-
-                        if org_card.count() > 0:
-                            org_card.click()
-                            print("✅ Organization selected successfully.", flush=True)
-                            page.wait_for_timeout(4000)
-                        else:
-                            fallback_org = page.locator(
-                                ".card, div[role='button'], .list-group-item, "
-                                "[class*='organization' i], [class*='org-card' i], "
-                                "li, button:has-text('Continue'), button:has-text('Select')"
-                            ).first
-                            if fallback_org.count() > 0:
-                                fallback_org.click()
-                                print("✅ Fallback organization selected.", flush=True)
-                                page.wait_for_timeout(4000)
-                            else:
-                                print("ℹ️ No organization card found — assuming already selected or not required.", flush=True)
-
-                        if "/login" in page.url or "organization-selector" in page.url or "inspect-not-allowed" in page.url:
-                            print(f"⚠️ Still on {page.url} after org step — trying /egp/home again", flush=True)
-                            page.goto(f"{EGP_BASE}/egp/home", timeout=20000, wait_until="domcontentloaded")
-                            page.wait_for_timeout(2000)
-                            print(f"🔎 URL after recovery: {page.url}", flush=True)
-                    except Exception as org_err:
-                        print(f"ℹ️ Organization selection skipped or auto-resolved: {org_err}", flush=True)
-
-                except Exception as e:
-                    print(f"⚠️ Token injection / post-login navigation failed: {e}", flush=True)
-                    try:
-                        print(f"🔎 Page URL: {page.url}", flush=True)
-                        print(f"🔎 Body snippet: {page.locator('body').inner_text(timeout=3000)[:400]}", flush=True)
-                    except Exception:
-                        pass
-                    browser.close()
-                    return 0
-            else:
-                print("ℹ️ EGP_USER/EGP_PASS not set — continuing without authentication", flush=True)
-
-            # Dismiss blocking modals
-            for attempt in range(3):
-                try:
-                    modal_close = page.locator(
-                        ".ant-modal-close, .nz-modal-close, [class*='modal-close' i], "
-                        "button:has-text('Close'), button:has-text('OK'), "
-                        "button:has-text('Got it'), button:has-text('Dismiss')"
-                    ).first
-                    if modal_close.count() > 0:
-                        modal_close.click(timeout=3000)
-                        page.wait_for_timeout(800)
-                        print(f"✅ Closed a blocking modal dialog (attempt {attempt + 1})", flush=True)
-                except Exception:
-                    pass
-                page.keyboard.press("Escape")
-                page.wait_for_timeout(500)
-                try:
-                    overlay = page.locator(".cdk-overlay-backdrop, nz-modal-container").first
-                    if overlay.count() == 0:
-                        break
-                    backdrop = page.locator(".cdk-overlay-backdrop").first
-                    if backdrop.count() > 0:
-                        backdrop.click(timeout=2000, force=True)
-                        page.wait_for_timeout(500)
-                except Exception:
-                    pass
-
-            # Navigate to Bidding List
+        for term in EGP_SEARCH_TERMS:
             try:
-                tenders_link = page.locator("nav a:has-text('Tenders'), header a:has-text('Tenders')").first
-                if tenders_link.count() == 0:
-                    tenders_link = page.get_by_role("link", name="Tenders", exact=True)
-                if tenders_link.count() == 0:
-                    tenders_link = page.locator("text=Tenders").first
-
-                try:
-                    tenders_link.click(timeout=15000)
-                except Exception as click_err:
-                    print(f"⚠️ Normal click on Tenders failed ({click_err}), forcing click", flush=True)
-                    tenders_link.click(timeout=10000, force=True)
-                page.wait_for_selector("text=/Bidding List/i", timeout=15000)
-                print("✅ Reached Bidding List view", flush=True)
-            except Exception as e:
-                print(f"❌ Could not reach Bidding List view: {e}", flush=True)
-                try:
-                    print(f"🔎 Current URL: {page.url}", flush=True)
-                    print(f"🔎 Body snippet: {page.locator('body').inner_text(timeout=3000)[:500]}", flush=True)
-                except Exception:
-                    pass
-                browser.close()
-                return 0
-
-            search_box = page.locator("input[placeholder*='Search' i]").first
-            seen_this_scan = set()
-
-            for term in EGP_SEARCH_TERMS:
-                try:
-                    search_box.click()
-                    search_box.fill("")
-                    page.wait_for_timeout(300)
-                    search_box.fill(term)
-                    search_box.press("Enter")
-                    page.wait_for_timeout(2500)
-
-                    actual_value = search_box.input_value()
-                    rows = page.locator("table tbody tr").all()
-                    first_row_preview = ""
-                    if rows:
-                        try:
-                            first_row_preview = rows[0].inner_text().replace("\\n", " | ")[:100]
-                        except Exception:
-                            pass
-                    print(f"eGP search '{term}' | input value now: '{actual_value}' | {len(rows)} rows | first row: {first_row_preview!r}", flush=True)
-
-                    for row in rows:
-                        try:
-                            cells = row.locator("td").all_inner_texts()
-                            if not cells:
-                                continue
-                            ref_no = cells[0].strip() if len(cells) > 0 else ""
-                            title_text = cells[2].strip() if len(cells) > 2 else " | ".join(cells)
-
-                            row_key = ref_no or title_text
-                            if row_key in seen_this_scan:
-                                continue
-                            seen_this_scan.add(row_key)
-
-                            if is_relevant_tender(title_text):
-                                tender_id = f"egp_{ref_no or title_text}"
-                                if not is_already_notified(tender_id):
-                                    mark_as_notified(tender_id)
-                                    found += 1
-
-                                    detail_link = EGP_BIDS_URL
-                                    try:
-                                        row_anchor = row.locator("a").first
-                                        if row_anchor.count() > 0:
-                                            href = row_anchor.get_attribute("href")
-                                            if href:
-                                                detail_link = href if href.startswith("http") else f"{EGP_BASE}{href}"
-                                                print(f"🔗 Found row anchor href: {detail_link}", flush=True)
-                                    except Exception:
-                                        pass
-
-                                    if detail_link == EGP_BIDS_URL:
-                                        try:
-                                            row.click(timeout=8000)
-                                            page.wait_for_timeout(2500)
-                                            detail_link = page.url
-                                            print(f"🔗 Captured detail URL via click-through: {detail_link}", flush=True)
-                                            page.go_back(timeout=8000)
-                                            page.wait_for_timeout(1500)
-                                            search_box = page.locator("input[placeholder*='Search' i]").first
-                                            search_box.click()
-                                            search_box.fill("")
-                                            page.wait_for_timeout(200)
-                                            search_box.fill(term)
-                                            search_box.press("Enter")
-                                            page.wait_for_timeout(2500)
-                                        except Exception as e:
-                                            print(f"⚠️ Click-through for detail link failed: {e}", flush=True)
-                                            detail_link = EGP_BIDS_URL
-
-                                    detail_text = ""
-                                    if detail_link and detail_link != EGP_BIDS_URL:
-                                        detail_page = None
-                                        try:
-                                            detail_page = context.new_page()
-                                            detail_page.goto(detail_link, timeout=20000, wait_until="domcontentloaded")
-                                            try:
-                                                detail_page.wait_for_load_state("networkidle", timeout=10000)
-                                            except Exception:
-                                                pass
-                                            for poll_attempt in range(5):
-                                                detail_page.wait_for_timeout(1500)
-                                                try:
-                                                    candidate_text = detail_page.locator("body").inner_text(timeout=5000)
-                                                except Exception:
-                                                    candidate_text = ""
-                                                if len(candidate_text) > 300:
-                                                    detail_text = candidate_text
-                                                    break
-                                                detail_text = candidate_text
-                                            detail_text = detail_text[:6000]
-                                            print(f"📄 Captured {len(detail_text)} chars from eGP detail page", flush=True)
-                                        except Exception as e:
-                                            print(f"⚠️ Could not read eGP detail page text: {e}", flush=True)
-                                        finally:
-                                            if detail_page is not None:
-                                                try:
-                                                    detail_page.close()
-                                                except Exception:
-                                                    pass
-
-                                    candidates.append({
-                                        "id": tender_id,
-                                        "source": "egp",
-                                        "title": title_text,
-                                        "ref_no": ref_no,
-                                        "detail_text": detail_text,
-                                        "link": detail_link,
-                                    })
-                        except Exception:
-                            continue
-                except Exception as e:
-                    print(f"⚠️ eGP search for '{term}' failed: {e}", flush=True)
+                # API supports ?search= and ?top=
+                from urllib.parse import quote
+                q = quote(term)
+                data = _egp_api_get(f"/cms-v2/api/sourcing/get-sourcing?search={q}&top={TOP_PER_TERM}")
+                if not data or "items" not in data:
+                    print(f"eGP search '{term}': no data", flush=True)
                     continue
 
-            browser.close()
+                items = data.get("items") or []
+                total = data.get("total", len(items))
+                print(f"eGP search '{term}': {len(items)} items (total matching ~{total})", flush=True)
+
+                for item in items:
+                    try:
+                        title_text = (item.get("lotName") or "").strip()
+                        ref_no = (item.get("procurementReferenceNo") or item.get("lotReferenceNo") or "").strip()
+                        if not title_text:
+                            continue
+
+                        row_key = ref_no or item.get("id") or title_text
+                        if row_key in seen_this_scan:
+                            continue
+                        seen_this_scan.add(row_key)
+
+                        if not is_relevant_tender(title_text):
+                            continue
+
+                        tender_id = f"egp_{ref_no or item.get('id') or title_text}"
+                        if is_already_notified(tender_id):
+                            continue
+
+                        # Skip clearly closed / past deadlines when we can
+                        deadline = item.get("submissionDeadline") or ""
+                        # Still collect — AI / user can decide; marking notified prevents re-scan noise
+                        mark_as_notified(tender_id)
+                        found += 1
+
+                        detail_text = _egp_build_detail_text(item)
+                        # Public portal link for the package/lot when possible
+                        package_id = item.get("packageId") or ""
+                        lot_id = item.get("lotId") or item.get("id") or ""
+                        if package_id:
+                            detail_link = f"{EGP_BASE}/egp/bids/all?packageId={package_id}"
+                        else:
+                            detail_link = f"{EGP_BASE}/egp/bids/all"
+
+                        print(f"📄 eGP candidate: {title_text[:70]} | deadline={deadline}", flush=True)
+
+                        candidates.append({
+                            "id": tender_id,
+                            "source": "egp",
+                            "title": title_text,
+                            "ref_no": ref_no,
+                            "detail_text": detail_text[:6000],
+                            "link": detail_link,
+                        })
+                    except Exception:
+                        continue
+
+                time.sleep(0.5)  # be polite between search terms
+
+            except Exception as e:
+                print(f"⚠️ eGP search for '{term}' failed: {e}", flush=True)
+                continue
 
         print(f"eGP engine complete. Collected {found} candidate matches for AI review.", flush=True)
         return found
