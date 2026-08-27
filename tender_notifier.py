@@ -281,12 +281,21 @@ MERKATO_MAX_PAGES = int(os.environ.get("MERKATO_MAX_PAGES", "4"))
 # .rstrip("/") guards against a trailing slash in the env var producing
 # doubled slashes in every derived URL below (e.g. "https://egp.gov.et/"
 # + "/egp/login" would otherwise become ".../egp.gov.et//egp/login").
-EGP_BASE = os.environ.get("EGP_BASE", "https://egp.gov.et").rstrip("/")
+EGP_BASE = os.environ.get("EGP_BASE", "https://production.egp.gov.et").rstrip("/")
 EGP_LOGIN_URL = f"{EGP_BASE}/egp/login"
 EGP_BIDS_URL = f"{EGP_BASE}/egp/bids/all"
 EGP_USER = os.environ.get("EGP_USER")
 EGP_PASS = os.environ.get("EGP_PASS")
 EGP_ORG_NAME = os.environ.get("EGP_ORG_NAME", "medMETRIC Healthcare Service PLC")
+
+# OpenID Connect / IdentityServer settings discovered from the frontend bundle
+# and /.well-known/openid-configuration. The SPA itself uses the password grant
+# with these exact client credentials, so we can do the same and completely
+# bypass the browser-based login (and the inspect-not-allowed protection).
+EGP_TOKEN_URL = f"{EGP_BASE}/auth/connect/token"
+EGP_CLIENT_ID = os.environ.get("EGP_CLIENT_ID", "skoruba_identity_admin")
+EGP_CLIENT_SECRET = os.environ.get("EGP_CLIENT_SECRET", "skoruba_admin_client_secret")
+EGP_SCOPES = "openid profile email roles erp_api offline_access"
 
 # Search terms fed one at a time into eGP's own built-in table search box —
 # far more reliable than scraping every row across 13+ pages.
@@ -494,6 +503,7 @@ def send_whatsapp(message):
             print(f"❌ Send error: {e}", flush=True)
 
 
+
 # ==================== ENGINE: 2MERKATO (Playwright) ====================
 def scrape_2merkato(candidates: list):
     print(f"[{datetime.now()}] 🔍 Running 2merkato Engine (Playwright)...", flush=True)
@@ -513,16 +523,9 @@ def scrape_2merkato(candidates: list):
             # --- Login (optional — only if credentials provided) ---
             if MERKATO_USER and MERKATO_PASS:
                 try:
-                    # domcontentloaded instead of networkidle — SPA sites with
-                    # ads/analytics often never go fully idle, causing false timeouts
                     page.goto(MERKATO_LOGIN_URL, timeout=30000, wait_until="domcontentloaded")
-
-                    # Wait specifically for a password field to render, rather than
-                    # waiting for the whole network to go quiet
                     page.wait_for_selector("input[type='password']", timeout=20000)
 
-                    # Diagnostic dump — logs every input field's actual attributes so we
-                    # can see the real markup if selectors below don't match
                     field_info = page.eval_on_selector_all(
                         "input",
                         "els => els.map(e => ({type: e.type, name: e.name, id: e.id, placeholder: e.placeholder}))"
@@ -544,41 +547,21 @@ def scrape_2merkato(candidates: list):
                             "button:has-text('Log in'), input[type='submit']"
                         ).first
                         submit_btn.click()
-
-                        # Give the SPA a moment to process login + redirect
                         page.wait_for_timeout(4000)
-                        current_url = page.url
-                        print(f"✅ Submitted login, current URL: {current_url}", flush=True)
+                        print(f"✅ Submitted login, current URL: {page.url}", flush=True)
                     else:
                         print(f"⚠️ Could not confidently identify email/username field among: {field_info}", flush=True)
                 except Exception as e:
                     print(f"⚠️ Login attempt failed, continuing without auth: {e}", flush=True)
 
-            # --- Search by keyword instead of paging the general listing ---
-            # The old approach walked the first few pages of "All Tenders"
-            # (25,000+ pages total, sorted by recency across every category
-            # on the site) — meaning it only ever saw whatever happened to
-            # be posted most recently regardless of relevance. Using the
-            # site's own "Search by keyword" filter, one term at a time,
-            # mirrors the eGP engine and actually targets medical/biomedical
-            # tenders specifically.
             page.goto(MERKATO_TENDERS_URL, timeout=30000, wait_until="domcontentloaded")
             page.wait_for_timeout(2000)
 
-            # The keyword field may already be visible on the page, or it may
-            # live inside a filter panel that only appears after tapping a
-            # search icon in the header (this is what the site's mobile view
-            # shows). Try the direct selector first; only hunt for a toggle
-            # if that comes up empty.
             search_input = page.locator(
                 "input[placeholder*='Search by keyword' i], input[placeholder*='keyword' i]"
             ).first
 
             if search_input.count() == 0:
-                # Diagnostic dump so that if this guess is wrong, the logs
-                # show exactly what's clickable in the header to open the
-                # search/filter panel — same pattern used for the eGP modal
-                # dismissal logic above.
                 header_clickables = page.eval_on_selector_all(
                     "header *, nav *",
                     "els => els.slice(0, 40).map(e => ({tag: e.tagName, "
@@ -617,10 +600,6 @@ def scrape_2merkato(candidates: list):
             seen_this_scan = set()
             for term in MERKATO_SEARCH_TERMS:
                 try:
-                    # The filter panel may auto-close after the previous term's
-                    # search was applied. If the input isn't visible/attached
-                    # anymore, try the same toggle click used to open it the
-                    # first time before giving up on this term.
                     if search_input.count() == 0 or not search_input.is_visible():
                         toggle = page.locator(
                             "[aria-label*='search' i], button:has-text('Search'), "
@@ -641,25 +620,11 @@ def scrape_2merkato(candidates: list):
                     page.wait_for_timeout(200)
                     search_input.fill(term)
 
-                    # Press Enter first. This was previously secondary to
-                    # clicking the "Filter" button, but the logs show a fixed
-                    # header (`<div class="flex h-16 ... pt-2 lg:h-32">`)
-                    # sitting on top of that button at some scroll positions —
-                    # Playwright correctly refuses to click through it, which
-                    # is why some terms ('hemodialysis', 'autoclave', etc.)
-                    # were failing with "intercepts pointer events" while
-                    # others worked fine depending on scroll state. Enter
-                    # submits the same form without needing to click anything
-                    # that could be obscured.
                     url_before = page.url
                     search_input.press("Enter")
                     page.wait_for_timeout(2000)
 
                     if page.url == url_before:
-                        # Enter alone didn't trigger navigation on this
-                        # layout — fall back to the Filter button, but with
-                        # force=True so a fixed header overlapping it doesn't
-                        # block the click the way it did before.
                         filter_btn = page.locator("button:has-text('Filter')").first
                         if filter_btn.count() > 0:
                             try:
@@ -705,22 +670,7 @@ def scrape_2merkato(candidates: list):
 
 
 def _get_merkato_card_status(link) -> str:
-    """
-    Reads the "Bidding: Open/Closed" status badge from the tender card
-    containing this listing link, so 2merkato results can skip tenders that
-    are already closed (eGP isn't touched here — eGP removes closed tenders
-    from its own listing automatically, so this check would be redundant
-    there and risks nothing but wasted effort).
-
-    Fails safe: if the badge can't be confidently located for any reason,
-    returns "unknown" rather than guessing — a missed selector should never
-    cause a genuinely open tender to be silently dropped, only cause us to
-    fall back to the old always-alert behavior for that one row.
-    """
     try:
-        # Walk up to the nearest ancestor element whose text contains
-        # "Bidding" — on 2merkato's card layout this is the tender card
-        # itself, which also contains the "Open"/"Closed" status pill.
         container = link.locator("xpath=ancestor::*[contains(., 'Bidding')][1]").first
         if container.count() == 0:
             return "unknown"
@@ -732,9 +682,6 @@ def _get_merkato_card_status(link) -> str:
     idx = lower.find("bidding")
     if idx == -1:
         return "unknown"
-    # The status word/pill sits right after the "Bidding" label — a small
-    # window here avoids false positives from the word "closed" appearing
-    # elsewhere in the card's body text (e.g. "closed bids" in a description).
     window = lower[idx: idx + 40]
     if "closed" in window:
         return "closed"
@@ -744,13 +691,6 @@ def _get_merkato_card_status(link) -> str:
 
 
 def _process_merkato_links(links, context, candidates: list, seen_this_scan: set) -> int:
-    """
-    Shared per-link handling for the 2merkato engine: dedup, keyword
-    relevance check (untouched — same is_relevant_tender used everywhere
-    else), detail-page fetch, and candidate collection. Factored out so both
-    the keyword-search path and the listing-page fallback path use identical
-    logic instead of two copies drifting apart over time.
-    """
     found = 0
     for link in links:
         try:
@@ -770,28 +710,13 @@ def _process_merkato_links(links, context, candidates: list, seen_this_scan: set
                 if not is_already_notified(tender_id):
                     status = _get_merkato_card_status(link)
                     if status == "closed":
-                        # Mark as notified so a closed tender doesn't get
-                        # rechecked every single scan cycle forever, but
-                        # skip the detail-page fetch and AI review entirely
-                        # — no point spending either on a tender you can no
-                        # longer bid on.
                         print(f"⏭️ Skipping closed 2merkato tender (Bidding: Closed): {title_text}", flush=True)
                         mark_as_notified(tender_id)
                         continue
 
-                    # Mark as notified immediately regardless of the eventual
-                    # AI verdict — prevents re-checking (and re-spending
-                    # AI quota on) the same tender on every scan cycle
                     mark_as_notified(tender_id)
-
                     found += 1
 
-                    # Fetch the actual detail page — the listing title alone
-                    # never contains the submission deadline, which is why
-                    # closing date kept coming back "not specified." Open it
-                    # in a SEPARATE tab so we don't disturb pagination state
-                    # on the main listing page. This is a Playwright call, not
-                    # an AI call, so it doesn't touch the AI quota.
                     detail_text = ""
                     detail_page = None
                     try:
@@ -822,8 +747,6 @@ def _process_merkato_links(links, context, candidates: list, seen_this_scan: set
                             except Exception:
                                 pass
 
-                    # Collect for the single end-of-scan batch AI call rather
-                    # than calling the AI right here per-tender
                     candidates.append({
                         "id": tender_id,
                         "source": "2merkato",
@@ -837,13 +760,80 @@ def _process_merkato_links(links, context, candidates: list, seen_this_scan: set
     return found
 
 
+def _egp_get_tokens():
+    """
+    Obtain access_token + refresh_token via the Resource Owner Password
+    Credentials grant. This is exactly what the official Angular SPA does
+    on login, so it is a supported (and currently working) path.
+    """
+    if not EGP_USER or not EGP_PASS:
+        print("⚠️ EGP_USER / EGP_PASS not set — cannot obtain tokens", flush=True)
+        return None
+
+    data = {
+        "grant_type": "password",
+        "username": EGP_USER,
+        "password": EGP_PASS,
+        "client_id": EGP_CLIENT_ID,
+        "client_secret": EGP_CLIENT_SECRET,
+        "scope": EGP_SCOPES,
+    }
+    try:
+        r = requests.post(
+            EGP_TOKEN_URL,
+            data=data,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            timeout=30,
+            verify=False,
+        )
+        if r.status_code != 200:
+            print(f"❌ eGP token request failed ({r.status_code}): {r.text[:300]}", flush=True)
+            return None
+        tokens = r.json()
+        if "access_token" not in tokens:
+            print(f"❌ eGP token response missing access_token: {tokens}", flush=True)
+            return None
+        print(f"✅ eGP tokens obtained (expires_in={tokens.get('expires_in')}s, scope={tokens.get('scope')})", flush=True)
+        return tokens
+    except Exception as e:
+        print(f"❌ eGP token request exception: {e}", flush=True)
+        return None
+
+
+def _egp_inject_tokens(context, page, tokens):
+    """Inject OIDC tokens into browser localStorage so the SPA is authenticated."""
+    import time as _time
+    now_ms = int(_time.time() * 1000)
+    expires_in = int(tokens.get("expires_in", 3600))
+    expires_at = now_ms + (expires_in * 1000)
+
+    page.goto(f"{EGP_BASE}/egp/", timeout=30000, wait_until="domcontentloaded")
+    page.wait_for_timeout(1500)
+
+    access_token = tokens["access_token"]
+    refresh_token = tokens.get("refresh_token", "")
+    id_token = tokens.get("id_token", "")
+    scope = tokens.get("scope", EGP_SCOPES)
+
+    script = f"""
+    () => {{
+        localStorage.setItem('access_token', {json.dumps(access_token)});
+        localStorage.setItem('refresh_token', {json.dumps(refresh_token)});
+        localStorage.setItem('id_token', {json.dumps(id_token)});
+        localStorage.setItem('expires_at', '{expires_at}');
+        localStorage.setItem('access_token_stored_at', '{now_ms}');
+        localStorage.setItem('granted_scopes', {json.dumps(scope.split())});
+        localStorage.setItem('ps/store/access_token', {json.dumps(access_token)});
+        try {{ sessionStorage.setItem('access_token', {json.dumps(access_token)}); }} catch (e) {{}}
+        return true;
+    }}
+    """
+    page.evaluate(script)
+    print("✅ Injected eGP tokens into browser localStorage", flush=True)
+    context.set_extra_http_headers({"Authorization": f"Bearer {access_token}"})
+
+
 def _egp_worker(result_queue):
-    """
-    Runs in a separate process (see run_egp_with_timeout below). Collects
-    into its own local candidates list and reports back through the queue,
-    since the parent process's candidates list can't be shared directly
-    with a spawned child.
-    """
     local_candidates = []
     try:
         found = scrape_egp(local_candidates)
@@ -853,29 +843,6 @@ def _egp_worker(result_queue):
 
 
 def run_egp_with_timeout(candidates: list, timeout_seconds: int = 300) -> int:
-    """
-    Runs the eGP engine in its own process with a hard wall-clock timeout,
-    instead of calling scrape_egp() directly in the scan thread.
-
-    Why: after switching eGP to Firefox, a run hung indefinitely somewhere
-    past "Running eGP Engine (Playwright)..." with no exception ever
-    raised — no timeout fired, nothing was logged for over an hour. Since
-    scrape_egp() runs inside the same background thread as the whole
-    scan loop, that hang didn't just fail eGP for one cycle, it froze
-    2merkato and every future scheduled scan too, with no way to recover
-    short of manually restarting the service. Python can't forcibly kill a
-    stuck thread, but it CAN forcibly kill a stuck child process — running
-    eGP out-of-process means whatever hangs inside it (this Firefox launch,
-    or anything else in the future), the rest of the scanner keeps running
-    on schedule regardless.
-
-    Uses the 'spawn' start method deliberately (not the default 'fork' on
-    Linux): forking would duplicate the parent's already-open Postgres
-    connection file descriptor into the child, which is unsafe for
-    concurrent/sequential use across two processes. Spawn gives the child a
-    completely fresh interpreter (and its own fresh DB connection when it
-    calls is_already_notified/mark_as_notified), avoiding that entirely.
-    """
     ctx = multiprocessing.get_context("spawn")
     result_queue = ctx.Queue()
     proc = ctx.Process(target=_egp_worker, args=(result_queue,))
@@ -911,21 +878,6 @@ def scrape_egp(candidates: list):
 
     try:
         with sync_playwright() as p:
-            # NOTE: eGP's login is still blocked (either by the
-            # /egp/inspect-not-allowed devtools-detection page, or something
-            # upstream of it) — that part is NOT solved. This is back on
-            # Chromium rather than Firefox: Firefox was tried specifically to
-            # sidestep the CDP-based devtools detection, but it introduced a
-            # worse problem — an unexplained indefinite hang with no
-            # exception ever raised, which froze the entire scan loop
-            # (2merkato included) until the service was manually restarted.
-            # Chromium's failure mode, by contrast, is clean: it fails fast,
-            # logs a clear reason, and lets the scan cycle finish normally.
-            # A clean, understood failure beats a silent hang — reverting to
-            # this known-stable state until the login itself is solved.
-            # The run_egp_with_timeout() wrapper around this whole function
-            # stays in place regardless, as a no-cost safety net against any
-            # future hang, whatever the cause.
             browser = p.chromium.launch(
                 headless=True,
                 args=[
@@ -951,195 +903,75 @@ def scrape_egp(candidates: list):
             """)
             page = context.new_page()
 
-            # --- Login (optional — only if credentials provided) ---
+            # --- Token-based login (bypasses inspect-not-allowed) ---
             if EGP_USER and EGP_PASS:
-                try:
-                    page.goto(EGP_LOGIN_URL, timeout=30000, wait_until="domcontentloaded")
-                    page.wait_for_selector("input[type='password']", timeout=30000)
-
-                    field_info = page.eval_on_selector_all(
-                        "input",
-                        "els => els.map(e => ({type: e.type, name: e.name, id: e.id, placeholder: e.placeholder}))"
-                    )
-                    print(f"🔎 eGP login page input fields detected: {field_info}", flush=True)
-
-                    user_field = page.locator(
-                        "input[type='email'], input[type='text'], input[name*='user' i], "
-                        "input[name*='email' i], input[id*='user' i], input[id*='email' i], "
-                        "input[placeholder*='user' i], input[placeholder*='email' i]"
-                    ).first
-                    pass_field = page.locator("input[type='password']").first
-
-                    if user_field.count() > 0 and pass_field.count() > 0:
-                        user_field.fill(EGP_USER)
-                        pass_field.fill(EGP_PASS)
-
-                        # Confirm the fields actually hold what we just typed
-                        # before submitting — if the site's JS resets/masks
-                        # them on some load states, a login "failure" could
-                        # really be an empty-field submission, not bad
-                        # credentials, and this log line is the only way
-                        # we'd ever know the difference.
-                        try:
-                            actual_user = user_field.input_value(timeout=2000)
-                            actual_pass_len = len(pass_field.input_value(timeout=2000))
-                            print(f"🔎 eGP fields before submit — user field: '{actual_user}' | password length: {actual_pass_len}", flush=True)
-                        except Exception:
-                            pass
-
-                        submit_btn = page.locator(
-                            "button[type='submit'], input[type='submit'], "
-                            "button:has-text('Login'), button:has-text('Sign in'), "
-                            "button:has-text('Log in'), button:has-text('Sign')"
-                        ).first
-                        print(f"🔍 eGP submit button found = {submit_btn.count() > 0}", flush=True)
-
-                        if submit_btn.count() > 0:
-                            submit_btn.click()
-                            page.wait_for_timeout(5000)
-                            print("✅ eGP login submitted.", flush=True)
-
-                            current_url = page.url
-                            print(f"✅ eGP login submitted, current URL: {current_url}", flush=True)
-
-                            # ==================== ORGANIZATION SELECTION STEP ====================
-                            try:
-                                print("🏢 Checking for organization selection prompt...", flush=True)
-
-                                # Prefer waiting for the org name (uses EGP_ORG_NAME env var)
-                                # Case-insensitive regex so "medMETRIC..." / "MEDMETRIC..." both match
-                                org_card = page.locator(f"text=/{EGP_ORG_NAME}/i").first
-
-                                # Also accept the older exact-match style just in case
-                                if org_card.count() == 0:
-                                    org_card = page.locator("text=MEDMETRIC HEALTHCARE SERVICE PLC").first
-
-                                # Give the async org list a moment to render
-                                try:
-                                    page.wait_for_selector(
-                                        f"text=/{EGP_ORG_NAME}/i, text=MEDMETRIC HEALTHCARE SERVICE PLC, "
-                                        ".card, [class*='org' i], [role='button']",
-                                        timeout=12000
-                                    )
-                                except Exception:
-                                    pass
-
-                                if org_card.count() > 0:
-                                    org_card.click()
-                                    print("✅ Organization selected successfully.", flush=True)
-                                    page.wait_for_timeout(4000)
-                                else:
-                                    # Fallback: first plausible organization card / list item
-                                    fallback_org = page.locator(
-                                        ".card, div[role='button'], .list-group-item, "
-                                        "[class*='organization' i], [class*='org-card' i], "
-                                        "li, button:has-text('Continue'), button:has-text('Select')"
-                                    ).first
-                                    if fallback_org.count() > 0:
-                                        fallback_org.click()
-                                        print("✅ Fallback organization selected.", flush=True)
-                                        page.wait_for_timeout(4000)
-                                    else:
-                                        print("ℹ️ No organization card found — assuming auto-resolved or already selected.", flush=True)
-
-                                # Recovery if we bounced back to /login after org click
-                                if "/login" in page.url:
-                                    print("⚠️ Bounced back to /login after org selection — waiting and retrying via direct navigation to /egp/home", flush=True)
-                                    page.wait_for_timeout(3000)
-                                    if "/login" in page.url:
-                                        try:
-                                            page.goto(f"{EGP_BASE}/egp/home", timeout=20000, wait_until="domcontentloaded")
-                                            page.wait_for_timeout(2000)
-                                        except Exception as e:
-                                            print(f"⚠️ Recovery navigation to /egp/home failed: {e}", flush=True)
-                                    print(f"🔎 URL after recovery attempt: {page.url}", flush=True)
-
-                            except Exception as org_err:
-                                print(f"ℹ️ Organization selection skipped or auto-resolved: {org_err}", flush=True)
-                            # ======================================================================
-
-                        if "/login" in current_url:
-                            # Still on the login page — the login itself
-                            # failed (bad credentials, site-side validation
-                            # error, CAPTCHA, account lockout, etc). Surface
-                            # whatever error message the page is showing and
-                            # abort this scan cleanly rather than timing out
-                            # repeatedly on a "Tenders" link that will never
-                            # appear.
-                            error_text = "(no visible error message found on page)"
-                            try:
-                                css_hit = page.locator("[class*='error' i], [class*='alert' i], [role='alert']").first
-                                if css_hit.count() > 0:
-                                    error_text = css_hit.inner_text(timeout=3000)
-                            except Exception:
-                                pass
-
-                            if error_text == "(no visible error message found on page)":
-                                # CSS-based error containers found nothing —
-                                # separately check for common failure-related
-                                # words anywhere in the visible text (kept as
-                                # its own pass since Playwright doesn't allow
-                                # mixing the "text=" engine into a plain CSS
-                                # selector list — that's what was silently
-                                # breaking this check before).
-                                for keyword in ("invalid", "incorrect", "failed", "locked", "attempts"):
-                                    try:
-                                        hit = page.get_by_text(keyword, exact=False).first
-                                        if hit.count() > 0:
-                                            error_text = hit.inner_text(timeout=2000)
-                                            break
-                                    except Exception:
-                                        continue
-
-                            # A narrow selector can miss error text the site
-                            # renders in an unexpected element, so also dump a
-                            # broader slice of the page body — cheap insurance
-                            # against another silent "no message found" log.
-                            try:
-                                body_snippet = page.locator("body").inner_text(timeout=3000)[:500]
-                            except Exception:
-                                body_snippet = ""
-
-                            captcha_present = (
-                                page.locator("iframe[src*='recaptcha' i], iframe[title*='captcha' i]").count() > 0
-                                or page.get_by_text("captcha", exact=False).count() > 0
-                            )
-
-                            print(f"❌ eGP login failed — still on login page. On-page message: {error_text}", flush=True)
-                            print(f"🔎 CAPTCHA detected on page: {captcha_present}", flush=True)
-                            print(f"🔎 Page body snippet at failure: {body_snippet}", flush=True)
-                            browser.close()
-                            return 0
-
-                    else:
-                        print(f"⚠️ Could not confidently identify eGP username/password field among: {field_info}", flush=True)
-                except Exception as e:
-                    print(f"⚠️ eGP login attempt failed, continuing without auth: {e}", flush=True)
-                    # A bare exception message (e.g. a wait_for_selector
-                    # timeout) doesn't say WHAT the page actually showed
-                    # instead of the expected login form — capture that now
-                    # rather than guessing from the exception type alone.
-                    try:
-                        print(f"🔎 eGP page URL at failure: {page.url}", flush=True)
-                        print(f"🔎 eGP page body snippet at failure: {page.locator('body').inner_text(timeout=3000)[:500]}", flush=True)
-                    except Exception:
-                        print("🔎 Could not capture page state at failure (page may be unresponsive)", flush=True)
-
-                    # Login itself threw (rather than gracefully landing back
-                    # on /login) — this previously fell through to attempt
-                    # org selection and the "Tenders" click anyway while not
-                    # actually logged in, which could only ever time out.
-                    # Stop cleanly here instead of cascading into a second,
-                    # unrelated-looking failure a few seconds later.
+                tokens = _egp_get_tokens()
+                if not tokens:
+                    print("❌ Could not obtain eGP tokens — aborting eGP engine for this cycle", flush=True)
                     browser.close()
                     return 0
 
-            # --- Dismiss any blocking modal (this app uses Ant Design/ng-zorro
-            # modals — one may pop up after org selection and intercept clicks).
-            # Logs showed an nz-modal-container sitting inside a
-            # cdk-overlay-container that our old .ant-modal-close selector
-            # didn't match, so we now target that structure directly too and
-            # retry Escape a few times since one press isn't always enough. ---
+                try:
+                    _egp_inject_tokens(context, page, tokens)
+
+                    page.goto(f"{EGP_BASE}/egp/home", timeout=30000, wait_until="domcontentloaded")
+                    page.wait_for_timeout(3000)
+                    print(f"✅ Post-token navigation URL: {page.url}", flush=True)
+
+                    # Organization selection
+                    try:
+                        print("🏢 Checking for organization selection prompt...", flush=True)
+                        try:
+                            page.wait_for_selector(
+                                f"text=/{EGP_ORG_NAME}/i, text=MEDMETRIC HEALTHCARE SERVICE PLC, "
+                                ".card, [class*='org' i], [role='button']",
+                                timeout=12000
+                            )
+                        except Exception:
+                            pass
+
+                        org_card = page.locator(f"text=/{EGP_ORG_NAME}/i").first
+                        if org_card.count() == 0:
+                            org_card = page.locator("text=MEDMETRIC HEALTHCARE SERVICE PLC").first
+
+                        if org_card.count() > 0:
+                            org_card.click()
+                            print("✅ Organization selected successfully.", flush=True)
+                            page.wait_for_timeout(4000)
+                        else:
+                            fallback_org = page.locator(
+                                ".card, div[role='button'], .list-group-item, "
+                                "[class*='organization' i], [class*='org-card' i], "
+                                "li, button:has-text('Continue'), button:has-text('Select')"
+                            ).first
+                            if fallback_org.count() > 0:
+                                fallback_org.click()
+                                print("✅ Fallback organization selected.", flush=True)
+                                page.wait_for_timeout(4000)
+                            else:
+                                print("ℹ️ No organization card found — assuming already selected or not required.", flush=True)
+
+                        if "/login" in page.url or "organization-selector" in page.url or "inspect-not-allowed" in page.url:
+                            print(f"⚠️ Still on {page.url} after org step — trying /egp/home again", flush=True)
+                            page.goto(f"{EGP_BASE}/egp/home", timeout=20000, wait_until="domcontentloaded")
+                            page.wait_for_timeout(2000)
+                            print(f"🔎 URL after recovery: {page.url}", flush=True)
+                    except Exception as org_err:
+                        print(f"ℹ️ Organization selection skipped or auto-resolved: {org_err}", flush=True)
+
+                except Exception as e:
+                    print(f"⚠️ Token injection / post-login navigation failed: {e}", flush=True)
+                    try:
+                        print(f"🔎 Page URL: {page.url}", flush=True)
+                        print(f"🔎 Body snippet: {page.locator('body').inner_text(timeout=3000)[:400]}", flush=True)
+                    except Exception:
+                        pass
+                    browser.close()
+                    return 0
+            else:
+                print("ℹ️ EGP_USER/EGP_PASS not set — continuing without authentication", flush=True)
+
+            # Dismiss blocking modals
             for attempt in range(3):
                 try:
                     modal_close = page.locator(
@@ -1153,34 +985,21 @@ def scrape_egp(candidates: list):
                         print(f"✅ Closed a blocking modal dialog (attempt {attempt + 1})", flush=True)
                 except Exception:
                     pass
-
                 page.keyboard.press("Escape")
                 page.wait_for_timeout(500)
-
-                # If an overlay/modal container is still present, click its
-                # backdrop to force it closed rather than waiting on a
-                # specific button that may not exist for this modal type
                 try:
                     overlay = page.locator(".cdk-overlay-backdrop, nz-modal-container").first
                     if overlay.count() == 0:
-                        break  # nothing left blocking — stop retrying
+                        break
                     backdrop = page.locator(".cdk-overlay-backdrop").first
                     if backdrop.count() > 0:
                         backdrop.click(timeout=2000, force=True)
                         page.wait_for_timeout(500)
-                        print(f"✅ Clicked overlay backdrop to dismiss modal (attempt {attempt + 1})", flush=True)
                 except Exception:
                     pass
 
-            # --- Navigate to Bidding List via the Tenders nav link (client-side
-            # routing — direct URL navigation to /egp/bids/all doesn't load the
-            # real table, it just bounces back to the dashboard) ---
+            # Navigate to Bidding List
             try:
-                # Prefer the actual nav-bar link (confirmed via screen recording:
-                # top nav reads "Home | Tenders | ...") over a bare text match —
-                # a generic "text=Tenders" can latch onto the wrong element if
-                # the page hasn't fully settled into the authenticated layout
-                # yet (e.g. a "Tenders" card elsewhere on a still-loading page).
                 tenders_link = page.locator("nav a:has-text('Tenders'), header a:has-text('Tenders')").first
                 if tenders_link.count() == 0:
                     tenders_link = page.get_by_role("link", name="Tenders", exact=True)
@@ -1190,21 +1009,23 @@ def scrape_egp(candidates: list):
                 try:
                     tenders_link.click(timeout=15000)
                 except Exception as click_err:
-                    # A leftover overlay can still intercept the click even
-                    # after the dismissal attempts above — force it through
-                    # rather than giving up the whole scan
                     print(f"⚠️ Normal click on Tenders failed ({click_err}), forcing click", flush=True)
                     tenders_link.click(timeout=10000, force=True)
                 page.wait_for_selector("text=/Bidding List/i", timeout=15000)
                 print("✅ Reached Bidding List view", flush=True)
             except Exception as e:
                 print(f"❌ Could not reach Bidding List view: {e}", flush=True)
+                try:
+                    print(f"🔎 Current URL: {page.url}", flush=True)
+                    print(f"🔎 Body snippet: {page.locator('body').inner_text(timeout=3000)[:500]}", flush=True)
+                except Exception:
+                    pass
                 browser.close()
                 return 0
 
             search_box = page.locator("input[placeholder*='Search' i]").first
-
             seen_this_scan = set()
+
             for term in EGP_SEARCH_TERMS:
                 try:
                     search_box.click()
@@ -1212,14 +1033,14 @@ def scrape_egp(candidates: list):
                     page.wait_for_timeout(300)
                     search_box.fill(term)
                     search_box.press("Enter")
-                    page.wait_for_timeout(2500)  # let the table filter update
+                    page.wait_for_timeout(2500)
 
                     actual_value = search_box.input_value()
                     rows = page.locator("table tbody tr").all()
                     first_row_preview = ""
                     if rows:
                         try:
-                            first_row_preview = rows[0].inner_text().replace("\n", " | ")[:100]
+                            first_row_preview = rows[0].inner_text().replace("\\n", " | ")[:100]
                         except Exception:
                             pass
                     print(f"eGP search '{term}' | input value now: '{actual_value}' | {len(rows)} rows | first row: {first_row_preview!r}", flush=True)
@@ -1240,16 +1061,9 @@ def scrape_egp(candidates: list):
                             if is_relevant_tender(title_text):
                                 tender_id = f"egp_{ref_no or title_text}"
                                 if not is_already_notified(tender_id):
-                                    # Mark as notified immediately regardless of the
-                                    # eventual AI verdict — prevents re-checking (and
-                                    # re-spending AI quota on) the same tender
-                                    # on every scan cycle
                                     mark_as_notified(tender_id)
-
                                     found += 1
 
-                                    # Try a plain anchor href inside the row first —
-                                    # cheap, no navigation needed
                                     detail_link = EGP_BIDS_URL
                                     try:
                                         row_anchor = row.locator("a").first
@@ -1261,9 +1075,6 @@ def scrape_egp(candidates: list):
                                     except Exception:
                                         pass
 
-                                    # No plain href — click the row to capture the
-                                    # real URL the SPA navigates to, then go back and
-                                    # restore the search filter
                                     if detail_link == EGP_BIDS_URL:
                                         try:
                                             row.click(timeout=8000)
@@ -1283,49 +1094,26 @@ def scrape_egp(candidates: list):
                                             print(f"⚠️ Click-through for detail link failed: {e}", flush=True)
                                             detail_link = EGP_BIDS_URL
 
-                                    # Fetch the actual detail page text — the title/ref_no
-                                    # alone never contain closing date, bid bond, or
-                                    # eligibility info, which is why those fields were
-                                    # always coming back "not specified." We open the
-                                    # detail page in a SEPARATE tab so we never disturb
-                                    # the main page's search box / filtered results.
-                                    # This is a Playwright call, not an AI call, so it
-                                    # doesn't touch the AI quota.
                                     detail_text = ""
                                     if detail_link and detail_link != EGP_BIDS_URL:
                                         detail_page = None
                                         try:
                                             detail_page = context.new_page()
                                             detail_page.goto(detail_link, timeout=20000, wait_until="domcontentloaded")
-                                            # Angular SPA detail views render fields async — a
-                                            # fixed short wait was catching the loading skeleton
-                                            # (both captures logged an identical, suspiciously
-                                            # small 144 chars). Wait for network activity to
-                                            # settle, then poll for the text to actually grow
-                                            # past a "still loading" size before giving up.
                                             try:
                                                 detail_page.wait_for_load_state("networkidle", timeout=10000)
                                             except Exception:
-                                                pass  # some SPAs never go fully idle — fine, we still poll below
-
-                                            detail_text = ""
+                                                pass
                                             for poll_attempt in range(5):
                                                 detail_page.wait_for_timeout(1500)
                                                 try:
                                                     candidate_text = detail_page.locator("body").inner_text(timeout=5000)
                                                 except Exception:
                                                     candidate_text = ""
-                                                # Real detail content (title, ref, dates, scope,
-                                                # eligibility) runs to many hundreds of chars —
-                                                # treat anything under ~300 as still loading
                                                 if len(candidate_text) > 300:
                                                     detail_text = candidate_text
                                                     break
-                                                detail_text = candidate_text  # keep best-effort fallback
-
-                                            # Trim to a sane size — some detail pages include
-                                            # long boilerplate/nav text we don't need to send
-                                            # to the AI, and it wastes tokens/quota
+                                                detail_text = candidate_text
                                             detail_text = detail_text[:6000]
                                             print(f"📄 Captured {len(detail_text)} chars from eGP detail page", flush=True)
                                         except Exception as e:
@@ -1337,8 +1125,6 @@ def scrape_egp(candidates: list):
                                                 except Exception:
                                                     pass
 
-                                    # Collect for the single end-of-scan batch AI call
-                                    # rather than calling the AI right here per-tender
                                     candidates.append({
                                         "id": tender_id,
                                         "source": "egp",
@@ -1349,7 +1135,6 @@ def scrape_egp(candidates: list):
                                     })
                         except Exception:
                             continue
-
                 except Exception as e:
                     print(f"⚠️ eGP search for '{term}' failed: {e}", flush=True)
                     continue
@@ -1364,7 +1149,6 @@ def scrape_egp(candidates: list):
         return 0
 
 
-# ==================== RUN COORDINATOR ====================
 def check_for_tenders():
     print("=================== STARTING SCAN CYCLE ===================", flush=True)
 
