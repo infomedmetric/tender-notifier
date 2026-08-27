@@ -1,614 +1,1108 @@
-"""
-Medmetric Tender Notifier
-==========================
-Scans Ethiopian procurement portals (eGP and 2merkato) for tenders relevant
-to medMETRIC Healthcare Service PLC, filters them with an AI relevance check
-(Groq), deduplicates against a Postgres (Neon) table, and sends WhatsApp
-alerts via an Evolution API instance for each newly matched tender.
-
-Architecture notes (see project memory for full history):
-- eGP: no browser automation. Hits the Angular app's public JSON API
-  directly via `requests` (no login required for listing), runs in-process
-  (no multiprocessing/subprocess timeout wrapper -- that approach caused a
-  bug where collected candidates were lost when the subprocess was killed).
-- 2merkato: still uses Playwright (JS-rendered portal), keyword-driven
-  search (not blind pagination), with a closed-tender status badge check.
-- AI filtering: Groq API via the `openai` package pointed at Groq's
-  OpenAI-compatible endpoint. Model is configurable via GROQ_MODEL env var.
-- Dedup: PostgreSQL on Neon.tech, `notified_tenders` table. Tenders are
-  marked as seen immediately regardless of AI verdict, to avoid re-spending
-  API quota re-evaluating the same tender on a later scan.
-- WhatsApp: Evolution API, one message per matched tender (not batched).
-- Everything sensitive/environment-specific (URLs, keys, phone numbers,
-  model name, scan interval) is env-var driven -- no secrets in source.
-"""
-
 import os
-import re
 import time
 import json
-import hmac
-import logging
-import threading
-from datetime import datetime, timezone, timedelta
-
 import requests
-from flask import Flask, request, jsonify
-from openai import OpenAI
+import threading
+import multiprocessing
+import traceback
+import hmac
 import psycopg2
-from psycopg2 import pool
-
-# Playwright is only needed for 2merkato
+from datetime import datetime, timezone, timedelta
+from flask import Flask, request
 from playwright.sync_api import sync_playwright
+import urllib3
+from openai import OpenAI
 
-# --------------------------------------------------------------------------
-# Logging
-# --------------------------------------------------------------------------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-)
-log = logging.getLogger("tender_notifier")
+def _call_groq_with_retry(client, system_instruction, prompt, temperature=0.2, max_retries=3, base_delay=2):
+    """
+    Wraps a Groq chat.completions.create call with retries + exponential
+    backoff, mirroring the same reliability pattern used before with
+    Gemini — a single transient network blip shouldn't immediately produce
+    a fallback/degraded result.
 
-
-def mask_phone(number: str) -> str:
-    """Mask a phone number for safe logging, e.g. +2519******74."""
-    if not number or len(number) < 6:
-        return "***"
-    return number[:5] + "*" * (len(number) - 7) + number[-2:]
-
-
-# --------------------------------------------------------------------------
-# Configuration (all env-var driven)
-# --------------------------------------------------------------------------
-class Config:
-    # --- eGP ---
-    EGP_BASE = os.environ.get("EGP_BASE", "https://production.egp.gov.et")
-    EGP_SEARCH_ENDPOINT = f"{EGP_BASE}/po-gw/cms-v2/api/sourcing/get-sourcing"
-    EGP_SEARCH_TERMS = [
-        t.strip()
-        for t in os.environ.get(
-            "EGP_SEARCH_TERMS",
-            "hemodialysis,dialysis,B Braun,Dialog+,biomedical,"
-            "medical equipment,sterilization,autoclave,RO water treatment,"
-            "ዲያሊሲስ,የህክምና መሣሪያዎች ጥገና",
-        ).split(",")
-        if t.strip()
-    ]
-
-    # --- 2merkato ---
-    MERKATO_BASE = os.environ.get("MERKATO_BASE", "https://tender.2merkato.com")
-    MERKATO_USERNAME = os.environ.get("MERKATO_USERNAME", "")
-    MERKATO_PASSWORD = os.environ.get("MERKATO_PASSWORD", "")
-    MERKATO_SEARCH_TERMS = [
-        t.strip()
-        for t in os.environ.get(
-            "MERKATO_SEARCH_TERMS",
-            "hemodialysis,dialysis,biomedical,medical equipment,"
-            "hospital equipment,sterilization,CSSD,calibration,"
-            "medical imaging,spare parts medical",
-        ).split(",")
-        if t.strip()
-    ]
-
-    # --- Hard exclusions (never touch without explicit instruction) ---
-    HARD_EXCLUDE_TERMS = [
-        "laboratory",
-        "reagent",
-        "medicine",
-        "pharmaceutical",
-        "vaccine",
-        "drug",
-    ]
-
-    # --- Groq / AI ---
-    GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
-    GROQ_BASE_URL = os.environ.get("GROQ_BASE_URL", "https://api.groq.com/openai/v1")
-    GROQ_MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
-    AI_BATCH_SIZE = int(os.environ.get("AI_BATCH_SIZE", "7"))
-    AI_DETAIL_CHARS = int(os.environ.get("AI_DETAIL_CHARS", "900"))
-
-    # --- WhatsApp / Evolution API ---
-    EVOLUTION_API_URL = os.environ.get(
-        "EVOLUTION_API_URL", "https://medmetric-evolution.onrender.com"
-    )
-    EVOLUTION_INSTANCE = os.environ.get("EVOLUTION_INSTANCE", "Tender-Notifier.")
-    EVOLUTION_API_KEY = os.environ.get("EVOLUTION_API_KEY", "")
-    NOTIFY_PHONE_NUMBERS = [
-        n.strip()
-        for n in os.environ.get("NOTIFY_PHONE_NUMBERS", "").split(",")
-        if n.strip()
-    ]
-
-    # --- Database (Neon Postgres) ---
-    DATABASE_URL = os.environ.get("DATABASE_URL", "")
-
-    # --- Scan interval & scheduling ---
-    SCAN_INTERVAL_HOURS = float(os.environ.get("SCAN_INTERVAL_HOURS", "6"))
-
-    # --- /test-check route protection ---
-    TEST_CHECK_TOKEN = os.environ.get("TEST_CHECK_TOKEN", "")
-
-    @classmethod
-    def validate(cls):
-        warnings = []
-        if not cls.GROQ_API_KEY:
-            warnings.append("GROQ_API_KEY is not set -- AI filtering will fail.")
-        if not cls.EVOLUTION_API_KEY:
-            warnings.append("EVOLUTION_API_KEY is not set -- WhatsApp sending will fail.")
-        if not cls.NOTIFY_PHONE_NUMBERS:
-            warnings.append("NOTIFY_PHONE_NUMBERS is not set -- no recipients configured.")
-        if not cls.DATABASE_URL:
-            warnings.append("DATABASE_URL is not set -- dedup will fail.")
-        if not cls.TEST_CHECK_TOKEN:
-            warnings.append("TEST_CHECK_TOKEN is not set -- /test-check route is unprotected.")
-        for w in warnings:
-            log.warning("STARTUP WARNING: %s", w)
-        if cls.NOTIFY_PHONE_NUMBERS:
-            log.info(
-                "Notify recipients: %s",
-                ", ".join(mask_phone(n) for n in cls.NOTIFY_PHONE_NUMBERS),
+    Model is configurable via GROQ_MODEL (defaults to openai/gpt-oss-120b).
+    Groq deprecated and removed llama-3.3-70b-versatile — every call to it
+    now fails with a 404 model_not_found error, confirmed across multiple
+    scans even with a valid API key, so this isn't a transient issue.
+    openai/gpt-oss-120b is Groq's own current recommended replacement.
+    Groq's free tier also has its own rate limits, so batching everything
+    into one call per scan cycle (see batch_analyze_tenders below) still
+    matters just as much here as it did with Gemini.
+    """
+    model_name = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
+    last_error = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            return client.chat.completions.create(
+                model=model_name,
+                messages=[
+                    {"role": "system", "content": system_instruction},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=temperature,
+                response_format={"type": "json_object"},
             )
+        except Exception as e:
+            last_error = e
+            if attempt < max_retries:
+                delay = base_delay * attempt  # 2s, 4s, 6s...
+                print(f"⚠️ Groq call failed (attempt {attempt}/{max_retries}): {e} — retrying in {delay}s", flush=True)
+                time.sleep(delay)
+    raise last_error
 
 
-# --------------------------------------------------------------------------
-# Database (Neon Postgres) -- persistent connection pool w/ liveness checks
-# --------------------------------------------------------------------------
-class Database:
-    def __init__(self, dsn: str):
-        self.dsn = dsn
-        self._pool = None
-        self._lock = threading.Lock()
-        if dsn:
-            self._connect()
 
-    def _connect(self):
-        self._pool = psycopg2.pool.SimpleConnectionPool(1, 3, self.dsn)
-        self._ensure_schema()
-
-    def _ensure_schema(self):
-        with self.get_conn() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    CREATE TABLE IF NOT EXISTS notified_tenders (
-                        id TEXT PRIMARY KEY,
-                        source TEXT NOT NULL,
-                        title TEXT,
-                        matched BOOLEAN,
-                        first_seen TIMESTAMPTZ DEFAULT NOW()
-                    );
-                    """
-                )
-            conn.commit()
-
-    def get_conn(self):
-        # Liveness check: pull a connection, verify it's alive, else reconnect.
-        with self._lock:
-            conn = self._pool.getconn()
-            try:
-                with conn.cursor() as cur:
-                    cur.execute("SELECT 1;")
-            except Exception:
-                log.warning("DB connection stale, reconnecting pool.")
-                self._pool.putconn(conn, close=True)
-                self._connect()
-                conn = self._pool.getconn()
-            return conn
-
-    def release(self, conn):
-        with self._lock:
-            self._pool.putconn(conn)
-
-    def is_seen(self, tender_id: str) -> bool:
-        conn = self.get_conn()
-        try:
-            with conn.cursor() as cur:
-                cur.execute("SELECT 1 FROM notified_tenders WHERE id = %s;", (tender_id,))
-                return cur.fetchone() is not None
-        finally:
-            self.release(conn)
-
-    def mark_seen(self, tender_id: str, source: str, title: str, matched: bool):
-        conn = self.get_conn()
-        try:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    INSERT INTO notified_tenders (id, source, title, matched)
-                    VALUES (%s, %s, %s, %s)
-                    ON CONFLICT (id) DO NOTHING;
-                    """,
-                    (tender_id, source, title, matched),
-                )
-            conn.commit()
-        finally:
-            self.release(conn)
-
-
-db = Database(Config.DATABASE_URL)
-
-# --------------------------------------------------------------------------
-# Groq AI client (via openai package)
-# --------------------------------------------------------------------------
-ai_client = OpenAI(api_key=Config.GROQ_API_KEY, base_url=Config.GROQ_BASE_URL)
-
-RELEVANCE_SCHEMA_PROMPT = """You are screening Ethiopian government/private procurement
-tenders for medMETRIC Healthcare Service PLC, a biomedical engineering and medical
-equipment services company (hemodialysis systems incl. B.Braun Dialog+ and SWS-4000A,
-RO/water treatment, CSSD & sterilization equipment (Rivamed), calibration & compliance
-testing, medical imaging, spare parts sourcing, medical equipment supply & consultancy).
-
-For each tender below, decide if it is genuinely relevant to medMETRIC's business.
-Exclude tenders that are purely about: laboratory reagents, pharmaceuticals, vaccines,
-medicines/drugs, or generic non-medical consulting/services with no equipment component.
-Medical-equipment-focused consultancy IS in scope.
-
-Respond ONLY with a JSON array (no markdown, no preamble), one object per tender, in the
-same order given, with this exact shape:
-[
-  {
-    "id": "<tender id as given>",
-    "relevant": true/false,
-    "reason": "<short reason>",
-    "constraints": "<eligibility/bid constraints if mentioned, else empty string>",
-    "closing_date": "<closing/submission date if mentioned, else empty string>"
-  }
+# Keywords used to locate the parts of a detail page worth keeping when the
+# full captured text (up to 6000 chars) is too long to send to the AI in
+# full. A blind [:N] truncation was cutting off the closing date and
+# eligibility/constraints info entirely whenever a page's nav/breadcrumb/menu
+# text ran long before the real content — which is exactly why those fields
+# kept coming back empty even though the scraper WAS capturing the text.
+_CLOSING_DATE_HINTS = [
+    "closing date", "submission deadline", "bid submission", "deadline",
+    "closing time", "bid closing", "last date", "due date", "valid until",
+    "validity", "opening date",
+]
+_CONSTRAINT_HINTS = [
+    "eligib", "bid bond", "bid security", "minimum requirement", "experience",
+    "similar contract", "qualification", "capital", "registration",
+    "local agent", "representative", "certificate", "license", "requirement",
 ]
 
-Tenders:
-"""
+
+def _build_detail_snippet(detail_text: str, max_chars: int = 2400) -> str:
+    """
+    Instead of blindly slicing the first N characters (which was silently
+    dropping the closing date and constraints whenever they appeared later
+    in the page than the cutoff), keep the front of the page for
+    title/scope context PLUS a window of text around any closing-date or
+    constraint-related keyword found anywhere in the full captured text.
+    This makes it far more likely the AI actually sees the relevant
+    sentence instead of nav/menu boilerplate.
+    """
+    if not detail_text:
+        return ""
+    if len(detail_text) <= max_chars:
+        return detail_text
+
+    lower = detail_text.lower()
+    front_budget = max_chars // 2
+    front = detail_text[:front_budget]
+
+    windows = []
+    remaining_budget = max_chars - front_budget
+    for hint in _CLOSING_DATE_HINTS + _CONSTRAINT_HINTS:
+        if remaining_budget <= 0:
+            break
+        idx = lower.find(hint)
+        if idx == -1 or idx < front_budget:
+            continue  # already covered by the front slice, or not present
+        start = max(0, idx - 60)
+        end = min(len(detail_text), idx + 240)
+        window = detail_text[start:end]
+        if window not in windows:
+            windows.append(window)
+            remaining_budget -= len(window)
+
+    return front + "\n[...]\n" + "\n[...]\n".join(windows) if windows else front
 
 
-def ai_filter_batch(tenders: list) -> dict:
-    """
-    Given a list of candidate tender dicts (each with id/title/detail_text),
-    return a dict of id -> verdict dict from the AI.
-    """
-    results = {}
-    for i in range(0, len(tenders), Config.AI_BATCH_SIZE):
-        chunk = tenders[i : i + Config.AI_BATCH_SIZE]
-        listing = "\n\n".join(
-            f"ID: {t['id']}\nTitle: {t['title']}\n"
-            f"Detail: {t['detail_text'][:Config.AI_DETAIL_CHARS]}"
-            for t in chunk
+def _build_batch_prompt(chunk_with_indices):
+    """Builds the system + user prompt for one sub-batch of (index, candidate) pairs."""
+    entries = []
+    for i, c in chunk_with_indices:
+        snippet = _build_detail_snippet(c.get('detail_text', ''))
+        entries.append(
+            f"[{i}] Source: {c['source']} | Title: {c['title']} | Ref No: {c.get('ref_no', '')}\n"
+            f"Detail: {snippet}"
         )
-        prompt = RELEVANCE_SCHEMA_PROMPT + listing
+    joined_entries = "\n\n".join(entries)
+
+    system_instruction = (
+        "You are an expert procurement analyst for medMETRIC Healthcare Service PLC, "
+        "an Ethiopian biomedical engineering and medical equipment technical-services provider. Their scope "
+        "covers: medical equipment Corrective and preventive maintenance & service contracts (including hemodialysis "
+        "systems like B.Braun Dialog+ and SWS-4000A), RO/water treatment systems, CSSD & "
+        "sterilization equipment (e.g. Rivamed or Aquaboss), corrective and preventive maintenance of "
+        " medical imaging equipment, Procurement of Maintenance and Repair Service, also medmetric participates on International Competitive Bidding (ICB) which is related to medical equipment "
+        "and general medical equipment supply/consultancy. They do NOT supply medicines, must check since they don't work on "
+        "pharmaceuticals, vaccines, or laboratory-only equipment/reagents/consumables — mark "
+        "those NOT relevant even if they mention \"medical\" in passing.\n\n"
+        "You will be given a numbered list of tenders, each with a Detail excerpt taken from the tender's "
+        "own detail page (it may include a front section plus separate windows of text pulled from around "
+        "date/eligibility keywords elsewhere on the page, joined by [...] markers — treat each window as "
+        "real page text, not as connected prose).\n\n"
+        "Analyze EACH tender independently and return a JSON object with a single key \"tenders\" whose "
+        "value is an array — one object per tender, covering every index given, with EXACTLY this shape:\n"
+        '{"tenders": [{'
+        '"index": 0, '
+        '"relevant": true, '
+        '"match_score": 85, '
+        '"reason": "short sentence on why it matches or not", '
+        '"procurement_object": "the object/type of procurement as stated on the page, e.g. \'Supply and installation of hemodialysis machines\'", '
+        '"constraints": "key eligibility/bid requirements actually stated in the text — e.g. bid bond amount, minimum years of similar experience, required certifications, local representation requirement. '
+        'If the provided excerpt does not contain this info, respond exactly with \'Not stated in provided text\' — do NOT say \'None\' or \'None identified\', since that implies you confirmed there are none.", '
+        '"closing_date": "the bid submission deadline / closing date (and time, if given) EXACTLY as it appears in the text, including the date format used. '
+        'If no such date appears anywhere in the excerpt, respond exactly with \'Not stated in provided text\'. Do not confuse this with a publish date, site-visit date, or clarification-request date."'
+        "}, ...]}\n"
+        "Respond with ONLY that JSON object — no markdown fences, no commentary."
+    )
+    prompt = f"Tenders to analyze:\n\n{joined_entries}"
+    return system_instruction, prompt
+
+
+
+def batch_analyze_tenders(candidates: list):
+    """
+    Analyzes ALL candidate tenders from a scan cycle in as FEW Groq calls as
+    possible — instead of one call per tender. Even free-tier LLM APIs cap
+    daily/per-minute requests (both a request count AND a tokens-per-minute
+    budget), so a per-tender approach can burn through a day's quota in one
+    scan.
+
+    A single-mega-request approach hit Groq's TPM (tokens per minute) limit
+    once there were 15-20+ candidates with detail text attached (413 "Request
+    too large"). So candidates are split into smaller sub-batches sized to
+    stay comfortably under the TPM limit, each sent as its own Groq call —
+    still far fewer calls than one per tender (e.g. 23 candidates becomes
+    ~3 calls instead of 23 or 46).
+
+    Returns a dict {index: {relevant, match_score, reason, object,
+    closing_date}} on success (possibly missing some indices if only some
+    sub-batches failed — the caller already treats a missing index as
+    "unverified, fall back to keyword match"), or None if EVERY sub-batch
+    failed (e.g. no API key, or Groq unreachable entirely).
+    """
+    if not candidates:
+        return {}
+
+    api_key = os.environ.get("GROQ_API_KEY")
+    if not api_key:
+        return None
+
+    # Sized conservatively: detail snippets now run up to ~2,400 chars/
+    # candidate (up from 900) so the AI can actually see closing dates and
+    # constraints that appear later in the page rather than always seeing
+    # blank space. ~6 candidates per chunk keeps prompt+completion tokens
+    # comfortably under Groq's 12,000 TPM limit for openai/gpt-oss-120b,
+    # even accounting for the system instruction and JSON completion overhead.
+    CHUNK_SIZE = 6
+
+    # Uses the standard OpenAI client pointed at Groq's OpenAI-compatible
+    # endpoint (per Groq's own current setup instructions), rather than the
+    # dedicated groq package. Deliberately still calling
+    # chat.completions.create() with response_format={"type": "json_object"}
+    # below (not the newer client.responses.create()) — Groq's Responses API
+    # is explicitly marked "currently in beta" in their docs, and this
+    # pipeline runs unattended and depends on getting valid, parseable JSON
+    # back every single time. Chat Completions + JSON mode is the
+    # well-established path for that; nothing here needed the beta endpoint.
+    client = OpenAI(api_key=api_key, base_url="https://api.groq.com/openai/v1")
+    indexed_candidates = list(enumerate(candidates))
+    chunks = [indexed_candidates[i:i + CHUNK_SIZE] for i in range(0, len(indexed_candidates), CHUNK_SIZE)]
+
+    all_results = {}
+    any_chunk_succeeded = False
+
+    for chunk_num, chunk in enumerate(chunks, start=1):
+        system_instruction, prompt = _build_batch_prompt(chunk)
         try:
-            resp = ai_client.chat.completions.create(
-                model=Config.GROQ_MODEL,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0,
-            )
-            raw = resp.choices[0].message.content.strip()
-            raw = re.sub(r"^```(json)?|```$", "", raw, flags=re.MULTILINE).strip()
+            response = _call_groq_with_retry(client, system_instruction, prompt, temperature=0.2)
+            raw = (response.choices[0].message.content or "").strip()
+            if raw.startswith("```"):
+                raw = raw.split("```")[1]
+                if raw.startswith("json"):
+                    raw = raw[4:]
+                raw = raw.strip()
             parsed = json.loads(raw)
-            for verdict in parsed:
-                results[str(verdict.get("id"))] = verdict
+            items = parsed.get("tenders", []) if isinstance(parsed, dict) else parsed
+            for item in items:
+                idx = item.get("index")
+                if idx is not None:
+                    all_results[idx] = item
+            any_chunk_succeeded = True
         except Exception as e:
-            log.error("AI batch failed for chunk starting at %d: %s", i, e)
-            # Fail closed for this chunk -- treat as not relevant rather than
-            # risk spamming WhatsApp with unverified matches.
-            for t in chunk:
-                results[str(t["id"])] = {
-                    "id": t["id"],
-                    "relevant": False,
-                    "reason": "AI evaluation failed",
-                    "constraints": "",
-                    "closing_date": "",
-                }
-    return results
+            print(f"⚠️ Batch AI analysis sub-batch {chunk_num}/{len(chunks)} failed after retries: {e}", flush=True)
+            # Leave this sub-batch's indices out of all_results — the caller
+            # already falls back to "unverified, keyword match only" for any
+            # index missing from the results dict
+
+        # Small pause between sub-batches so back-to-back chunks don't
+        # themselves stack up against the TPM window
+        if chunk_num < len(chunks):
+            time.sleep(3)
+
+    return all_results if any_chunk_succeeded else None
 
 
-def is_relevant_tender(title: str, detail_text: str) -> bool:
-    """Pre-filter keyword check. DO NOT modify keyword lists without
-    explicit instruction -- eGP and 2merkato engines are treated
-    independently but share this helper."""
-    text = f"{title} {detail_text}".lower()
-    if any(term.lower() in text for term in Config.HARD_EXCLUDE_TERMS):
-        return False
-    return True
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-
-# --------------------------------------------------------------------------
-# eGP engine -- public JSON API, no browser automation, runs in-process
-# --------------------------------------------------------------------------
-def scrape_egp() -> list:
-    """
-    Calls the Angular app's public sourcing API directly. No login needed.
-    Runs fully in-process (no multiprocessing/subprocess timeout wrapper --
-    that approach previously caused collected candidates to be discarded
-    when the subprocess hit its timeout and was killed).
-    """
-    candidates = []
-    now = datetime.now(timezone.utc)
-    seen_ids_this_run = set()
-
-    for term in Config.EGP_SEARCH_TERMS:
-        try:
-            resp = requests.get(
-                Config.EGP_SEARCH_ENDPOINT,
-                params={"search": term, "top": 25},
-                timeout=30,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-        except Exception as e:
-            log.warning("eGP API call failed for term '%s': %s", term, e)
-            continue
-
-        if isinstance(data, list):
-            items = data
-        else:
-            items = data.get("items") or data.get("data") or []
-        if not isinstance(items, list):
-            items = []
-
-        for item in items:
-            tender_id = str(item.get("id") or item.get("sourcingId") or item.get("referenceNumber") or "")
-            if not tender_id or tender_id in seen_ids_this_run:
-                continue
-
-            deadline_raw = item.get("submissionDeadline")
-            deadline_dt = None
-            if deadline_raw:
-                try:
-                    deadline_dt = datetime.fromisoformat(deadline_raw.replace("Z", "+00:00"))
-                except Exception:
-                    deadline_dt = None
-
-            if deadline_dt and deadline_dt < now:
-                # Skip tenders whose submission deadline has already passed.
-                continue
-
-            title = item.get("lotName", "") or item.get("title", "")
-            description = item.get("lotDescription", "") or item.get(
-                "packageInformation", {}
-            ).get("package_description", "")
-            bid_security = item.get("packageInformation", {}).get(
-                "bid_security_amount", ""
-            )
-            procuring_entity = item.get("procuringEntity", "")
-
-            detail_text = (
-                f"Title: {title}\n"
-                f"Reference: {item.get('referenceNumber', '')}\n"
-                f"Procuring Entity: {procuring_entity}\n"
-                f"Closing Date: {deadline_raw or 'N/A'}\n"
-                f"Bid Security: {bid_security}\n"
-                f"Description: {description}"
-            )
-
-            if not is_relevant_tender(title, detail_text):
-                continue
-
-            seen_ids_this_run.add(tender_id)
-            candidates.append(
-                {
-                    "id": f"egp-{tender_id}",
-                    "source": "eGP",
-                    "title": title,
-                    "detail_text": detail_text,
-                    "closing_date": deadline_raw or "",
-                    "url": f"{Config.EGP_BASE}/sourcing/{tender_id}",
-                }
-            )
-
-    log.info("eGP: collected %d candidates", len(candidates))
-    return candidates
-
-
-# --------------------------------------------------------------------------
-# 2merkato engine -- Playwright, keyword-driven search, closed-status check
-# --------------------------------------------------------------------------
-def scrape_2merkato() -> list:
-    candidates = []
-    seen_ids_this_run = set()
-
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        context = browser.new_context()
-        page = context.new_page()
-
-        try:
-            if Config.MERKATO_USERNAME and Config.MERKATO_PASSWORD:
-                page.goto(f"{Config.MERKATO_BASE}/login", timeout=30000)
-                page.fill("input[name='username']", Config.MERKATO_USERNAME)
-                page.fill("input[name='password']", Config.MERKATO_PASSWORD)
-                page.click("button[type='submit']")
-                page.wait_for_load_state("networkidle")
-
-            for term in Config.MERKATO_SEARCH_TERMS:
-                try:
-                    search_url = f"{Config.MERKATO_BASE}/search?q={requests.utils.quote(term)}"
-                    page.goto(search_url, timeout=30000)
-                    page.wait_for_load_state("networkidle")
-
-                    rows = page.query_selector_all("div.tender-item, tr.tender-row")
-                    for row in rows:
-                        status_badge = row.query_selector(".status-badge, .badge-closed")
-                        if status_badge:
-                            status_text = (status_badge.inner_text() or "").strip().lower()
-                            if "closed" in status_text:
-                                continue
-
-                        title_el = row.query_selector("a.tender-title, a")
-                        if not title_el:
-                            continue
-                        title = (title_el.inner_text() or "").strip()
-                        href = title_el.get_attribute("href") or ""
-                        tender_id = re.sub(r"\W+", "-", href.strip("/"))[:80] or title[:40]
-
-                        if not tender_id or tender_id in seen_ids_this_run:
-                            continue
-
-                        detail_el = row.query_selector(".tender-detail, .description")
-                        detail_text = (detail_el.inner_text().strip() if detail_el else title)
-
-                        if not is_relevant_tender(title, detail_text):
-                            continue
-
-                        seen_ids_this_run.add(tender_id)
-                        candidates.append(
-                            {
-                                "id": f"merkato-{tender_id}",
-                                "source": "2merkato",
-                                "title": title,
-                                "detail_text": detail_text,
-                                "closing_date": "",
-                                "url": href if href.startswith("http") else f"{Config.MERKATO_BASE}{href}",
-                            }
-                        )
-                except Exception as e:
-                    log.warning("2merkato search failed for term '%s': %s", term, e)
-                    continue
-        finally:
-            context.close()
-            browser.close()
-
-    log.info("2merkato: collected %d candidates", len(candidates))
-    return candidates
-
-
-# --------------------------------------------------------------------------
-# WhatsApp via Evolution API -- one message per matched tender
-# --------------------------------------------------------------------------
-def send_whatsapp_message(phone_number: str, text: str) -> bool:
-    url = f"{Config.EVOLUTION_API_URL}/message/sendText/{Config.EVOLUTION_INSTANCE}"
-    headers = {"apikey": Config.EVOLUTION_API_KEY, "Content-Type": "application/json"}
-    payload = {"number": phone_number, "text": text}
-    try:
-        resp = requests.post(url, headers=headers, json=payload, timeout=20)
-        resp.raise_for_status()
-        return True
-    except Exception as e:
-        log.error("WhatsApp send failed for %s: %s", mask_phone(phone_number), e)
-        return False
-
-
-def notify_tender(tender: dict, verdict: dict):
-    message = (
-        f"\U0001F4E2 *New Tender Match*\n\n"
-        f"*Title:* {tender['title']}\n"
-        f"*Source:* {tender['source']}\n"
-        f"*Closing Date:* {verdict.get('closing_date') or tender.get('closing_date') or 'N/A'}\n"
-        f"*Why it matched:* {verdict.get('reason', '')}\n"
-        f"*Constraints:* {verdict.get('constraints') or 'N/A'}\n"
-        f"*Link:* {tender.get('url', 'N/A')}"
-    )
-    for phone in Config.NOTIFY_PHONE_NUMBERS:
-        send_whatsapp_message(phone, message)
-
-
-def send_status_report(summary: str):
-    for phone in Config.NOTIFY_PHONE_NUMBERS:
-        send_whatsapp_message(phone, summary)
-
-
-# --------------------------------------------------------------------------
-# Core scan loop
-# --------------------------------------------------------------------------
-def run_scan() -> dict:
-    log.info("=== Starting scan cycle ===")
-    all_candidates = []
-
-    for engine_name, engine_fn in (
-        ("eGP", scrape_egp),
-        ("2merkato", scrape_2merkato),
-    ):
-        try:
-            all_candidates.extend(engine_fn())
-        except Exception as e:
-            log.error("%s engine crashed: %s", engine_name, e)
-
-    # Filter out tenders already seen (regardless of prior verdict).
-    new_candidates = [t for t in all_candidates if not db.is_seen(t["id"])]
-    log.info(
-        "Total candidates: %d, new (unseen) candidates: %d",
-        len(all_candidates),
-        len(new_candidates),
-    )
-
-    matched_count = 0
-    if new_candidates:
-        verdicts = ai_filter_batch(new_candidates)
-        for tender in new_candidates:
-            verdict = verdicts.get(tender["id"].split("-", 1)[-1]) or verdicts.get(tender["id"]) or {}
-            is_match = bool(verdict.get("relevant"))
-
-            # Mark as seen immediately regardless of verdict, to avoid
-            # re-spending AI quota re-evaluating the same tender later.
-            db.mark_seen(tender["id"], tender["source"], tender["title"], is_match)
-
-            if is_match:
-                matched_count += 1
-                notify_tender(tender, verdict)
-
-    summary = (
-        f"Tender scan complete. {len(all_candidates)} candidates checked, "
-        f"{len(new_candidates)} new, {matched_count} matched."
-        if matched_count
-        else f"Tender scan complete. No new matching tenders "
-        f"({len(new_candidates)} new candidates evaluated, none relevant)."
-    )
-    log.info(summary)
-    return {
-        "total_candidates": len(all_candidates),
-        "new_candidates": len(new_candidates),
-        "matched": matched_count,
-        "summary": summary,
-    }
-
-
-def scheduler_loop():
-    interval_seconds = Config.SCAN_INTERVAL_HOURS * 3600
-    while True:
-        try:
-            run_scan()
-        except Exception as e:
-            log.error("Scheduled scan failed: %s", e)
-        time.sleep(interval_seconds)
-
-
-# --------------------------------------------------------------------------
-# Flask app
-# --------------------------------------------------------------------------
 app = Flask(__name__)
 
+# ================== CONFIGURATION ==================
+EVOLUTION_BASE = os.environ.get("EVOLUTION_BASE", "https://medmetric-evolution.onrender.com")
+INSTANCE_NAME = os.environ.get("INSTANCE_NAME", "Tender-Notifier.")
 
-@app.route("/")
-def index():
-    return jsonify(
-        {
-            "service": "Medmetric Tender Notifier",
-            "status": "running",
-            "scan_interval_hours": Config.SCAN_INTERVAL_HOURS,
-        }
-    )
+# SECURITY: no hardcoded fallback — a real API key must never live in source
+# code, especially in a public repo. If it's missing, we log a clear warning
+# at startup rather than silently sending requests with an empty key.
+GLOBAL_API_KEY = os.environ.get("GLOBAL_API_KEY")
+if not GLOBAL_API_KEY:
+    print("⚠️ GLOBAL_API_KEY is not set — WhatsApp sends will fail until it's configured in Render's environment variables.", flush=True)
+
+# SECURITY/PRIVACY: no hardcoded phone number — recipients must be supplied
+# via the WHATSAPP_NUMBERS env var (comma-separated).
+WHATSAPP_NUMBERS = [
+    n.strip() for n in os.environ.get("WHATSAPP_NUMBERS", "").split(",") if n.strip()
+]
+if not WHATSAPP_NUMBERS:
+    print("⚠️ WHATSAPP_NUMBERS is not set — no recipients configured.", flush=True)
+
+# Shared secret required to trigger a manual scan via /test-check. Without
+# this, anyone who discovers the public Render URL could trigger scans on
+# demand, burning your Groq quota and spamming your WhatsApp numbers.
+TEST_CHECK_TOKEN = os.environ.get("TEST_CHECK_TOKEN")
+
+MERKATO_USER = os.environ.get("MERKATO_USER")
+MERKATO_PASS = os.environ.get("MERKATO_PASS")
+
+# CORRECT domain — the working tenders app, not www.2merkato.com
+MERKATO_BASE = "https://tender.2merkato.com"
+MERKATO_LOGIN_URL = f"{MERKATO_BASE}/login"
+MERKATO_TENDERS_URL = f"{MERKATO_BASE}/tenders"
+MERKATO_MAX_PAGES = int(os.environ.get("MERKATO_MAX_PAGES", "4"))
+
+# The eGP domain has moved/varied before (production.egp.gov.et vs plain
+# egp.gov.et, and there's a real chance it could live at something like
+# egp.ppa.gov.et in the future). Making this a single env-var-driven
+# constant means switching domains is a Render dashboard change, not a
+# code change — every URL below (login, bids listing, home-navigation
+# recovery, detail-page link resolution) derives from this one value.
+# .rstrip("/") guards against a trailing slash in the env var producing
+# doubled slashes in every derived URL below (e.g. "https://egp.gov.et/"
+# + "/egp/login" would otherwise become ".../egp.gov.et//egp/login").
+EGP_BASE = os.environ.get("EGP_BASE", "https://production.egp.gov.et").rstrip("/")
+EGP_LOGIN_URL = f"{EGP_BASE}/egp/login"
+EGP_BIDS_URL = f"{EGP_BASE}/egp/bids/all"
+EGP_USER = os.environ.get("EGP_USER")
+EGP_PASS = os.environ.get("EGP_PASS")
+EGP_ORG_NAME = os.environ.get("EGP_ORG_NAME", "medMETRIC Healthcare Service PLC")
+
+# OpenID Connect / IdentityServer settings discovered from the frontend bundle
+# and /.well-known/openid-configuration. The SPA itself uses the password grant
+# with these exact client credentials, so we can do the same and completely
+# bypass the browser-based login (and the inspect-not-allowed protection).
+EGP_TOKEN_URL = f"{EGP_BASE}/auth/connect/token"
+EGP_CLIENT_ID = os.environ.get("EGP_CLIENT_ID", "skoruba_identity_admin")
+EGP_CLIENT_SECRET = os.environ.get("EGP_CLIENT_SECRET", "skoruba_admin_client_secret")
+EGP_SCOPES = "openid profile email roles erp_api offline_access"
+
+# Search terms fed one at a time into eGP's own built-in table search box —
+# far more reliable than scraping every row across 13+ pages.
+# Rebuilt around medMETRIC's actual service lines (medmetrichealthcare.com):
+# maintenance/service contracts, RO water treatment, CSSD/sterilization,
+# and calibration — not just dialysis. "laboratory" intentionally dropped —
+# lab-only tenders are explicitly out of scope.
+EGP_SEARCH_TERMS = [
+    "Procurement of Maintenance and Repair Service", "Procurement of Medical Equipment and Supplies", "hemodialysis", "dialysis",
+    "medical equipment", "sterilization", "water treatment", "Reverse osmosis", "filters",
+    "x-ray", "ultrasound", "medical imaging", "membrane", "ICB", "International Competitive Bid",
+    "B Braun", "Dialog+", "ዲያሊሲስ",
+]
+
+# Search terms fed one at a time into 2merkato's own "Search by keyword" filter
+# panel — mirrors the EGP_SEARCH_TERMS approach above. 2merkato's general
+# listing has 25,000+ pages, so paging through the first few of those (the
+# old approach) only ever saw whatever happened to be posted most recently
+# across ALL categories, not specifically medical/biomedical tenders. Reusing
+# the site's own keyword search narrows results down to a handful of pages
+# per term, the same way it does on eGP.
+MERKATO_SEARCH_TERMS = [
+    "hemodialysis", "dialysis", "medical equipment", "sterilization",
+    "water treatment", "reverse osmosis", "x-ray", "ultrasound",
+    "medical imaging", "biomedical", "CSSD", "autoclave", "ICB",
+    "medical equipment maintenance", "hospital equipment",
+    "B Braun", "Dialog+", "ዲያሊሲስ",
+]
+
+# How many result pages to walk PER search term (not per whole catalog) —
+# a filtered keyword search returns far fewer pages than the full listing,
+# so a small number here is plenty and keeps the scan fast.
+MERKATO_MAX_PAGES_PER_TERM = int(os.environ.get("MERKATO_MAX_PAGES_PER_TERM", "3"))
+
+# Any ONE of these alone is specific enough to trigger a match.
+# Includes medMETRIC's actual named service lines (CSSD, RO/water treatment,
+# calibration, spare parts, biomedical engineering) so tenders aren't
+# under-scored just because they're not dialysis-specific.
+STRONG_KEYWORDS = [
+    "ICB", "hemodialysis", "dialysis", "bbraun", "philips", "SWS",
+    "x-ray", "xray", "ultrasound", "CT Scan", "autoclave", "Water treatment",
+    "Procurement of Maintenance and Repair Service", "cssd", "Procurement of Medical Equipment and Supplies",
+    "reverse osmosis", "ro system", "SPHMMC", "technical service",
+    "biomedical engineering", "medical imaging", "calibration",
+    "EPSA", "medical equipment", "hospital equipment",
+    "medical device", "የህክምና ጥገና",
+]
+
+# Generic medical-adjacent words — only count if paired with an equipment/
+# procurement-type word in the same title (avoids matching HR/insurance/
+# consulting tenders that merely mention "health"). "laboratory" removed —
+# lab-only tenders are handled by HARD_EXCLUDE_TERMS below instead.
+MEDICAL_CONTEXT = ["medical", "health", "hospital", "biomedical", "clinical"]
+EQUIPMENT_CONTEXT = ["equipment", "supplies", "supply", "device", "machine",
+                     "ICB", "corrective maintenance", "maintenance", "repair", "procurement of medical equipment",
+                     "calibration", "medical equipment installation", "servicing",
+                     "Maintenance and Repair Service", "medical consultancy" ]
+
+# Always excluded regardless of context — these categories are never
+# relevant to Medmetric no matter what else appears in the title.
+# Laboratory-only tenders and pure medicine/pharmaceutical supply tenders
+# (e.g. "RDF Medicines...") are explicitly out of scope — medMETRIC is a
+# biomedical engineering/technical-service company, not a drug supplier.
+HARD_EXCLUDE_TERMS = [
+    "vehicle", "toyota", "car ", "motorbike", "insurance", "life insurance",
+    "term life", "gpa", "spare part", "construction","road"
+    "laboratory", "lab reagent", "reagent", "lab equipment",
+    "medicine", "medicines", "pharmaceutical", "pharmaceuticals",
+    "drug", "drugs", "vaccine", "vaccines", "rdf medicine", "rdf medicines"
+]
+
+# Excluded UNLESS the title also shows clear medical + equipment context —
+# generic "consultancy services" for HR/finance/etc. should be skipped, but
+# "medical equipment consultancy services" should NOT be, since Medmetric
+# offers exactly that
+CONTEXTUAL_EXCLUDE_TERMS = ["car", "consulting firm"]
 
 
-@app.route("/health")
-def health():
-    return jsonify({"status": "ok"})
+def is_relevant_tender(title):
+    title_lower = title.lower()
+
+    if any(term in title_lower for term in HARD_EXCLUDE_TERMS):
+        return False
+
+    has_medical_context = any(term in title_lower for term in MEDICAL_CONTEXT)
+    has_equipment_context = any(term in title_lower for term in EQUIPMENT_CONTEXT)
+
+    if any(term in title_lower for term in CONTEXTUAL_EXCLUDE_TERMS):
+        if not (has_medical_context and has_equipment_context):
+            return False
+        # else: it's medical-equipment consultancy — fall through, don't exclude
+
+    if any(term in title_lower for term in STRONG_KEYWORDS):
+        return True
+
+    return has_medical_context and has_equipment_context
 
 
-@app.route("/test-check")
-def test_check():
-    token = request.args.get("token", "")
-    if not Config.TEST_CHECK_TOKEN or not hmac.compare_digest(token, Config.TEST_CHECK_TOKEN):
-        return jsonify({"error": "unauthorized"}), 401
-    result = run_scan()
-    return jsonify(result)
+# ==================== PERSISTENT DEDUP (Postgres) ====================
+DATABASE_URL = os.environ.get("DATABASE_URL")
+
+# Reuse a single connection across the whole scan instead of opening/closing
+# a new one per tender — repeated SSL handshakes were adding real memory/CPU
+# overhead on Render's free tier and were the likely cause of the scan
+# stalling or getting silently killed partway through page 1.
+_db_conn = None
 
 
-def start_background_scheduler():
-    thread = threading.Thread(target=scheduler_loop, daemon=True)
-    thread.start()
-    log.info("Background scheduler started (interval: %sh)", Config.SCAN_INTERVAL_HOURS)
+def get_db_connection():
+    global _db_conn
+    if _db_conn is not None:
+        try:
+            # Cheap liveness check — reuse the connection if it's still good
+            cur = _db_conn.cursor()
+            cur.execute("SELECT 1")
+            cur.close()
+            return _db_conn
+        except Exception:
+            try:
+                _db_conn.close()
+            except Exception:
+                pass
+            _db_conn = None
 
+    _db_conn = psycopg2.connect(DATABASE_URL, sslmode="require", connect_timeout=10)
+    return _db_conn
+
+
+def init_db():
+    """Run once at startup to ensure the dedup table exists."""
+    if not DATABASE_URL:
+        print("⚠️ DATABASE_URL not set — falling back to in-memory dedup (will reset on restart)", flush=True)
+        return
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS notified_tenders (
+                tender_id TEXT PRIMARY KEY,
+                notified_at TIMESTAMP DEFAULT NOW()
+            )
+        """)
+        conn.commit()
+        cur.close()
+        print("✅ Connected to Postgres and verified notified_tenders table", flush=True)
+    except Exception as e:
+        print(f"❌ Postgres init failed, falling back to in-memory dedup: {e}", flush=True)
+
+
+# In-memory fallback used only if DATABASE_URL is missing or unreachable —
+# keeps the app functional (just without persistence) rather than crashing
+_MEMORY_FALLBACK = set()
+
+
+def is_already_notified(tender_id: str) -> bool:
+    if not DATABASE_URL:
+        return tender_id in _MEMORY_FALLBACK
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT 1 FROM notified_tenders WHERE tender_id = %s", (tender_id,))
+        result = cur.fetchone()
+        cur.close()
+        return result is not None
+    except Exception as e:
+        print(f"⚠️ DB check failed for {tender_id}, using memory fallback: {e}", flush=True)
+        return tender_id in _MEMORY_FALLBACK
+
+
+def mark_as_notified(tender_id: str):
+    if not DATABASE_URL:
+        _MEMORY_FALLBACK.add(tender_id)
+        return
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO notified_tenders (tender_id) VALUES (%s) ON CONFLICT DO NOTHING",
+            (tender_id,)
+        )
+        conn.commit()
+        cur.close()
+    except Exception as e:
+        print(f"⚠️ DB insert failed for {tender_id}, using memory fallback: {e}", flush=True)
+        _MEMORY_FALLBACK.add(tender_id)
+
+
+def send_whatsapp(message):
+    if not GLOBAL_API_KEY or not WHATSAPP_NUMBERS:
+        print("❌ Cannot send WhatsApp message: GLOBAL_API_KEY or WHATSAPP_NUMBERS is not configured.", flush=True)
+        return
+
+    url = f"{EVOLUTION_BASE}/message/sendText/{INSTANCE_NAME}"
+    headers = {"Content-Type": "application/json", "apikey": GLOBAL_API_KEY}
+    for number in WHATSAPP_NUMBERS:
+        payload = {"number": number, "text": message}
+        try:
+            r = requests.post(url, json=payload, headers=headers, timeout=10)
+            # PRIVACY: mask most of the phone number in logs rather than
+            # printing it in full — logs can end up shared/exported more
+            # widely than intended
+            masked = number[:5] + "***" + number[-2:] if len(number) > 7 else "***"
+            print(f"✅ WhatsApp Status ({masked}): {r.status_code}", flush=True)
+        except Exception as e:
+            print(f"❌ Send error: {e}", flush=True)
+
+
+
+# ==================== ENGINE: 2MERKATO (Playwright) ====================
+def scrape_2merkato(candidates: list):
+    print(f"[{datetime.now()}] 🔍 Running 2merkato Engine (Playwright)...", flush=True)
+    found = 0
+
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-dev-shm-usage"]
+            )
+            context = browser.new_context(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+            )
+            page = context.new_page()
+
+            # --- Login (optional — only if credentials provided) ---
+            if MERKATO_USER and MERKATO_PASS:
+                try:
+                    page.goto(MERKATO_LOGIN_URL, timeout=30000, wait_until="domcontentloaded")
+                    page.wait_for_selector("input[type='password']", timeout=20000)
+
+                    field_info = page.eval_on_selector_all(
+                        "input",
+                        "els => els.map(e => ({type: e.type, name: e.name, id: e.id, placeholder: e.placeholder}))"
+                    )
+                    print(f"🔎 Login page input fields detected: {field_info}", flush=True)
+
+                    email_field = page.locator(
+                        "input[type='email'], input[name*='email' i], input[name*='user' i], "
+                        "input[id*='email' i], input[id*='user' i], input[placeholder*='email' i]"
+                    ).first
+                    pass_field = page.locator("input[type='password']").first
+
+                    if email_field.count() > 0 and pass_field.count() > 0:
+                        email_field.fill(MERKATO_USER)
+                        pass_field.fill(MERKATO_PASS)
+
+                        submit_btn = page.locator(
+                            "button[type='submit'], button:has-text('Login'), button:has-text('Sign in'), "
+                            "button:has-text('Log in'), input[type='submit']"
+                        ).first
+                        submit_btn.click()
+                        page.wait_for_timeout(4000)
+                        print(f"✅ Submitted login, current URL: {page.url}", flush=True)
+                    else:
+                        print(f"⚠️ Could not confidently identify email/username field among: {field_info}", flush=True)
+                except Exception as e:
+                    print(f"⚠️ Login attempt failed, continuing without auth: {e}", flush=True)
+
+            page.goto(MERKATO_TENDERS_URL, timeout=30000, wait_until="domcontentloaded")
+            page.wait_for_timeout(2000)
+
+            search_input = page.locator(
+                "input[placeholder*='Search by keyword' i], input[placeholder*='keyword' i]"
+            ).first
+
+            if search_input.count() == 0:
+                header_clickables = page.eval_on_selector_all(
+                    "header *, nav *",
+                    "els => els.slice(0, 40).map(e => ({tag: e.tagName, "
+                    "aria: e.getAttribute('aria-label'), cls: e.className, "
+                    "text: (e.innerText || '').trim().slice(0, 30)}))"
+                )
+                print(f"🔎 2merkato search input not immediately visible. Header elements: {header_clickables}", flush=True)
+
+                toggle = page.locator(
+                    "[aria-label*='search' i], button:has-text('Search'), "
+                    "header svg, nav svg, [class*='search-icon' i], [class*='search-toggle' i]"
+                ).first
+                if toggle.count() > 0:
+                    try:
+                        toggle.click(timeout=5000)
+                        page.wait_for_timeout(1000)
+                        print("✅ Clicked a probable search-toggle icon in the header", flush=True)
+                    except Exception as e:
+                        print(f"⚠️ Could not click search-toggle candidate: {e}", flush=True)
+
+                search_input = page.locator(
+                    "input[placeholder*='Search by keyword' i], input[placeholder*='keyword' i]"
+                ).first
+
+            if search_input.count() == 0:
+                print("❌ 2merkato search-by-keyword input never appeared — falling back to the old first-page listing so this scan isn't a total loss.", flush=True)
+                links = page.locator("a[href*='/tenders/']").all()
+                print(f"Fallback listing page: found {len(links)} raw tender links", flush=True)
+                found += _process_merkato_links(links, context, candidates, seen_this_scan=set())
+                browser.close()
+                print(f"2merkato engine complete. Collected {found} candidate matches for AI review.", flush=True)
+                return found
+
+            print("✅ Found 2merkato 'Search by keyword' input — proceeding with keyword-driven search", flush=True)
+
+            seen_this_scan = set()
+            for term in MERKATO_SEARCH_TERMS:
+                try:
+                    if search_input.count() == 0 or not search_input.is_visible():
+                        toggle = page.locator(
+                            "[aria-label*='search' i], button:has-text('Search'), "
+                            "header svg, nav svg, [class*='search-icon' i], [class*='search-toggle' i]"
+                        ).first
+                        if toggle.count() > 0:
+                            try:
+                                toggle.click(timeout=5000)
+                                page.wait_for_timeout(1000)
+                            except Exception:
+                                pass
+                        search_input = page.locator(
+                            "input[placeholder*='Search by keyword' i], input[placeholder*='keyword' i]"
+                        ).first
+
+                    search_input.click()
+                    search_input.fill("")
+                    page.wait_for_timeout(200)
+                    search_input.fill(term)
+
+                    url_before = page.url
+                    search_input.press("Enter")
+                    page.wait_for_timeout(2000)
+
+                    if page.url == url_before:
+                        filter_btn = page.locator("button:has-text('Filter')").first
+                        if filter_btn.count() > 0:
+                            try:
+                                filter_btn.click(timeout=5000, force=True)
+                            except Exception as e:
+                                print(f"⚠️ Forced Filter click also failed for '{term}': {e}", flush=True)
+
+                    page.wait_for_timeout(2500)
+                    print(f"➡️ 2merkato search '{term}' submitted, current URL: {page.url}", flush=True)
+
+                    for page_num in range(1, MERKATO_MAX_PAGES_PER_TERM + 1):
+                        if page_num > 1:
+                            next_btn = page.locator(
+                                "button:has-text('Next'), a:has-text('Next'), [aria-label*='next' i]"
+                            ).first
+                            if next_btn.count() == 0:
+                                break
+                            try:
+                                next_btn.click(timeout=5000)
+                                page.wait_for_timeout(2000)
+                            except Exception:
+                                break
+
+                        links = page.locator("a[href*='/tenders/']").all()
+                        print(f"2merkato search '{term}' page {page_num}: found {len(links)} raw tender links", flush=True)
+                        if not links:
+                            break
+
+                        found += _process_merkato_links(links, context, candidates, seen_this_scan)
+
+                except Exception as e:
+                    print(f"⚠️ 2merkato search for '{term}' failed: {e}", flush=True)
+                    continue
+
+            browser.close()
+
+        print(f"2merkato engine complete. Collected {found} candidate matches for AI review.", flush=True)
+        return found
+
+    except Exception as e:
+        print(f"❌ 2merkato extraction engine down: {e}", flush=True)
+        return 0
+
+
+def _get_merkato_card_status(link) -> str:
+    try:
+        container = link.locator("xpath=ancestor::*[contains(., 'Bidding')][1]").first
+        if container.count() == 0:
+            return "unknown"
+        card_text = container.inner_text(timeout=3000)
+    except Exception:
+        return "unknown"
+
+    lower = card_text.lower()
+    idx = lower.find("bidding")
+    if idx == -1:
+        return "unknown"
+    window = lower[idx: idx + 40]
+    if "closed" in window:
+        return "closed"
+    if "open" in window:
+        return "open"
+    return "unknown"
+
+
+def _process_merkato_links(links, context, candidates: list, seen_this_scan: set) -> int:
+    found = 0
+    for link in links:
+        try:
+            title_text = link.inner_text().strip()
+            href = link.get_attribute("href")
+            if not title_text or not href:
+                continue
+
+            full_link = href if href.startswith("http") else f"{MERKATO_BASE}{href}"
+
+            if full_link in seen_this_scan:
+                continue
+            seen_this_scan.add(full_link)
+
+            if is_relevant_tender(title_text):
+                tender_id = f"merkato_{full_link.rstrip('/').split('/')[-1]}"
+                if not is_already_notified(tender_id):
+                    status = _get_merkato_card_status(link)
+                    if status == "closed":
+                        print(f"⏭️ Skipping closed 2merkato tender (Bidding: Closed): {title_text}", flush=True)
+                        mark_as_notified(tender_id)
+                        continue
+
+                    mark_as_notified(tender_id)
+                    found += 1
+
+                    detail_text = ""
+                    detail_page = None
+                    try:
+                        detail_page = context.new_page()
+                        detail_page.goto(full_link, timeout=20000, wait_until="domcontentloaded")
+                        try:
+                            detail_page.wait_for_load_state("networkidle", timeout=10000)
+                        except Exception:
+                            pass
+                        for poll_attempt in range(5):
+                            detail_page.wait_for_timeout(1000)
+                            try:
+                                candidate_text = detail_page.locator("body").inner_text(timeout=5000)
+                            except Exception:
+                                candidate_text = ""
+                            if len(candidate_text) > 300:
+                                detail_text = candidate_text
+                                break
+                            detail_text = candidate_text
+                        detail_text = detail_text[:6000]
+                        print(f"📄 Captured {len(detail_text)} chars from 2merkato detail page", flush=True)
+                    except Exception as e:
+                        print(f"⚠️ Could not read 2merkato detail page text: {e}", flush=True)
+                    finally:
+                        if detail_page is not None:
+                            try:
+                                detail_page.close()
+                            except Exception:
+                                pass
+
+                    candidates.append({
+                        "id": tender_id,
+                        "source": "2merkato",
+                        "title": title_text,
+                        "ref_no": "",
+                        "detail_text": detail_text,
+                        "link": full_link,
+                    })
+        except Exception:
+            continue
+    return found
+
+
+
+def _egp_api_get(path_and_query: str, timeout: int = 30):
+    """GET from the public eGP gateway (/po-gw/...). Returns parsed JSON or None."""
+    url = f"{EGP_BASE}/po-gw{path_and_query}" if path_and_query.startswith("/") else f"{EGP_BASE}/po-gw/{path_and_query}"
+    try:
+        r = requests.get(url, timeout=timeout, verify=False)
+        if r.status_code != 200:
+            print(f"⚠️ eGP API {r.status_code} for {path_and_query[:80]}", flush=True)
+            return None
+        return r.json()
+    except Exception as e:
+        print(f"⚠️ eGP API error for {path_and_query[:60]}: {e}", flush=True)
+        return None
+
+
+def _egp_build_detail_text(item: dict) -> str:
+    """Build a text snippet the AI can use from the rich API item (no detail-page fetch needed)."""
+    parts = []
+    parts.append(f"Title: {item.get('lotName', '')}")
+    parts.append(f"Description: {item.get('lotDescription', '')}")
+    parts.append(f"Reference: {item.get('procurementReferenceNo') or item.get('lotReferenceNo', '')}")
+    parts.append(f"Category: {item.get('procurementCategory', '')}")
+    parts.append(f"Method: {item.get('method', '')}")
+    parts.append(f"Market: {item.get('marketPlace', '')}")
+    parts.append(f"Procuring Entity: {item.get('procuringEntity', '')}")
+    parts.append(f"Submission Deadline / Closing Date: {item.get('submissionDeadline', '')}")
+    parts.append(f"Invitation Date: {item.get('invitationDate', '')}")
+    parts.append(f"Is Submittable: {item.get('isSubmittable', '')}")
+
+    pkg = item.get("packageInformation") or {}
+    if pkg:
+        parts.append(f"Package Name: {pkg.get('name', '')}")
+        parts.append(f"Package Description: {pkg.get('description', '')}")
+        parts.append(f"Procurement Method: {pkg.get('procurement_method', '')}")
+        parts.append(f"Procurement Type: {pkg.get('procurement_type', '')}")
+        parts.append(f"Award Type: {pkg.get('award_type', '')}")
+        parts.append(f"Bid Security Amount: {pkg.get('bid_security_amount', '')}")
+        parts.append(f"Bid Security Form: {pkg.get('bid_security_form', '')}")
+        parts.append(f"Package Submission Deadline: {pkg.get('submission_deadline', '')}")
+        parts.append(f"Clarification Deadline: {pkg.get('clarification_deadline', '')}")
+        addr = pkg.get("address") or {}
+        if addr:
+            parts.append(f"Location: {addr.get('town', '')}, {addr.get('street', '')}")
+
+    return "\n".join(p for p in parts if p and not p.endswith(": "))
+
+
+def _egp_worker(result_queue):
+    local_candidates = []
+    try:
+        found = scrape_egp(local_candidates)
+        result_queue.put({"error": None, "candidates": local_candidates, "found": found})
+    except Exception as e:
+        result_queue.put({"error": str(e), "candidates": local_candidates, "found": 0})
+
+
+def run_egp_with_timeout(candidates: list, timeout_seconds: int = 600) -> int:
+    """Runs the eGP engine in its own process with a hard wall-clock timeout."""
+    ctx = multiprocessing.get_context("spawn")
+    result_queue = ctx.Queue()
+    proc = ctx.Process(target=_egp_worker, args=(result_queue,))
+    proc.start()
+    proc.join(timeout=timeout_seconds)
+
+    if proc.is_alive():
+        print(f"⏱️ eGP engine exceeded {timeout_seconds}s and appears hung — terminating it so the rest of the scan cycle isn't blocked. Will retry next cycle.", flush=True)
+        proc.terminate()
+        proc.join(timeout=10)
+        if proc.is_alive():
+            proc.kill()
+            proc.join()
+        return 0
+
+    try:
+        result = result_queue.get_nowait()
+    except Exception:
+        print("⚠️ eGP worker process exited without returning a result (likely crashed before reporting back).", flush=True)
+        return 0
+
+    if result["error"]:
+        print(f"❌ eGP engine failed in subprocess: {result['error']}", flush=True)
+
+    candidates.extend(result["candidates"])
+    return result["found"]
+
+
+# ==================== ENGINE: eGP (API — no browser) ====================
+def scrape_egp(candidates: list):
+    """
+    Scrape eGP via the public /po-gw/cms-v2/api/sourcing/get-sourcing API.
+
+    Playwright is intentionally NOT used here: the site detects CDP/automation
+    and redirects every browser session to /egp/inspect-not-allowed. The
+    sourcing API is public (no login required) and already returns title,
+    reference, closing date, bid security, description, and procuring entity.
+    """
+    print(f"[{datetime.now()}] 🔍 Running eGP Engine (API)...", flush=True)
+    found = 0
+    seen_this_scan = set()
+
+    # How many results to pull per search term
+    TOP_PER_TERM = int(os.environ.get("EGP_TOP_PER_TERM", "25"))
+
+    try:
+        for term in EGP_SEARCH_TERMS:
+            try:
+                # API supports ?search= and ?top=
+                from urllib.parse import quote
+                q = quote(term)
+                data = _egp_api_get(f"/cms-v2/api/sourcing/get-sourcing?search={q}&top={TOP_PER_TERM}")
+                if not data or "items" not in data:
+                    print(f"eGP search '{term}': no data", flush=True)
+                    continue
+
+                items = data.get("items") or []
+                total = data.get("total", len(items))
+                print(f"eGP search '{term}': {len(items)} items (total matching ~{total})", flush=True)
+
+                for item in items:
+                    try:
+                        title_text = (item.get("lotName") or "").strip()
+                        ref_no = (item.get("procurementReferenceNo") or item.get("lotReferenceNo") or "").strip()
+                        if not title_text:
+                            continue
+
+                        row_key = ref_no or item.get("id") or title_text
+                        if row_key in seen_this_scan:
+                            continue
+                        seen_this_scan.add(row_key)
+
+                        if not is_relevant_tender(title_text):
+                            continue
+
+                        # Skip expired / past deadlines (API returns historical tenders too)
+                        deadline = item.get("submissionDeadline") or ""
+                        if deadline:
+                            try:
+                                # e.g. 2025-04-30T14:30:00+03:00
+                                dl = datetime.fromisoformat(deadline.replace("Z", "+00:00"))
+                                now = datetime.now(timezone.utc)
+                                if dl.tzinfo is None:
+                                    # assume Africa/Addis_Ababa (+03) if naive
+                                    dl = dl.replace(tzinfo=timezone(timedelta(hours=3)))
+                                if dl < now:
+                                    continue  # closed — do not alert
+                            except Exception:
+                                pass  # if unparseable, keep and let AI/user decide
+
+                        tender_id = f"egp_{ref_no or item.get('id') or title_text}"
+                        if is_already_notified(tender_id):
+                            continue
+
+                        mark_as_notified(tender_id)
+                        found += 1
+
+                        detail_text = _egp_build_detail_text(item)
+                        package_id = item.get("packageId") or ""
+                        if package_id:
+                            detail_link = f"{EGP_BASE}/egp/bids/all?packageId={package_id}"
+                        else:
+                            detail_link = f"{EGP_BASE}/egp/bids/all"
+
+                        print(f"📄 eGP candidate: {title_text[:70]} | deadline={deadline}", flush=True)
+
+                        candidates.append({
+                            "id": tender_id,
+                            "source": "egp",
+                            "title": title_text,
+                            "ref_no": ref_no,
+                            "detail_text": detail_text[:6000],
+                            "link": detail_link,
+                        })
+                    except Exception:
+                        continue
+
+                time.sleep(0.5)  # be polite between search terms
+
+            except Exception as e:
+                print(f"⚠️ eGP search for '{term}' failed: {e}", flush=True)
+                continue
+
+        print(f"eGP engine complete. Collected {found} candidate matches for AI review.", flush=True)
+        return found
+
+    except Exception as e:
+        print(f"❌ eGP extraction engine down: {e}", flush=True)
+        return 0
+
+
+def check_for_tenders():
+    print("=================== STARTING SCAN CYCLE ===================", flush=True)
+
+    candidates = []  # populated by both scrapers; analyzed in ONE batch AI call below
+
+    try:
+        merkato_found = scrape_2merkato(candidates)
+    except Exception:
+        print("❌ 2merkato engine crashed with an unhandled exception:", flush=True)
+        print(traceback.format_exc(), flush=True)
+        merkato_found = 0
+
+    try:
+        # API-based eGP does not hang like the old Playwright path, so run
+        # in-process to guarantee candidates are returned (subprocess timeout
+        # previously killed a successful 182-item collection before results
+        # could be passed back to the parent).
+        egp_found = scrape_egp(candidates)
+    except Exception:
+        print("❌ eGP engine crashed with an unhandled exception:", flush=True)
+        print(traceback.format_exc(), flush=True)
+        egp_found = 0
+
+    print(f"🧮 {len(candidates)} total candidate tenders collected ({merkato_found} 2merkato, {egp_found} eGP) — running one batch AI review", flush=True)
+
+    total_sent = 0
+    if candidates:
+        # ONE (or a handful of) Groq call(s) for the entire scan cycle, covering
+        # every candidate from both engines — instead of the old per-tender
+        # approach that could burn a day's free-tier quota in a single scan.
+        # NOTE: this only batches the AI ANALYSIS step, not the WhatsApp
+        # notifications — each tender still gets sent as its own message
+        # below, since that's easier to read/forward than one long combined
+        # message.
+        batch_results = batch_analyze_tenders(candidates)
+
+        for i, c in enumerate(candidates):
+            result = batch_results.get(i) if batch_results is not None else None
+
+            if batch_results is None:
+                # The whole batch call failed even after retries (e.g. quota
+                # exhausted). Fall back to sending everything that passed the
+                # keyword filter, clearly flagged as unverified, rather than
+                # silently dropping legitimate tenders.
+                is_relevant = True
+                match_score = "?"
+                reason = "AI batch analysis unavailable — keyword match only"
+                procurement_object = ""
+                constraints = "Unknown — AI unavailable"
+                closing_date = "Unknown — AI unavailable"
+                ai_verified = False
+            elif result is None:
+                # Batch call succeeded but this particular index was missing
+                # from the response — same fallback, just for one item
+                is_relevant = True
+                match_score = "?"
+                reason = "Missing from AI batch response — keyword match only"
+                procurement_object = ""
+                constraints = "Unknown — AI unavailable"
+                closing_date = "Unknown — AI unavailable"
+                ai_verified = False
+            else:
+                is_relevant = bool(result.get("relevant", True))
+                match_score = result.get("match_score", "?")
+                reason = result.get("reason", "")
+                procurement_object = result.get("procurement_object", "")
+                # "Not stated in provided text" (not "None identified") is the
+                # correct fallback here — the AI was only shown an excerpt of
+                # the page, so an empty result means "not found in what we
+                # sent it", not "confirmed there are none".
+                constraints = result.get("constraints") or "Not stated in provided text"
+                closing_date = result.get("closing_date") or "Not stated in provided text"
+                ai_verified = True
+
+            if not is_relevant:
+                # Log the AI's actual reasoning, not just the title — makes
+                # it possible to sanity-check a borderline rejection (e.g. a
+                # title that LOOKED relevant) without digging through the
+                # WhatsApp thread for context that was never sent there
+                print(f"🤖 AI rejected as not relevant, skipping alert: {c['title']} — reason: {reason or '(no reason returned)'}", flush=True)
+                continue
+
+            verification_note = "⚠️ *Unverified* (AI review failed — keyword match only)\n\n" if not ai_verified else ""
+            ref_line = f"📄 *Ref No:* {c['ref_no']}\n\n" if c.get("ref_no") else ""
+            object_line = f"🏷️ *Procurement Object:* {procurement_object}\n" if procurement_object else ""
+            source_label = "eGP" if c["source"] == "egp" else "2merkato"
+            label = f"New Medical Tender Found ({source_label})!"
+
+            alert = (
+                f"🔔 *{label}*\n\n"
+                f"{verification_note}"
+                f"📋 *Title:* {c['title']}\n"
+                f"{ref_line}"
+                f"{object_line}"
+                f"🤖 *AI Analysis:*\n"
+                f"🎯 *Match Score:* {match_score}% - {reason}\n"
+                f"⚠️ *Constraints:* {constraints}\n"
+                f"📅 *Closing Date:* {closing_date}\n\n"
+                f"🔗 *Link:* {c['link']}"
+            )
+            send_whatsapp(alert)
+            total_sent += 1
+            time.sleep(2)
+
+    total = total_sent
+    print(f"=================== SCAN COMPLETE: {total} ALERTS SENT ({len(candidates)} candidates reviewed) ===================", flush=True)
+
+    if total == 0:
+        send_whatsapp("🔍 *Tender Monitor Scan Completed.*\nNo new unique medical equipment or maintenance matches found on 2merkato or eGP.")
+
+
+def monitoring_loop():
+    # Configurable via Render env var so this doesn't need a code change next time —
+    # defaults to 6 hours if SCAN_INTERVAL_HOURS isn't set
+    try:
+        interval_hours = float(os.environ.get("SCAN_INTERVAL_HOURS", "6"))
+    except ValueError:
+        interval_hours = 6
+    while True:
+        try:
+            check_for_tenders()
+        except Exception:
+            print("❌ check_for_tenders crashed at the top level:", flush=True)
+            print(traceback.format_exc(), flush=True)
+        time.sleep(interval_hours * 3600)
+
+
+# ==================== FLASK ROUTES ====================
+@app.route('/')
+def home():
+    return "Medical Tender Tracking Service Is Online!", 200
+
+
+@app.route('/test-check')
+def manual_test():
+    # SECURITY: without this check, anyone who finds the public Render URL
+    # could trigger a scan on demand — burning Groq API quota and sending
+    # WhatsApp messages at will. Require a shared secret token to proceed.
+    if not TEST_CHECK_TOKEN:
+        return "Manual trigger is disabled: TEST_CHECK_TOKEN is not configured.", 503
+
+    provided_token = request.args.get("token", "")
+    if not hmac.compare_digest(provided_token, TEST_CHECK_TOKEN):
+        return "Unauthorized", 401
+
+    threading.Thread(target=check_for_tenders).start()
+    return "Scraper sync cycle triggered!", 200
+
+
+# Ensure the dedup table exists as soon as the module loads (covers both
+# `python app.py` local runs and gunicorn/production imports)
+init_db()
 
 if __name__ == "__main__":
-    Config.validate()
-    start_background_scheduler()
-    port = int(os.environ.get("PORT", "10000"))
+    threading.Thread(target=monitoring_loop, daemon=True).start()
+    port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
