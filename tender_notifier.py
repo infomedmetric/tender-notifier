@@ -7,7 +7,7 @@ import multiprocessing
 import traceback
 import hmac
 import psycopg2
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from flask import Flask, request
 from playwright.sync_api import sync_playwright
 import urllib3
@@ -897,13 +897,11 @@ def scrape_egp(candidates: list):
                         deadline = item.get("submissionDeadline") or ""
                         if deadline:
                             try:
-                                from datetime import datetime, timezone
                                 # e.g. 2025-04-30T14:30:00+03:00
                                 dl = datetime.fromisoformat(deadline.replace("Z", "+00:00"))
                                 now = datetime.now(timezone.utc)
                                 if dl.tzinfo is None:
                                     # assume Africa/Addis_Ababa (+03) if naive
-                                    from datetime import timedelta
                                     dl = dl.replace(tzinfo=timezone(timedelta(hours=3)))
                                 if dl < now:
                                     continue  # closed — do not alert
