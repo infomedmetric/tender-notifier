@@ -337,7 +337,10 @@ def scrape_egp() -> list:
             log.warning("eGP API call failed for term '%s': %s", term, e)
             continue
 
-        items = data.get("data") or data.get("items") or data if isinstance(data, list) else data.get("data", [])
+        if isinstance(data, list):
+            items = data
+        else:
+            items = data.get("items") or data.get("data") or []
         if not isinstance(items, list):
             items = []
 
@@ -359,8 +362,12 @@ def scrape_egp() -> list:
                 continue
 
             title = item.get("lotName", "") or item.get("title", "")
-            description = item.get("description", "")
-            bid_security = item.get("bidSecurity", "")
+            description = item.get("lotDescription", "") or item.get(
+                "packageInformation", {}
+            ).get("package_description", "")
+            bid_security = item.get("packageInformation", {}).get(
+                "bid_security_amount", ""
+            )
             procuring_entity = item.get("procuringEntity", "")
 
             detail_text = (
