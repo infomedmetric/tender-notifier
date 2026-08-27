@@ -816,7 +816,7 @@ def _egp_worker(result_queue):
         result_queue.put({"error": str(e), "candidates": local_candidates, "found": 0})
 
 
-def run_egp_with_timeout(candidates: list, timeout_seconds: int = 300) -> int:
+def run_egp_with_timeout(candidates: list, timeout_seconds: int = 600) -> int:
     """Runs the eGP engine in its own process with a hard wall-clock timeout."""
     ctx = multiprocessing.get_context("spawn")
     result_queue = ctx.Queue()
@@ -861,7 +861,7 @@ def scrape_egp(candidates: list):
     seen_this_scan = set()
 
     # How many results to pull per search term
-    TOP_PER_TERM = int(os.environ.get("EGP_TOP_PER_TERM", "40"))
+    TOP_PER_TERM = int(os.environ.get("EGP_TOP_PER_TERM", "25"))
 
     try:
         for term in EGP_SEARCH_TERMS:
@@ -893,20 +893,32 @@ def scrape_egp(candidates: list):
                         if not is_relevant_tender(title_text):
                             continue
 
+                        # Skip expired / past deadlines (API returns historical tenders too)
+                        deadline = item.get("submissionDeadline") or ""
+                        if deadline:
+                            try:
+                                from datetime import datetime, timezone
+                                # e.g. 2025-04-30T14:30:00+03:00
+                                dl = datetime.fromisoformat(deadline.replace("Z", "+00:00"))
+                                now = datetime.now(timezone.utc)
+                                if dl.tzinfo is None:
+                                    # assume Africa/Addis_Ababa (+03) if naive
+                                    from datetime import timedelta
+                                    dl = dl.replace(tzinfo=timezone(timedelta(hours=3)))
+                                if dl < now:
+                                    continue  # closed — do not alert
+                            except Exception:
+                                pass  # if unparseable, keep and let AI/user decide
+
                         tender_id = f"egp_{ref_no or item.get('id') or title_text}"
                         if is_already_notified(tender_id):
                             continue
 
-                        # Skip clearly closed / past deadlines when we can
-                        deadline = item.get("submissionDeadline") or ""
-                        # Still collect — AI / user can decide; marking notified prevents re-scan noise
                         mark_as_notified(tender_id)
                         found += 1
 
                         detail_text = _egp_build_detail_text(item)
-                        # Public portal link for the package/lot when possible
                         package_id = item.get("packageId") or ""
-                        lot_id = item.get("lotId") or item.get("id") or ""
                         if package_id:
                             detail_link = f"{EGP_BASE}/egp/bids/all?packageId={package_id}"
                         else:
@@ -952,7 +964,11 @@ def check_for_tenders():
         merkato_found = 0
 
     try:
-        egp_found = run_egp_with_timeout(candidates)
+        # API-based eGP does not hang like the old Playwright path, so run
+        # in-process to guarantee candidates are returned (subprocess timeout
+        # previously killed a successful 182-item collection before results
+        # could be passed back to the parent).
+        egp_found = scrape_egp(candidates)
     except Exception:
         print("❌ eGP engine crashed with an unhandled exception:", flush=True)
         print(traceback.format_exc(), flush=True)
