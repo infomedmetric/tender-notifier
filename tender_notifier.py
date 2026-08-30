@@ -51,6 +51,67 @@ def _call_groq_with_retry(client, system_instruction, prompt, temperature=0.2, m
     raise last_error
 
 
+def _call_gemini_with_retry(system_instruction, prompt, temperature=0.2, max_retries=3, base_delay=2):
+    """
+    Calls Google Gemini generateContent REST API with retries.
+    Uses GEMINI_API_KEY and GEMINI_MODEL (default gemini-2.0-flash).
+    No extra pip package required — plain requests.
+    """
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        raise RuntimeError("GEMINI_API_KEY is not set")
+    model = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
+    url = (
+        f"https://generativelanguage.googleapis.com/v1beta/models/"
+        f"{model}:generateContent?key={api_key}"
+    )
+    body = {
+        "system_instruction": {"parts": [{"text": system_instruction}]},
+        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+        "generationConfig": {
+            "temperature": temperature,
+            "responseMimeType": "application/json",
+        },
+    }
+    last_error = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            r = requests.post(url, json=body, timeout=90)
+            if r.status_code != 200:
+                raise RuntimeError(f"Gemini HTTP {r.status_code}: {r.text[:300]}")
+            data = r.json()
+            # Normalize to a Groq-like object with .choices[0].message.content
+            text_out = ""
+            for cand in data.get("candidates") or []:
+                parts = ((cand.get("content") or {}).get("parts")) or []
+                for p in parts:
+                    text_out += p.get("text") or ""
+            if not text_out.strip():
+                raise RuntimeError(f"Gemini empty response: {str(data)[:300]}")
+
+            class _Msg:
+                def __init__(self, content):
+                    self.content = content
+
+            class _Choice:
+                def __init__(self, content):
+                    self.message = _Msg(content)
+
+            class _Resp:
+                def __init__(self, content):
+                    self.choices = [_Choice(content)]
+
+            return _Resp(text_out)
+        except Exception as e:
+            last_error = e
+            if attempt < max_retries:
+                delay = base_delay * attempt
+                print(f"⚠️ Gemini call failed (attempt {attempt}/{max_retries}): {e} — retrying in {delay}s", flush=True)
+                time.sleep(delay)
+    raise last_error
+
+
+
 
 # Keywords used to locate the parts of a detail page worth keeping when the
 # full captured text (up to 6000 chars) is too long to send to the AI in
@@ -154,85 +215,106 @@ def _build_batch_prompt(chunk_with_indices):
 
 def batch_analyze_tenders(candidates: list):
     """
-    Analyzes ALL candidate tenders from a scan cycle in as FEW Groq calls as
-    possible — instead of one call per tender. Even free-tier LLM APIs cap
-    daily/per-minute requests (both a request count AND a tokens-per-minute
-    budget), so a per-tender approach can burn through a day's quota in one
-    scan.
+    Analyze candidates with SEPARATE free-tier keys:
+      - 2merkato  → GROQ_API_KEY   (Groq)
+      - egp       → GEMINI_API_KEY (Google Gemini)
 
-    A single-mega-request approach hit Groq's TPM (tokens per minute) limit
-    once there were 15-20+ candidates with detail text attached (413 "Request
-    too large"). So candidates are split into smaller sub-batches sized to
-    stay comfortably under the TPM limit, each sent as its own Groq call —
-    still far fewer calls than one per tender (e.g. 23 candidates becomes
-    ~3 calls instead of 23 or 46).
-
-    Returns a dict {index: {relevant, match_score, reason, object,
-    closing_date}} on success (possibly missing some indices if only some
-    sub-batches failed — the caller already treats a missing index as
-    "unverified, fall back to keyword match"), or None if EVERY sub-batch
-    failed (e.g. no API key, or Groq unreachable entirely).
+    Each source is chunked independently so one source cannot exhaust the
+    other source's quota. Returns {global_index: analysis_dict} or None if
+    every provider failed for every item.
     """
     if not candidates:
         return {}
 
-    api_key = os.environ.get("GROQ_API_KEY")
-    if not api_key:
-        return None
+    CHUNK_SIZE = int(os.environ.get("AI_CHUNK_SIZE", "3"))
 
-    # Sized conservatively: detail snippets now run up to ~2,400 chars/
-    # candidate (up from 900) so the AI can actually see closing dates and
-    # constraints that appear later in the page rather than always seeing
-    # blank space. ~6 candidates per chunk keeps prompt+completion tokens
-    # comfortably under Groq's 12,000 TPM limit for openai/gpt-oss-120b,
-    # even accounting for the system instruction and JSON completion overhead.
-    CHUNK_SIZE = 3  # smaller batches = fewer tokens, more reliable on Groq free tier
+    def _run_chunks(indexed_subset, provider: str):
+        """indexed_subset: list of (global_index, candidate). provider: groq|gemini"""
+        if not indexed_subset:
+            return {}, False
 
-    # Uses the standard OpenAI client pointed at Groq's OpenAI-compatible
-    # endpoint (per Groq's own current setup instructions), rather than the
-    # dedicated groq package. Deliberately still calling
-    # chat.completions.create() with response_format={"type": "json_object"}
-    # below (not the newer client.responses.create()) — Groq's Responses API
-    # is explicitly marked "currently in beta" in their docs, and this
-    # pipeline runs unattended and depends on getting valid, parseable JSON
-    # back every single time. Chat Completions + JSON mode is the
-    # well-established path for that; nothing here needed the beta endpoint.
-    client = OpenAI(api_key=api_key, base_url="https://api.groq.com/openai/v1")
-    indexed_candidates = list(enumerate(candidates))
-    chunks = [indexed_candidates[i:i + CHUNK_SIZE] for i in range(0, len(indexed_candidates), CHUNK_SIZE)]
+        if provider == "groq":
+            api_key = os.environ.get("GROQ_API_KEY")
+            if not api_key:
+                print("⚠️ GROQ_API_KEY not set — skipping 2merkato AI analysis", flush=True)
+                return {}, False
+            client = OpenAI(api_key=api_key, base_url="https://api.groq.com/openai/v1")
+        else:
+            if not os.environ.get("GEMINI_API_KEY"):
+                print("⚠️ GEMINI_API_KEY not set — skipping eGP AI analysis", flush=True)
+                return {}, False
+            client = None
+
+        chunks = [indexed_subset[i:i + CHUNK_SIZE] for i in range(0, len(indexed_subset), CHUNK_SIZE)]
+        results = {}
+        any_ok = False
+
+        for chunk_num, chunk in enumerate(chunks, start=1):
+            # Re-index 0..n-1 inside the prompt, map back to global indices after
+            local_pairs = [(local_i, c) for local_i, (_, c) in enumerate(chunk)]
+            global_by_local = {local_i: global_i for local_i, (global_i, _) in enumerate(chunk)}
+            system_instruction, prompt = _build_batch_prompt(local_pairs)
+            try:
+                if provider == "groq":
+                    response = _call_groq_with_retry(client, system_instruction, prompt, temperature=0.2)
+                else:
+                    response = _call_gemini_with_retry(system_instruction, prompt, temperature=0.2)
+                raw = (response.choices[0].message.content or "").strip()
+                if raw.startswith("```"):
+                    raw = raw.split("```")[1]
+                    if raw.startswith("json"):
+                        raw = raw[4:]
+                    raw = raw.strip()
+                parsed = json.loads(raw)
+                items = parsed.get("tenders", []) if isinstance(parsed, dict) else parsed
+                for item in items:
+                    local_idx = item.get("index")
+                    if local_idx is None:
+                        continue
+                    global_idx = global_by_local.get(local_idx)
+                    if global_idx is not None:
+                        item = dict(item)
+                        item["index"] = global_idx
+                        results[global_idx] = item
+                any_ok = True
+                print(f"✅ {provider} sub-batch {chunk_num}/{len(chunks)} ok ({len(chunk)} tenders)", flush=True)
+            except Exception as e:
+                print(f"⚠️ {provider} sub-batch {chunk_num}/{len(chunks)} failed: {e}", flush=True)
+
+            if chunk_num < len(chunks):
+                time.sleep(5)
+
+        return results, any_ok
+
+    # Preserve global indices; split by source
+    merkato = [(i, c) for i, c in enumerate(candidates) if c.get("source") == "2merkato"]
+    egp = [(i, c) for i, c in enumerate(candidates) if c.get("source") == "egp"]
+    other = [(i, c) for i, c in enumerate(candidates) if c.get("source") not in ("2merkato", "egp")]
+
+    print(
+        f"🤖 AI split: {len(merkato)} × Groq (2merkato), {len(egp)} × Gemini (eGP)"
+        + (f", {len(other)} × Groq (other)" if other else ""),
+        flush=True,
+    )
 
     all_results = {}
-    any_chunk_succeeded = False
+    any_ok = False
 
-    for chunk_num, chunk in enumerate(chunks, start=1):
-        system_instruction, prompt = _build_batch_prompt(chunk)
-        try:
-            response = _call_groq_with_retry(client, system_instruction, prompt, temperature=0.2)
-            raw = (response.choices[0].message.content or "").strip()
-            if raw.startswith("```"):
-                raw = raw.split("```")[1]
-                if raw.startswith("json"):
-                    raw = raw[4:]
-                raw = raw.strip()
-            parsed = json.loads(raw)
-            items = parsed.get("tenders", []) if isinstance(parsed, dict) else parsed
-            for item in items:
-                idx = item.get("index")
-                if idx is not None:
-                    all_results[idx] = item
-            any_chunk_succeeded = True
-        except Exception as e:
-            print(f"⚠️ Batch AI analysis sub-batch {chunk_num}/{len(chunks)} failed after retries: {e}", flush=True)
-            # Leave this sub-batch's indices out of all_results — the caller
-            # already falls back to "unverified, keyword match only" for any
-            # index missing from the results dict
+    r, ok = _run_chunks(merkato, "groq")
+    all_results.update(r)
+    any_ok = any_ok or ok
 
-        # Small pause between sub-batches so back-to-back chunks don't
-        # themselves stack up against the TPM window
-        if chunk_num < len(chunks):
-            time.sleep(5)  # longer pause between chunks to stay under free-tier TPM
+    r, ok = _run_chunks(egp, "gemini")
+    all_results.update(r)
+    any_ok = any_ok or ok
 
-    return all_results if any_chunk_succeeded else None
+    # Any unexpected source → Groq
+    r, ok = _run_chunks(other, "groq")
+    all_results.update(r)
+    any_ok = any_ok or ok
+
+    return all_results if any_ok else None
+
 
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -972,7 +1054,7 @@ def check_for_tenders():
         print(traceback.format_exc(), flush=True)
         egp_found = 0
 
-    print(f"🧮 {len(candidates)} total candidate tenders collected ({merkato_found} 2merkato, {egp_found} eGP) — running one batch AI review", flush=True)
+    print(f"🧮 {len(candidates)} total candidate tenders collected ({merkato_found} 2merkato, {egp_found} eGP) — running AI review (Groq=2merkato, Gemini=eGP)", flush=True)
 
     total_sent = 0
     if candidates:
@@ -1031,11 +1113,26 @@ def check_for_tenders():
                 print(f"🤖 AI rejected as not relevant, skipping alert: {c['title']} — reason: {reason or '(no reason returned)'}", flush=True)
                 continue
 
-            # Skip unverified alerts when AI is down (default on — set SKIP_UNVERIFIED_ALERTS=0 to send them)
-            skip_unverified = os.environ.get("SKIP_UNVERIFIED_ALERTS", "1").strip().lower() in ("1", "true", "yes")
-            if not ai_verified and skip_unverified:
-                print(f"⏭️ Skipping unverified (AI unavailable) alert: {c['title'][:60]}", flush=True)
-                continue
+            # When AI fails for an item, still alert if the title has a STRONG
+            # keyword (dialysis, ultrasound equipment, etc.). Only skip weak
+            # generic matches. Set SKIP_UNVERIFIED_ALERTS=1 to suppress all unverified.
+            skip_all_unverified = os.environ.get("SKIP_UNVERIFIED_ALERTS", "0").strip().lower() in ("1", "true", "yes")
+            if not ai_verified:
+                title_l = c["title"].lower()
+                strong_hit = any(
+                    k in title_l
+                    for k in (
+                        "dialysis", "hemodialysis", "hemodial", "bbraun", "b braun",
+                        "dialog+", "ultrasound", "x-ray", "xray", "ct scan",
+                        "steriliz", "autoclave", "cssd", "reverse osmosis", "ro system",
+                        "water treatment", "biomedical", "medical imaging",
+                        "maintenance and repair", "calibration",
+                    )
+                )
+                if skip_all_unverified or not strong_hit:
+                    print(f"⏭️ Skipping unverified alert: {c['title'][:60]}", flush=True)
+                    continue
+                print(f"⚠️ AI unavailable but strong keyword match — still alerting: {c['title'][:60]}", flush=True)
 
             def _short(s, n=100):
                 s = (s or "").strip()
@@ -1047,7 +1144,10 @@ def check_for_tenders():
             title_s = _short(c["title"], 120)
 
             source_label = "eGP" if c["source"] == "egp" else "2merkato"
-            lines = [f"🔔 *New tender ({source_label})*", f"📋 {title_s}"]
+            lines = [f"🔔 *New tender ({source_label})*"]
+            if not ai_verified:
+                lines.append("⚠️ *Unverified* (AI limited — keyword match)")
+            lines.append(f"📋 {title_s}")
             if c.get("ref_no"):
                 lines.append(f"📄 Ref: {c['ref_no']}")
             if object_s:
