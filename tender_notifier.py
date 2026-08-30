@@ -70,7 +70,7 @@ _CONSTRAINT_HINTS = [
 ]
 
 
-def _build_detail_snippet(detail_text: str, max_chars: int = 2400) -> str:
+def _build_detail_snippet(detail_text: str, max_chars: int = 1200) -> str:
     """
     Instead of blindly slicing the first N characters (which was silently
     dropping the closing date and constraints whenever they appeared later
@@ -138,7 +138,7 @@ def _build_batch_prompt(chunk_with_indices):
         '"index": 0, '
         '"relevant": true, '
         '"match_score": 85, '
-        '"reason": "short sentence on why it matches or not", '
+        '"reason": "max 12 words why it matches or not", '
         '"procurement_object": "the object/type of procurement as stated on the page, e.g. \'Supply and installation of hemodialysis machines\'", '
         '"constraints": "key eligibility/bid requirements actually stated in the text — e.g. bid bond amount, minimum years of similar experience, required certifications, local representation requirement. '
         'If the provided excerpt does not contain this info, respond exactly with \'Not stated in provided text\' — do NOT say \'None\' or \'None identified\', since that implies you confirmed there are none.", '
@@ -186,7 +186,7 @@ def batch_analyze_tenders(candidates: list):
     # blank space. ~6 candidates per chunk keeps prompt+completion tokens
     # comfortably under Groq's 12,000 TPM limit for openai/gpt-oss-120b,
     # even accounting for the system instruction and JSON completion overhead.
-    CHUNK_SIZE = 6
+    CHUNK_SIZE = 3  # smaller batches = fewer tokens, more reliable on Groq free tier
 
     # Uses the standard OpenAI client pointed at Groq's OpenAI-compatible
     # endpoint (per Groq's own current setup instructions), rather than the
@@ -230,7 +230,7 @@ def batch_analyze_tenders(candidates: list):
         # Small pause between sub-batches so back-to-back chunks don't
         # themselves stack up against the TPM window
         if chunk_num < len(chunks):
-            time.sleep(3)
+            time.sleep(5)  # longer pause between chunks to stay under free-tier TPM
 
     return all_results if any_chunk_succeeded else None
 
@@ -1031,24 +1031,42 @@ def check_for_tenders():
                 print(f"🤖 AI rejected as not relevant, skipping alert: {c['title']} — reason: {reason or '(no reason returned)'}", flush=True)
                 continue
 
-            verification_note = "⚠️ *Unverified* (AI review failed — keyword match only)\n\n" if not ai_verified else ""
-            ref_line = f"📄 *Ref No:* {c['ref_no']}\n\n" if c.get("ref_no") else ""
-            object_line = f"🏷️ *Procurement Object:* {procurement_object}\n" if procurement_object else ""
-            source_label = "eGP" if c["source"] == "egp" else "2merkato"
-            label = f"New Medical Tender Found ({source_label})!"
+            # Skip unverified alerts when AI is down (default on — set SKIP_UNVERIFIED_ALERTS=0 to send them)
+            skip_unverified = os.environ.get("SKIP_UNVERIFIED_ALERTS", "1").strip().lower() in ("1", "true", "yes")
+            if not ai_verified and skip_unverified:
+                print(f"⏭️ Skipping unverified (AI unavailable) alert: {c['title'][:60]}", flush=True)
+                continue
 
-            alert = (
-                f"🔔 *{label}*\n\n"
-                f"{verification_note}"
-                f"📋 *Title:* {c['title']}\n"
-                f"{ref_line}"
-                f"{object_line}"
-                f"🤖 *AI Analysis:*\n"
-                f"🎯 *Match Score:* {match_score}% - {reason}\n"
-                f"⚠️ *Constraints:* {constraints}\n"
-                f"📅 *Closing Date:* {closing_date}\n\n"
-                f"🔗 *Link:* {c['link']}"
-            )
+            def _short(s, n=100):
+                s = (s or "").strip()
+                return s if len(s) <= n else s[: n - 1] + "…"
+
+            reason_s = _short(str(reason), 80)
+            constraints_s = _short(str(constraints), 100)
+            object_s = _short(str(procurement_object), 80)
+            title_s = _short(c["title"], 120)
+
+            source_label = "eGP" if c["source"] == "egp" else "2merkato"
+            lines = [f"🔔 *New tender ({source_label})*", f"📋 {title_s}"]
+            if c.get("ref_no"):
+                lines.append(f"📄 Ref: {c['ref_no']}")
+            if object_s:
+                lines.append(f"🏷️ {object_s}")
+            lines.append(f"🎯 {match_score}% — {reason_s}")
+            if constraints_s and constraints_s not in (
+                "Not stated in provided text",
+                "Unknown — AI unavailable",
+            ):
+                lines.append(f"⚠️ {constraints_s}")
+            lines.append(f"📅 Close: {closing_date}")
+            # Put the URL alone on its own line — WhatsApp often fails to make
+            # links tappable when they sit on the same line as *markdown* or emoji.
+            link = (c.get("link") or "").strip()
+            if link:
+                lines.append("")
+                lines.append(link)
+
+            alert = "\n".join(lines)
             send_whatsapp(alert)
             total_sent += 1
             time.sleep(2)
