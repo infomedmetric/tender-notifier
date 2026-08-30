@@ -1005,9 +1005,24 @@ def scrape_egp(candidates: list):
                         found += 1
 
                         detail_text = _egp_build_detail_text(item)
-                        package_id = item.get("packageId") or ""
-                        if package_id:
-                            detail_link = f"{EGP_BASE}/egp/bids/all?packageId={package_id}"
+
+                        # Deep-link format used by the SPA (from frontend router):
+                        # /egp/bids/all/{tendering|purchasing|...}/{id}/{open|closed}
+                        # id = sourceId when Purchasing, else lotInPackageId || lotId
+                        src_app = (item.get("sourceApplication") or "").strip()
+                        app_path = {
+                            "Tendering": "tendering",
+                            "Auctioning": "auctioning",
+                            "Purchasing": "purchasing",
+                            "Prequalification": "prequalification",
+                        }.get(src_app, "tendering")
+                        if src_app == "Purchasing":
+                            detail_id = item.get("sourceId") or item.get("lotInPackageId") or item.get("lotId") or item.get("id") or ""
+                        else:
+                            detail_id = item.get("lotInPackageId") or item.get("lotId") or item.get("id") or ""
+                        open_closed = "open" if item.get("isSubmittable") else "closed"
+                        if detail_id:
+                            detail_link = f"{EGP_BASE}/egp/bids/all/{app_path}/{detail_id}/{open_closed}"
                         else:
                             detail_link = f"{EGP_BASE}/egp/bids/all"
 
