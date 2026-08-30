@@ -13,23 +13,39 @@ from playwright.sync_api import sync_playwright
 import urllib3
 from openai import OpenAI
 
-def _call_groq_with_retry(client, system_instruction, prompt, temperature=0.2, max_retries=3, base_delay=2):
+def _call_groq_with_retry(client, system_instruction, prompt, temperature=None, max_retries=None, base_delay=None):
     """
-    Wraps a Groq chat.completions.create call with retries + exponential
-    backoff, mirroring the same reliability pattern used before with
-    Gemini — a single transient network blip shouldn't immediately produce
-    a fallback/degraded result.
+    Wraps Groq chat.completions.create with retries + exponential backoff.
 
-    Model is configurable via GROQ_MODEL (defaults to openai/gpt-oss-120b).
-    Groq deprecated and removed llama-3.3-70b-versatile — every call to it
-    now fails with a 404 model_not_found error, confirmed across multiple
-    scans even with a valid API key, so this isn't a transient issue.
-    openai/gpt-oss-120b is Groq's own current recommended replacement.
-    Groq's free tier also has its own rate limits, so batching everything
-    into one call per scan cycle (see batch_analyze_tenders below) still
-    matters just as much here as it did with Gemini.
+    Env configuration (all optional):
+      GROQ_MODEL          default openai/gpt-oss-120b
+                          alternatives: openai/gpt-oss-20b (faster/lighter)
+      GROQ_TEMPERATURE    default 0.2  (0 = more deterministic JSON)
+      GROQ_MAX_TOKENS     default 2048 (completion size cap)
+      GROQ_MAX_RETRIES    default 3
+      GROQ_RETRY_DELAY    default 2     (seconds; multiplied by attempt)
     """
     model_name = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
+    if temperature is None:
+        try:
+            temperature = float(os.environ.get("GROQ_TEMPERATURE", "0.2"))
+        except ValueError:
+            temperature = 0.2
+    if max_retries is None:
+        try:
+            max_retries = int(os.environ.get("GROQ_MAX_RETRIES", "3"))
+        except ValueError:
+            max_retries = 3
+    if base_delay is None:
+        try:
+            base_delay = float(os.environ.get("GROQ_RETRY_DELAY", "2"))
+        except ValueError:
+            base_delay = 2
+    try:
+        max_tokens = int(os.environ.get("GROQ_MAX_TOKENS", "2048"))
+    except ValueError:
+        max_tokens = 2048
+
     last_error = None
     for attempt in range(1, max_retries + 1):
         try:
@@ -40,6 +56,7 @@ def _call_groq_with_retry(client, system_instruction, prompt, temperature=0.2, m
                     {"role": "user", "content": prompt},
                 ],
                 temperature=temperature,
+                max_tokens=max_tokens,
                 response_format={"type": "json_object"},
             )
         except Exception as e:
@@ -54,13 +71,13 @@ def _call_groq_with_retry(client, system_instruction, prompt, temperature=0.2, m
 def _call_gemini_with_retry(system_instruction, prompt, temperature=0.2, max_retries=3, base_delay=2):
     """
     Calls Google Gemini generateContent REST API with retries.
-    Uses GEMINI_API_KEY and GEMINI_MODEL (default gemini-2.0-flash).
+    Uses GEMINI_API_KEY and GEMINI_MODEL (default gemini-flash-latest).
     No extra pip package required — plain requests.
     """
     api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
         raise RuntimeError("GEMINI_API_KEY is not set")
-    model = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
+    model = os.environ.get("GEMINI_MODEL", "gemini-flash-latest")
     url = (
         f"https://generativelanguage.googleapis.com/v1beta/models/"
         f"{model}:generateContent?key={api_key}"
@@ -256,7 +273,7 @@ def batch_analyze_tenders(candidates: list):
             system_instruction, prompt = _build_batch_prompt(local_pairs)
             try:
                 if provider == "groq":
-                    response = _call_groq_with_retry(client, system_instruction, prompt, temperature=0.2)
+                    response = _call_groq_with_retry(client, system_instruction, prompt)
                 else:
                     response = _call_gemini_with_retry(system_instruction, prompt, temperature=0.2)
                 raw = (response.choices[0].message.content or "").strip()
