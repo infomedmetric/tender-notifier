@@ -232,50 +232,38 @@ def _build_batch_prompt(chunk_with_indices):
 
 def batch_analyze_tenders(candidates: list):
     """
-    Analyze candidates with SEPARATE free-tier keys:
-      - 2merkato  → GROQ_API_KEY   (Groq)
-      - egp       → GEMINI_API_KEY (Google Gemini)
+    Analyze candidates with SEPARATE Groq free-tier keys:
+      - 2merkato  → GROQ_API_KEY
+      - egp       → GROQ_API_KEY_EGP  (falls back to GROQ_API_KEY if unset)
 
     Each source is chunked independently so one source cannot exhaust the
-    other source's quota. Returns {global_index: analysis_dict} or None if
-    every provider failed for every item.
+    other key's quota. Returns {global_index: analysis_dict} or None if
+    every call failed for every item.
     """
     if not candidates:
         return {}
 
     CHUNK_SIZE = int(os.environ.get("AI_CHUNK_SIZE", "3"))
 
-    def _run_chunks(indexed_subset, provider: str):
-        """indexed_subset: list of (global_index, candidate). provider: groq|gemini"""
+    def _run_chunks(indexed_subset, label: str, api_key: str):
+        """indexed_subset: list of (global_index, candidate)."""
         if not indexed_subset:
             return {}, False
+        if not api_key:
+            print(f"⚠️ No Groq key for {label} — skipping AI analysis for this source", flush=True)
+            return {}, False
 
-        if provider == "groq":
-            api_key = os.environ.get("GROQ_API_KEY")
-            if not api_key:
-                print("⚠️ GROQ_API_KEY not set — skipping 2merkato AI analysis", flush=True)
-                return {}, False
-            client = OpenAI(api_key=api_key, base_url="https://api.groq.com/openai/v1")
-        else:
-            if not os.environ.get("GEMINI_API_KEY"):
-                print("⚠️ GEMINI_API_KEY not set — skipping eGP AI analysis", flush=True)
-                return {}, False
-            client = None
-
+        client = OpenAI(api_key=api_key, base_url="https://api.groq.com/openai/v1")
         chunks = [indexed_subset[i:i + CHUNK_SIZE] for i in range(0, len(indexed_subset), CHUNK_SIZE)]
         results = {}
         any_ok = False
 
         for chunk_num, chunk in enumerate(chunks, start=1):
-            # Re-index 0..n-1 inside the prompt, map back to global indices after
             local_pairs = [(local_i, c) for local_i, (_, c) in enumerate(chunk)]
             global_by_local = {local_i: global_i for local_i, (global_i, _) in enumerate(chunk)}
             system_instruction, prompt = _build_batch_prompt(local_pairs)
             try:
-                if provider == "groq":
-                    response = _call_groq_with_retry(client, system_instruction, prompt)
-                else:
-                    response = _call_gemini_with_retry(system_instruction, prompt, temperature=0.2)
+                response = _call_groq_with_retry(client, system_instruction, prompt)
                 raw = (response.choices[0].message.content or "").strip()
                 if raw.startswith("```"):
                     raw = raw.split("```")[1]
@@ -294,39 +282,41 @@ def batch_analyze_tenders(candidates: list):
                         item["index"] = global_idx
                         results[global_idx] = item
                 any_ok = True
-                print(f"✅ {provider} sub-batch {chunk_num}/{len(chunks)} ok ({len(chunk)} tenders)", flush=True)
+                print(f"✅ {label} sub-batch {chunk_num}/{len(chunks)} ok ({len(chunk)} tenders)", flush=True)
             except Exception as e:
-                print(f"⚠️ {provider} sub-batch {chunk_num}/{len(chunks)} failed: {e}", flush=True)
+                print(f"⚠️ {label} sub-batch {chunk_num}/{len(chunks)} failed: {e}", flush=True)
 
             if chunk_num < len(chunks):
                 time.sleep(5)
 
         return results, any_ok
 
-    # Preserve global indices; split by source
     merkato = [(i, c) for i, c in enumerate(candidates) if c.get("source") == "2merkato"]
     egp = [(i, c) for i, c in enumerate(candidates) if c.get("source") == "egp"]
     other = [(i, c) for i, c in enumerate(candidates) if c.get("source") not in ("2merkato", "egp")]
 
+    key_merkato = os.environ.get("GROQ_API_KEY", "")
+    key_egp = os.environ.get("GROQ_API_KEY_EGP") or key_merkato
+
     print(
-        f"🤖 AI split: {len(merkato)} × Groq (2merkato), {len(egp)} × Gemini (eGP)"
-        + (f", {len(other)} × Groq (other)" if other else ""),
+        f"🤖 AI split: {len(merkato)} × Groq/2merkato, {len(egp)} × Groq/eGP"
+        + (f", {len(other)} × Groq/other" if other else "")
+        + ("" if os.environ.get("GROQ_API_KEY_EGP") else " [eGP using same key as 2merkato — set GROQ_API_KEY_EGP for a second quota]"),
         flush=True,
     )
 
     all_results = {}
     any_ok = False
 
-    r, ok = _run_chunks(merkato, "groq")
+    r, ok = _run_chunks(merkato, "groq-merkato", key_merkato)
     all_results.update(r)
     any_ok = any_ok or ok
 
-    r, ok = _run_chunks(egp, "gemini")
+    r, ok = _run_chunks(egp, "groq-egp", key_egp)
     all_results.update(r)
     any_ok = any_ok or ok
 
-    # Any unexpected source → Groq
-    r, ok = _run_chunks(other, "groq")
+    r, ok = _run_chunks(other, "groq-other", key_merkato)
     all_results.update(r)
     any_ok = any_ok or ok
 
@@ -1071,7 +1061,7 @@ def check_for_tenders():
         print(traceback.format_exc(), flush=True)
         egp_found = 0
 
-    print(f"🧮 {len(candidates)} total candidate tenders collected ({merkato_found} 2merkato, {egp_found} eGP) — running AI review (Groq=2merkato, Gemini=eGP)", flush=True)
+    print(f"🧮 {len(candidates)} total candidate tenders collected ({merkato_found} 2merkato, {egp_found} eGP) — running AI review (Groq×2: merkato + eGP)", flush=True)
 
     total_sent = 0
     if candidates:
