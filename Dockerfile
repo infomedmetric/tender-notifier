@@ -1,4 +1,4 @@
-FROM mcr.microsoft.com/playwright/python:v1.48.0-jammy
+FROM mcr.microsoft.com/playwright/python:v1.64.1-jammy
 
 WORKDIR /app
 
@@ -10,4 +10,5 @@ COPY . .
 ENV PORT=10000
 EXPOSE 10000
 
-CMD ["python", "tender_notifier.py"]
+# Use gunicorn if available; fallback to python
+CMD gunicorn tender_notifier:app --bind 0.0.0.0:${PORT:-10000} --workers 1 --threads 4 --timeout 120

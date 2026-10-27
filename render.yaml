@@ -1,0 +1,45 @@
+# Optional: Blueprint for Render (you can also configure manually in the dashboard)
+services:
+  - type: web
+    name: medmetric-tender-agent
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: medmetric-tender-db
+          property: connectionString
+      - key: GROQ_API_KEY
+        sync: false
+      - key: GROQ_API_KEY_EGP
+        sync: false
+      - key: GLOBAL_API_KEY
+        sync: false
+      - key: WHATSAPP_NUMBERS
+        sync: false
+      - key: MOBILE_API_KEY
+        sync: false
+      - key: TEST_CHECK_TOKEN
+        sync: false
+      - key: EVOLUTION_BASE
+        sync: false
+      - key: INSTANCE_NAME
+        sync: false
+      - key: SCAN_INTERVAL_HOURS
+        value: "6"
+      - key: MERKATO_USER
+        sync: false
+      - key: MERKATO_PASS
+        sync: false
+      - key: EGP_USER
+        sync: false
+      - key: EGP_PASS
+        sync: false
+
+databases:
+  - name: medmetric-tender-db
+    plan: free
+    databaseName: tenders
+    user: tenders
