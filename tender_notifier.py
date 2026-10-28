@@ -1787,6 +1787,7 @@ def api_scan():
     Always returns JSON with a clear `status` field the mobile app understands:
       started | running | recent | denied | unavailable
     """
+    global _scan_running
     if not _mobile_api_authorized():
         return jsonify({
             "error": "Unauthorized — set the same key as MOBILE_API_KEY on the server in app Settings → Tender API key.",
