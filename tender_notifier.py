@@ -340,27 +340,23 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 app = Flask(__name__)
 
 # ================== CONFIGURATION ==================
-# Evolution API (WhatsApp). Set these on Render → Environment.
-EVOLUTION_BASE = (os.environ.get("EVOLUTION_BASE") or "https://medmetric-evolution.onrender.com").rstrip("/")
-INSTANCE_NAME = (os.environ.get("INSTANCE_NAME") or "Tender-Notifier.").strip()
-# Prefer dedicated Evolution key; fall back to GLOBAL_API_KEY for older deploys
-EVOLUTION_API_KEY = (
-    os.environ.get("EVOLUTION_API_KEY")
-    or os.environ.get("GLOBAL_API_KEY")
-    or ""
-).strip()
-GLOBAL_API_KEY = os.environ.get("GLOBAL_API_KEY")  # still used as Evolution fallback above
-if not EVOLUTION_API_KEY:
-    print("⚠️ EVOLUTION_API_KEY / GLOBAL_API_KEY is not set — WhatsApp sends will fail until configured.", flush=True)
+EVOLUTION_BASE = os.environ.get("EVOLUTION_BASE", "https://medmetric-evolution.onrender.com")
+INSTANCE_NAME = os.environ.get("INSTANCE_NAME", "Tender-Notifier.")
 
-# Recipients: comma-separated international numbers, e.g. 2519xxxxxxxx (no +)
+# SECURITY: no hardcoded fallback — a real API key must never live in source
+# code, especially in a public repo. If it's missing, we log a clear warning
+# at startup rather than silently sending requests with an empty key.
+GLOBAL_API_KEY = os.environ.get("GLOBAL_API_KEY")
+if not GLOBAL_API_KEY:
+    print("⚠️ GLOBAL_API_KEY is not set — WhatsApp sends will fail until it's configured in Render's environment variables.", flush=True)
+
+# SECURITY/PRIVACY: no hardcoded phone number — recipients must be supplied
+# via the WHATSAPP_NUMBERS env var (comma-separated).
 WHATSAPP_NUMBERS = [
     n.strip() for n in os.environ.get("WHATSAPP_NUMBERS", "").split(",") if n.strip()
 ]
 if not WHATSAPP_NUMBERS:
-    print("⚠️ WHATSAPP_NUMBERS is not set — no WhatsApp recipients configured.", flush=True)
-else:
-    print(f"✅ WhatsApp recipients configured: {len(WHATSAPP_NUMBERS)} number(s)", flush=True)
+    print("⚠️ WHATSAPP_NUMBERS is not set — no recipients configured.", flush=True)
 
 # Shared secret required to trigger a manual scan via /test-check. Without
 # this, anyone who discovers the public Render URL could trigger scans on
@@ -370,6 +366,18 @@ TEST_CHECK_TOKEN = os.environ.get("TEST_CHECK_TOKEN")
 # In-memory scan status for mobile /api/health and /api/scan
 _scan_lock = threading.Lock()
 _scan_running = False
+# If a scan dies mid-run (Render sleep / redeploy / OOM), running stays true in
+# Postgres forever. Treat locks older than this as stale so the next trigger always starts.
+try:
+    STALE_SCAN_MINUTES = float(os.environ.get("STALE_SCAN_MINUTES", "25"))
+except ValueError:
+    STALE_SCAN_MINUTES = 25.0
+# Cooldown after a successful scan before api/scan starts another (0 = always allow)
+try:
+    SCAN_RECENT_COOLDOWN_MINUTES = float(os.environ.get("SCAN_RECENT_COOLDOWN_MINUTES", "0"))
+except ValueError:
+    SCAN_RECENT_COOLDOWN_MINUTES = 0.0
+
 _last_scan = {
     "started_at": None,
     "completed_at": None,
@@ -686,6 +694,66 @@ def _load_scan_state_from_db():
         return dict(_last_scan), _scan_running
 
 
+
+def _parse_ts(value):
+    if not value:
+        return None
+    try:
+        s = str(value).replace("Z", "+00:00")
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except Exception:
+        return None
+
+
+def _scan_is_stale(last: dict, running: bool) -> bool:
+    """True when DB says running but started_at is too old (or missing)."""
+    if not running:
+        return False
+    started = _parse_ts(last.get("started_at") if last else None)
+    if started is None:
+        return True  # running with no start time = corrupt/stuck
+    age_min = (datetime.now(timezone.utc) - started).total_seconds() / 60.0
+    return age_min >= STALE_SCAN_MINUTES
+
+
+def _clear_scan_lock(reason: str = "manual reset"):
+    """Force running=false so the next scan can start (Neon + memory)."""
+    global _scan_running, _last_scan
+    with _scan_lock:
+        completed = datetime.now(timezone.utc).isoformat()
+        _scan_running = False
+        _last_scan["running"] = False
+        _last_scan["completed_at"] = completed
+        _last_scan["error"] = reason
+        _persist_scan_state(
+            running=False,
+            completed_at=completed,
+            error=reason,
+        )
+    print(f"🔓 Scan lock cleared: {reason}", flush=True)
+
+
+def _reset_stale_scan_on_boot():
+    """On process start, clear a stuck running flag left by a previous dyno."""
+    try:
+        last, running = _load_scan_state_from_db()
+        if running and _scan_is_stale(last, running):
+            _clear_scan_lock(
+                f"stale lock on boot (started_at={last.get('started_at')}, "
+                f"limit={STALE_SCAN_MINUTES}m)"
+            )
+        elif running:
+            # Still within window but process just started — previous worker is gone
+            _clear_scan_lock(
+                f"running flag present on fresh process start "
+                f"(started_at={last.get('started_at')}) — previous instance dead"
+            )
+    except Exception as e:
+        print(f"⚠️ boot scan lock check failed: {e}", flush=True)
+
 def database_is_connected() -> bool:
     if not DATABASE_URL:
         return False
@@ -834,83 +902,24 @@ def _mobile_api_authorized() -> bool:
         return False
 
 
-def _normalize_wa_number(raw: str) -> str:
-    """International digits only (Evolution expects no + / spaces). Ethiopia: 2519…"""
-    s = (raw or "").strip()
-    s = s.replace(" ", "").replace("-", "").replace("(", "").replace(")", "")
-    if s.startswith("+"):
-        s = s[1:]
-    if s.startswith("00"):
-        s = s[2:]
-    # Local Ethiopian mobile 09xxxxxxxx → 2519xxxxxxxx
-    if s.startswith("0") and len(s) == 10:
-        s = "251" + s[1:]
-    return "".join(ch for ch in s if ch.isdigit())
+def send_whatsapp(message):
+    if not GLOBAL_API_KEY or not WHATSAPP_NUMBERS:
+        print("❌ Cannot send WhatsApp message: GLOBAL_API_KEY or WHATSAPP_NUMBERS is not configured.", flush=True)
+        return
 
-
-def _mask_number(number: str) -> str:
-    return number[:5] + "***" + number[-2:] if len(number) > 7 else "***"
-
-
-def send_whatsapp(message: str) -> bool:
-    """Send a short WhatsApp text via Evolution API to every WHATSAPP_NUMBERS recipient.
-
-    Supports Evolution v2 flat body `{"number","text"}` and falls back to v1
-    `{"number","textMessage":{"text"}}` if the first attempt fails with 4xx.
-    """
-    if not EVOLUTION_API_KEY:
-        print("❌ WhatsApp skipped: EVOLUTION_API_KEY / GLOBAL_API_KEY not set.", flush=True)
-        return False
-    if not WHATSAPP_NUMBERS:
-        print("❌ WhatsApp skipped: WHATSAPP_NUMBERS not set.", flush=True)
-        return False
-    if not message or not str(message).strip():
-        return False
-
-    from urllib.parse import quote
-    instance = quote(INSTANCE_NAME, safe="")
-    url = f"{EVOLUTION_BASE}/message/sendText/{instance}"
-    headers = {
-        "Content-Type": "application/json",
-        "apikey": EVOLUTION_API_KEY,
-        "Authorization": f"Bearer {EVOLUTION_API_KEY}",
-    }
-
-    any_ok = False
-    for raw in WHATSAPP_NUMBERS:
-        number = _normalize_wa_number(raw)
-        if not number:
-            print(f"⚠️ Skipping invalid WhatsApp number: {raw!r}", flush=True)
-            continue
-        masked = _mask_number(number)
-        # Evolution v2 (current): flat text field
-        payloads = [
-            {"number": number, "text": str(message)},
-            # Evolution v1 compatibility
-            {"number": number, "textMessage": {"text": str(message)}},
-        ]
-        sent = False
-        for i, payload in enumerate(payloads):
-            try:
-                r = requests.post(url, json=payload, headers=headers, timeout=20)
-                body_preview = (r.text or "")[:240].replace("\n", " ")
-                if r.status_code < 300:
-                    print(f"✅ WhatsApp sent ({masked}) status={r.status_code} via payload#{i+1}", flush=True)
-                    any_ok = True
-                    sent = True
-                    break
-                print(
-                    f"⚠️ WhatsApp ({masked}) HTTP {r.status_code} payload#{i+1}: {body_preview}",
-                    flush=True,
-                )
-                # Retry alternate payload only on client/server validation errors
-                if r.status_code not in (400, 404, 422, 500):
-                    break
-            except Exception as e:
-                print(f"❌ WhatsApp send error ({masked}) payload#{i+1}: {e}", flush=True)
-        if not sent:
-            print(f"❌ WhatsApp failed for {masked} after trying Evolution v1/v2 payloads", flush=True)
-    return any_ok
+    url = f"{EVOLUTION_BASE}/message/sendText/{INSTANCE_NAME}"
+    headers = {"Content-Type": "application/json", "apikey": GLOBAL_API_KEY}
+    for number in WHATSAPP_NUMBERS:
+        payload = {"number": number, "text": message}
+        try:
+            r = requests.post(url, json=payload, headers=headers, timeout=10)
+            # PRIVACY: mask most of the phone number in logs rather than
+            # printing it in full — logs can end up shared/exported more
+            # widely than intended
+            masked = number[:5] + "***" + number[-2:] if len(number) > 7 else "***"
+            print(f"✅ WhatsApp Status ({masked}): {r.status_code}", flush=True)
+        except Exception as e:
+            print(f"❌ Send error: {e}", flush=True)
 
 
 
@@ -1449,13 +1458,35 @@ def scrape_egp(candidates: list):
         return 0
 
 
-def check_for_tenders():
+def check_for_tenders(force: bool = False):
+    """Run eGP + 2merkato scrape → AI → queue PENDING_APPROVAL.
+
+    force=True bypasses the in-progress lock (used by /api/scan?force=1).
+    Stale locks (running longer than STALE_SCAN_MINUTES) are auto-cleared.
+    """
     global _scan_running, _last_scan
     with _scan_lock:
-        _, db_running = _load_scan_state_from_db()
-        if _scan_running or db_running:
-            print("⚠️ Scan already running — skipping overlapping trigger.", flush=True)
-            return
+        last, db_running = _load_scan_state_from_db()
+        in_progress = bool(_scan_running or db_running)
+        if in_progress and not force:
+            if _scan_is_stale(last, True):
+                print(
+                    f"🔓 Stale scan lock detected (started_at={last.get('started_at')}) "
+                    f"— clearing and starting a new scan (eGP + 2merkato).",
+                    flush=True,
+                )
+                _scan_running = False
+                _persist_scan_state(
+                    running=False,
+                    error=f"auto-cleared stale lock at {datetime.now(timezone.utc).isoformat()}",
+                )
+            else:
+                print("⚠️ Scan already running — skipping overlapping trigger.", flush=True)
+                return
+        elif in_progress and force:
+            print("⚡ force=1 — overriding in-progress scan lock.", flush=True)
+            _scan_running = False
+
         started = datetime.now(timezone.utc).isoformat()
         _scan_running = True
         _last_scan = {
@@ -1465,6 +1496,7 @@ def check_for_tenders():
             "egp_candidates": None,
             "queued_for_approval": None,
             "error": None,
+            "running": True,
         }
         _persist_scan_state(
             running=True,
@@ -1721,10 +1753,30 @@ def api_health():
         "merkato_login_configured": bool(MERKATO_USER and MERKATO_PASS),
         "scan_running": running,
         "last_scan": last,
-        "whatsapp_configured": bool(EVOLUTION_API_KEY and WHATSAPP_NUMBERS),
-        "whatsapp_recipients": len(WHATSAPP_NUMBERS),
-        "evolution_base": EVOLUTION_BASE,
-        "evolution_instance": INSTANCE_NAME,
+    })
+
+
+
+@app.route("/api/scan/reset", methods=["POST", "GET"])
+def api_scan_reset():
+    """Clear stuck scan lock in Postgres (use when logs say 'already running')."""
+    if not _mobile_api_authorized():
+        token = request.args.get("token") or (request.get_json(silent=True) or {}).get("token")
+        if not (TEST_CHECK_TOKEN and token and token == TEST_CHECK_TOKEN):
+            return jsonify({"error": "Unauthorized"}), 401
+    reason = (
+        request.args.get("reason")
+        or (request.get_json(silent=True) or {}).get("reason")
+        or "manual /api/scan/reset"
+    )
+    _clear_scan_lock(str(reason))
+    last, running = _load_scan_state_from_db()
+    return jsonify({
+        "ok": True,
+        "status": "reset",
+        "message": "Scan lock cleared. POST /api/scan to start eGP + 2merkato.",
+        "scan_running": running,
+        "last_scan": last,
     })
 
 
@@ -1748,35 +1800,60 @@ def api_scan():
             "database_connected": False,
         }), 503
 
+    force = (
+        str(request.args.get("force") or "").strip().lower() in ("1", "true", "yes")
+        or str((request.get_json(silent=True) or {}).get("force") or "").strip().lower()
+        in ("1", "true", "yes")
+    )
+
     with _scan_lock:
         last, running = _load_scan_state_from_db()
-        if running or _scan_running:
-            return jsonify({
-                "status": "running",
-                "message": "A scan is already in progress.",
-                "last_scan": last,
-                "database_connected": True,
-            })
-        completed = last.get("completed_at") or _last_scan.get("completed_at")
-        if completed:
-            try:
-                done = datetime.fromisoformat(str(completed).replace("Z", "+00:00"))
-                if datetime.now(timezone.utc) - done < timedelta(minutes=2):
-                    return jsonify({
-                        "status": "recent",
-                        "message": "A scan completed very recently; sync existing records instead of starting another.",
-                        "last_scan": last,
-                        "database_connected": True,
-                    })
-            except Exception:
-                pass
+        if (running or _scan_running) and not force:
+            if _scan_is_stale(last, True):
+                print(
+                    f"🔓 /api/scan: clearing stale lock (started_at={last.get('started_at')})",
+                    flush=True,
+                )
+                _scan_running = False
+                _persist_scan_state(
+                    running=False,
+                    error=f"auto-cleared stale lock via /api/scan at {datetime.now(timezone.utc).isoformat()}",
+                )
+            else:
+                return jsonify({
+                    "status": "running",
+                    "message": "A scan is already in progress. Retry with ?force=1 to override, or POST /api/scan/reset.",
+                    "last_scan": last,
+                    "database_connected": True,
+                })
 
-    # Start scan in background; check_for_tenders will mark running in Postgres
-    threading.Thread(target=check_for_tenders, daemon=True).start()
+        if SCAN_RECENT_COOLDOWN_MINUTES > 0 and not force:
+            completed = last.get("completed_at") or _last_scan.get("completed_at")
+            if completed:
+                try:
+                    done = _parse_ts(completed)
+                    if done and datetime.now(timezone.utc) - done < timedelta(
+                        minutes=SCAN_RECENT_COOLDOWN_MINUTES
+                    ):
+                        return jsonify({
+                            "status": "recent",
+                            "message": (
+                                f"A scan completed within the last {SCAN_RECENT_COOLDOWN_MINUTES} min; "
+                                "sync existing records, or pass force=1 to scan again."
+                            ),
+                            "last_scan": last,
+                            "database_connected": True,
+                        })
+                except Exception:
+                    pass
+
+    # Start both engines (eGP + 2merkato) in background
+    threading.Thread(target=check_for_tenders, kwargs={"force": force}, daemon=True).start()
     return jsonify({
         "status": "started",
         "message": "Tender source scan started (eGP + 2merkato). Results are saved to Postgres as PENDING_APPROVAL.",
         "database_connected": True,
+        "forced": force,
     })
 
 
@@ -1800,34 +1877,6 @@ def _row_to_tender(r):
         d["procurement_object"] = r[12]
         d["constraints"] = r[13]
     return d
-
-
-@app.route("/api/whatsapp/test", methods=["POST", "GET"])
-def api_whatsapp_test():
-    """Send a short test message via Evolution API (auth: X-API-KEY or TEST_CHECK_TOKEN)."""
-    token = request.args.get("token") or (request.get_json(silent=True) or {}).get("token")
-    authorized = _mobile_api_authorized()
-    if not authorized and TEST_CHECK_TOKEN and token == TEST_CHECK_TOKEN:
-        authorized = True
-    if not authorized:
-        return jsonify({"error": "Unauthorized", "status": "denied"}), 401
-
-    body = request.get_json(silent=True) or {}
-    custom = (body.get("message") or request.args.get("message") or "").strip()
-    msg = custom or (
-        "✅ medMETRIC Tender Notifier — WhatsApp test via Evolution API.\n"
-        "If you received this, EVOLUTION_BASE / INSTANCE_NAME / API key / WHATSAPP_NUMBERS are correct."
-    )
-    ok = send_whatsapp(msg)
-    return jsonify({
-        "ok": ok,
-        "status": "sent" if ok else "failed",
-        "evolution_base": EVOLUTION_BASE,
-        "instance": INSTANCE_NAME,
-        "recipients": len(WHATSAPP_NUMBERS),
-        "whatsapp_configured": bool(EVOLUTION_API_KEY and WHATSAPP_NUMBERS),
-        "message": "Check Render logs for per-number HTTP status if failed.",
-    }), (200 if ok else 502)
 
 
 @app.route("/api/tenders", methods=["GET"])
@@ -2041,6 +2090,7 @@ def _ensure_monitor_started():
             return
         _monitor_started = True
         threading.Thread(target=monitoring_loop, daemon=True).start()
+        _reset_stale_scan_on_boot()
         print("📡 Background tender monitor started (eGP + 2merkato)", flush=True)
 
 _ensure_monitor_started()

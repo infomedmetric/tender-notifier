@@ -24,28 +24,14 @@ Set these in **Render Dashboard → your Web Service → Environment**.
 | `EGP_PASS` | eGP password | Optional portal login |
 | `EGP_BASE` | `https://production.egp.gov.et` | eGP host |
 
-## Optional WhatsApp via Evolution API (short notify only)
+## Optional WhatsApp (short notify only)
 
-| Variable | Example | Purpose |
-|----------|---------|---------|
-| `EVOLUTION_BASE` | `https://medmetric-evolution.onrender.com` | Evolution API base URL (no trailing slash) |
-| `INSTANCE_NAME` | `Tender-Notifier.` | Exact Evolution **instance name** (not the id) |
-| `EVOLUTION_API_KEY` | long secret | Preferred Evolution apikey header |
-| `GLOBAL_API_KEY` | long secret | Fallback if `EVOLUTION_API_KEY` is empty |
-| `WHATSAPP_NUMBERS` | `2519xxxxxxxx,2517xxxxxxxx` | Recipients, country code, **no +** |
-
-When a scan finds new tenders, a short WhatsApp is sent: “N new tender(s) waiting for your approval…”.
-Approve can also send a short confirmation. Full tender details stay in the app / Postgres.
-
-**Test after deploy** (use your `MOBILE_API_KEY` or `TEST_CHECK_TOKEN`):
-
-```bash
-curl -X POST "https://YOUR-TENDER-SERVICE.onrender.com/api/whatsapp/test" \
-  -H "X-API-KEY: YOUR_MOBILE_API_KEY" \
-  -H "Content-Type: application/json"
-```
-
-Or: `GET /api/whatsapp/test?token=YOUR_TEST_CHECK_TOKEN`
+| Variable | Purpose |
+|----------|---------|
+| `EVOLUTION_BASE` | Evolution API base URL |
+| `INSTANCE_NAME` | Instance name |
+| `GLOBAL_API_KEY` | Evolution / fallback API key |
+| `WHATSAPP_NUMBERS` | Comma-separated numbers |
 
 ## Optional tuning
 
@@ -93,3 +79,27 @@ Header: `X-API-KEY: <MOBILE_API_KEY>`
 Deploy on Render with **Docker** using the repository `Dockerfile` (also configured in `render.yaml`). The Docker base image and Python dependency are both pinned to Playwright `1.64.1`; the browser executable must match the Python package version. Do not use an old Playwright Docker image with an unconstrained or newer pip package.
 
 After pushing a Dockerfile or requirements change, choose **Manual Deploy → Deploy latest commit** and wait for the build to finish before running a scan. A restart of the previous deployment keeps its old image.
+
+
+## Scan lock / stuck "already running"
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `STALE_SCAN_MINUTES` | `25` | Auto-clear `running` lock older than this |
+| `SCAN_RECENT_COOLDOWN_MINUTES` | `0` | Block re-scan for N minutes after success (`0` = always allow) |
+
+Immediate unlock without redeploy:
+
+```bash
+curl -X POST "https://YOUR-SERVICE.onrender.com/api/scan/reset" \
+  -H "X-API-KEY: YOUR_MOBILE_API_KEY"
+```
+
+Force start even if lock is fresh:
+
+```bash
+curl -X POST "https://YOUR-SERVICE.onrender.com/api/scan?force=1" \
+  -H "X-API-KEY: YOUR_MOBILE_API_KEY"
+```
+
+Each `/api/scan` runs **both** eGP and 2merkato engines.

@@ -1,12 +1,3 @@
-
-## WhatsApp / Evolution API (this build)
-
-- Robust `send_whatsapp()` for Evolution v1 + v2 payloads
-- Phone numbers normalized (e.g. `09…` → `2519…`)
-- `EVOLUTION_API_KEY` preferred over `GLOBAL_API_KEY`
-- `GET/POST /api/whatsapp/test` to verify Evolution wiring
-- Health reports `whatsapp_configured`, recipient count, instance name
-
 # Tender notifier v2
 
 ## Playwright browser/runtime alignment (2026-10-26)
