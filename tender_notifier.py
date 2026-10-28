@@ -1513,28 +1513,37 @@ def check_for_tenders(force: bool = False):
     total_sent = 0
     try:
         print("=================== STARTING SCAN CYCLE ===================", flush=True)
+        print("📌 Order: eGP (API, fast) first → 2merkato (Playwright, slow) second → AI review", flush=True)
 
         candidates = []  # populated by both scrapers; analyzed in ONE batch AI call below
 
+        # eGP FIRST: pure HTTP API, finishes in ~1–3 min. On Render Free the
+        # instance often restarts mid-2merkato; if eGP ran second it never ran.
         try:
-            merkato_found = scrape_2merkato(candidates)
-        except Exception:
-            print("❌ 2merkato engine crashed with an unhandled exception:", flush=True)
-            print(traceback.format_exc(), flush=True)
-            merkato_found = 0
-
-        try:
-            # API-based eGP does not hang like the old Playwright path, so run
-            # in-process to guarantee candidates are returned (subprocess timeout
-            # previously killed a successful 182-item collection before results
-            # could be passed back to the parent).
+            print("—— Phase 1/3: eGP API scan ——", flush=True)
             egp_found = scrape_egp(candidates)
+            print(f"✅ Phase 1 done: {egp_found} eGP candidates so far (total list={len(candidates)})", flush=True)
+            _persist_scan_state(egp_candidates=egp_found, two_merkato_candidates=0)
         except Exception:
             print("❌ eGP engine crashed with an unhandled exception:", flush=True)
             print(traceback.format_exc(), flush=True)
             egp_found = 0
 
-        print(f"🧮 {len(candidates)} total candidate tenders collected ({merkato_found} 2merkato, {egp_found} eGP) — running AI review (Groq×2: merkato + eGP)", flush=True)
+        try:
+            print("—— Phase 2/3: 2merkato Playwright scan ——", flush=True)
+            merkato_found = scrape_2merkato(candidates)
+            print(f"✅ Phase 2 done: {merkato_found} 2merkato candidates (total list={len(candidates)})", flush=True)
+            _persist_scan_state(egp_candidates=egp_found, two_merkato_candidates=merkato_found)
+        except Exception:
+            print("❌ 2merkato engine crashed with an unhandled exception:", flush=True)
+            print(traceback.format_exc(), flush=True)
+            merkato_found = 0
+
+        print(
+            f"🧮 Phase 3/3: AI review — {len(candidates)} candidates "
+            f"({merkato_found} 2merkato, {egp_found} eGP)",
+            flush=True,
+        )
 
         total_sent = 0
         if candidates:
@@ -1749,7 +1758,8 @@ def api_health():
         "scan_api": True,
         "statuses": sorted(TENDER_STATUSES),
         "database_connected": db_ok,
-        "sources": ["2merkato", "egp"],
+        "sources": ["egp", "2merkato"],
+        "scan_order": "egp_then_2merkato",
         "merkato_login_configured": bool(MERKATO_USER and MERKATO_PASS),
         "scan_running": running,
         "last_scan": last,
