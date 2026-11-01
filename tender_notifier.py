@@ -2437,24 +2437,33 @@ def register_evolution_webhook() -> dict:
     hook_url = f"{base}/webhook/evolution?token={quote(WEBHOOK_TOKEN)}"
     endpoint = f"{EVOLUTION_BASE}/webhook/set/{quote(INSTANCE_NAME, safe='')}"
     headers = {"Content-Type": "application/json", "apikey": GLOBAL_API_KEY}
-    bodies = [
-        # Evolution API v2
-        {"webhook": {"enabled": True, "url": hook_url, "webhookByEvents": False,
-                     "webhookBase64": False, "events": ["MESSAGES_UPSERT"]}},
-        # Evolution API v1 / flat variant
-        {"enabled": True, "url": hook_url, "webhook_by_events": False,
-         "webhook_base64": False, "events": ["MESSAGES_UPSERT"]},
-    ]
+    # Evolution API v2 schema: everything wrapped in "webhook", with byEvents /
+    # base64 (NOT webhookByEvents / webhookBase64 — those keys are rejected with 400).
+    body = {"webhook": {
+        "enabled": True,
+        "url": hook_url,
+        "byEvents": False,
+        "base64": False,
+        "events": ["MESSAGES_UPSERT"],
+    }}
     last = ""
-    for body in bodies:
+    # Evolution on Render's free tier sleeps and can take 30-60s to wake up, so
+    # use a long read timeout and a few spaced retries instead of failing once.
+    for attempt in range(1, 4):
         try:
-            r = requests.post(endpoint, json=body, headers=headers, timeout=20)
-            last = f"{r.status_code} {r.text[:150]}"
+            r = requests.post(endpoint, json=body, headers=headers, timeout=75)
+            last = f"{r.status_code} {r.text[:200]}"
             if r.status_code < 300:
                 print(f"✅ Evolution webhook registered -> {base}/webhook/evolution", flush=True)
                 return {"ok": True, "detail": last}
+            print(f"⚠️ Evolution webhook registration attempt {attempt}/3: {last}", flush=True)
+            if r.status_code in (400, 401, 403, 404):
+                break  # config/auth problem — retrying won't help
         except Exception as e:
             last = str(e)
+            print(f"⚠️ Evolution webhook registration attempt {attempt}/3 failed: {last}", flush=True)
+        if attempt < 3:
+            time.sleep(30)
     print(f"⚠️ Evolution webhook registration failed: {last}", flush=True)
     return {"ok": False, "detail": last}
 
