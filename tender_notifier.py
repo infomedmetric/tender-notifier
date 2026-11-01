@@ -1,4 +1,5 @@
 import os
+import re
 import time
 import json
 import requests
@@ -502,6 +503,13 @@ MERKATO_SEARCH_TERMS = [
 # a filtered keyword search returns far fewer pages than the full listing,
 # so a small number here is plenty and keeps the scan fast.
 MERKATO_MAX_PAGES_PER_TERM = int(os.environ.get("MERKATO_MAX_PAGES_PER_TERM", "3"))
+# How many 2merkato detail pages to download per scan (plain HTTP, after
+# Chromium has already quit). The browser used to open one tab per result and
+# that is what kept killing the Render instance mid-scan.
+try:
+    MERKATO_MAX_DETAILS = int(os.environ.get("MERKATO_MAX_DETAILS", "40"))
+except ValueError:
+    MERKATO_MAX_DETAILS = 40
 
 # Any ONE of these alone is specific enough to trigger a match.
 # Includes medMETRIC's actual named service lines (CSSD, RO/water treatment,
@@ -996,181 +1004,46 @@ def send_whatsapp(message):
 
 
 
-# ==================== ENGINE: 2MERKATO (Playwright) ====================
-def scrape_2merkato(candidates: list):
-    print(f"[{datetime.now()}] 🔍 Running 2merkato Engine (Playwright)...", flush=True)
-    found = 0
+# ==================== ENGINE: 2MERKATO ====================
+# Chromium is used only to log in (about half a minute), then it is closed.
+# Search results and detail pages are Inertia JSON inside the HTML, so the
+# rest of the scan is plain HTTP. Opening a browser tab per tender is what
+# kept restarting the Render instance before AI review or WhatsApp ran.
 
+_MERKATO_CHROME_ARGS = [
+    "--no-sandbox",
+    "--disable-dev-shm-usage",
+    "--disable-gpu",
+    "--disable-software-rasterizer",
+    "--disable-extensions",
+    "--disable-background-networking",
+    "--disable-sync",
+    "--disable-default-apps",
+    "--mute-audio",
+    "--no-first-run",
+    "--no-default-browser-check",
+    "--renderer-process-limit=1",
+    "--js-flags=--max-old-space-size=96",
+]
+
+
+def _log_mem(tag: str):
     try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(
-                headless=True,
-                args=["--no-sandbox", "--disable-dev-shm-usage"]
-            )
-            context = browser.new_context(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-            )
-            page = context.new_page()
-
-            # --- Login (optional — only if credentials provided) ---
-            if MERKATO_USER and MERKATO_PASS:
-                try:
-                    page.goto(MERKATO_LOGIN_URL, timeout=30000, wait_until="domcontentloaded")
-                    page.wait_for_selector("input[type='password']", timeout=20000)
-
-                    field_info = page.eval_on_selector_all(
-                        "input",
-                        "els => els.map(e => ({type: e.type, name: e.name, id: e.id, placeholder: e.placeholder}))"
-                    )
-                    print(f"🔎 Login page input fields detected: {field_info}", flush=True)
-
-                    email_field = page.locator(
-                        "input[type='email'], input[name*='email' i], input[name*='user' i], "
-                        "input[id*='email' i], input[id*='user' i], input[placeholder*='email' i]"
-                    ).first
-                    pass_field = page.locator("input[type='password']").first
-
-                    if email_field.count() > 0 and pass_field.count() > 0:
-                        email_field.fill(MERKATO_USER)
-                        pass_field.fill(MERKATO_PASS)
-
-                        submit_btn = page.locator(
-                            "button[type='submit'], button:has-text('Login'), button:has-text('Sign in'), "
-                            "button:has-text('Log in'), input[type='submit']"
-                        ).first
-                        submit_btn.click()
-                        page.wait_for_timeout(4000)
-                        print(f"✅ Submitted login, current URL: {page.url}", flush=True)
-                    else:
-                        print(f"⚠️ Could not confidently identify email/username field among: {field_info}", flush=True)
-                except Exception as e:
-                    print(f"⚠️ Login attempt failed, continuing without auth: {e}", flush=True)
-
-            page.goto(MERKATO_TENDERS_URL, timeout=30000, wait_until="domcontentloaded")
-            page.wait_for_timeout(2000)
-
-            search_input = page.locator(
-                "input[placeholder*='Search by keyword' i], input[placeholder*='keyword' i]"
-            ).first
-
-            if search_input.count() == 0:
-                header_clickables = page.eval_on_selector_all(
-                    "header *, nav *",
-                    "els => els.slice(0, 40).map(e => ({tag: e.tagName, "
-                    "aria: e.getAttribute('aria-label'), cls: e.className, "
-                    "text: (e.innerText || '').trim().slice(0, 30)}))"
-                )
-                print(f"🔎 2merkato search input not immediately visible. Header elements: {header_clickables}", flush=True)
-
-                toggle = page.locator(
-                    "[aria-label*='search' i], button:has-text('Search'), "
-                    "header svg, nav svg, [class*='search-icon' i], [class*='search-toggle' i]"
-                ).first
-                if toggle.count() > 0:
-                    try:
-                        toggle.click(timeout=5000)
-                        page.wait_for_timeout(1000)
-                        print("✅ Clicked a probable search-toggle icon in the header", flush=True)
-                    except Exception as e:
-                        print(f"⚠️ Could not click search-toggle candidate: {e}", flush=True)
-
-                search_input = page.locator(
-                    "input[placeholder*='Search by keyword' i], input[placeholder*='keyword' i]"
-                ).first
-
-            if search_input.count() == 0:
-                print("❌ 2merkato search-by-keyword input never appeared — falling back to the old first-page listing so this scan isn't a total loss.", flush=True)
-                links = page.locator("a[href*='/tenders/']").all()
-                print(f"Fallback listing page: found {len(links)} raw tender links", flush=True)
-                found += _process_merkato_links(links, context, candidates, seen_this_scan=set())
-                browser.close()
-                print(f"2merkato engine complete. Collected {found} candidate matches for AI review.", flush=True)
-                return found
-
-            print("✅ Found 2merkato 'Search by keyword' input — proceeding with keyword-driven search", flush=True)
-
-            seen_this_scan = set()
-            for term in MERKATO_SEARCH_TERMS:
-                try:
-                    if search_input.count() == 0 or not search_input.is_visible():
-                        toggle = page.locator(
-                            "[aria-label*='search' i], button:has-text('Search'), "
-                            "header svg, nav svg, [class*='search-icon' i], [class*='search-toggle' i]"
-                        ).first
-                        if toggle.count() > 0:
-                            try:
-                                toggle.click(timeout=5000)
-                                page.wait_for_timeout(1000)
-                            except Exception:
-                                pass
-                        search_input = page.locator(
-                            "input[placeholder*='Search by keyword' i], input[placeholder*='keyword' i]"
-                        ).first
-
-                    search_input.click()
-                    search_input.fill("")
-                    page.wait_for_timeout(200)
-                    search_input.fill(term)
-
-                    url_before = page.url
-                    search_input.press("Enter")
-                    page.wait_for_timeout(2000)
-
-                    if page.url == url_before:
-                        filter_btn = page.locator("button:has-text('Filter')").first
-                        if filter_btn.count() > 0:
-                            try:
-                                filter_btn.click(timeout=5000, force=True)
-                            except Exception as e:
-                                print(f"⚠️ Forced Filter click also failed for '{term}': {e}", flush=True)
-
-                    page.wait_for_timeout(2500)
-                    print(f"➡️ 2merkato search '{term}' submitted, current URL: {page.url}", flush=True)
-
-                    for page_num in range(1, MERKATO_MAX_PAGES_PER_TERM + 1):
-                        if page_num > 1:
-                            next_btn = page.locator(
-                                "button:has-text('Next'), a:has-text('Next'), [aria-label*='next' i]"
-                            ).first
-                            if next_btn.count() == 0:
-                                break
-                            try:
-                                next_btn.click(timeout=5000)
-                                page.wait_for_timeout(2000)
-                            except Exception:
-                                break
-
-                        links = page.locator("a[href*='/tenders/']").all()
-                        print(f"2merkato search '{term}' page {page_num}: found {len(links)} raw tender links", flush=True)
-                        if not links:
-                            break
-
-                        found += _process_merkato_links(links, context, candidates, seen_this_scan)
-
-                except Exception as e:
-                    print(f"⚠️ 2merkato search for '{term}' failed: {e}", flush=True)
-                    continue
-
-            browser.close()
-
-        print(f"2merkato engine complete. Collected {found} candidate matches for AI review.", flush=True)
-        return found
-
-    except Exception as e:
-        print(f"❌ 2merkato extraction engine down: {e}", flush=True)
-        return 0
-
-
-def _get_merkato_card_status(link) -> str:
-    try:
-        container = link.locator("xpath=ancestor::*[contains(., 'Bidding')][1]").first
-        if container.count() == 0:
-            return "unknown"
-        card_text = container.inner_text(timeout=3000)
+        import resource
+        rss_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        print(f"🧠 mem {tag}: maxrss={rss_kb / 1024:.0f}MB", flush=True)
     except Exception:
-        return "unknown"
+        pass
 
-    lower = card_text.lower()
+
+def _merkato_block_heavy(route):
+    if route.request.resource_type in ("image", "media", "font"):
+        return route.abort()
+    return route.continue_()
+
+
+def _merkato_card_status(card_text: str) -> str:
+    lower = (card_text or "").lower()
     idx = lower.find("bidding")
     if idx == -1:
         return "unknown"
@@ -1182,78 +1055,259 @@ def _get_merkato_card_status(link) -> str:
     return "unknown"
 
 
-def _process_merkato_links(links, context, candidates: list, seen_this_scan: set) -> int:
+def _merkato_session(cookies):
+    session = requests.Session()
+    session.headers["User-Agent"] = (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+    )
+    for c in cookies or []:
+        name, value = c.get("name"), c.get("value")
+        if name and value is not None:
+            session.cookies.set(name, value)
+    return session
+
+
+def _merkato_load_inertia(session, url):
+    """2merkato is Inertia: the tender payload is JSON inside data-page, not the DOM."""
+    try:
+        r = session.get(url, timeout=25)
+    except Exception as e:
+        print(f"⚠️ 2merkato HTTP failed for {url[:90]}: {e}", flush=True)
+        return None
+    if r.status_code != 200 or not r.text:
+        print(f"⚠️ 2merkato HTTP {r.status_code} for {url[:90]}", flush=True)
+        return None
+    m = re.search(r'data-page="([^"]+)"', r.text)
+    if not m:
+        print(f"⚠️ 2merkato page had no data-page JSON: {url[:90]}", flush=True)
+        return None
+    try:
+        import html as html_lib
+        return json.loads(html_lib.unescape(m.group(1)))
+    except Exception as e:
+        print(f"⚠️ 2merkato data-page parse failed: {e}", flush=True)
+        return None
+
+
+def _merkato_text_from_props(props, limit=6000) -> str:
+    skip = {
+        "csrf_token", "recaptcha", "auth", "errors", "flash", "zones",
+        "env", "site_key", "notification_bar", "remaining_days", "portal",
+    }
+    parts = []
+    used = 0
+
+    def walk(o, key=""):
+        nonlocal used
+        if used >= limit:
+            return
+        if isinstance(o, dict):
+            for k, v in o.items():
+                if k in skip:
+                    continue
+                walk(v, k)
+        elif isinstance(o, list):
+            for v in o[:40]:
+                walk(v, key)
+        elif isinstance(o, str):
+            s = " ".join(o.split())
+            if len(s) < 3 or s.lower() == "subscription required":
+                return
+            line = f"{key}: {s}" if key else s
+            parts.append(line)
+            used += len(line) + 1
+
+    walk(props or {})
+    return "\n".join(parts)[:limit]
+
+
+def _merkato_login_cookies():
+    """Log in with Chromium, return cookies, then close the browser immediately.
+
+    Walking search results inside Chromium (a new tab per tender) is what kept
+    restarting the Render instance before WhatsApp could send.
+    """
+    if not (MERKATO_USER and MERKATO_PASS):
+        print("⚠️ MERKATO_USER/PASS not set — 2merkato dates stay hidden behind the subscription wall.", flush=True)
+        return []
+    browser = None
+    cookies = []
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True, args=_MERKATO_CHROME_ARGS)
+            context = browser.new_context(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+            )
+            page = context.new_page()
+            page.route("**/*", _merkato_block_heavy)
+            _log_mem("chromium-up")
+            page.goto(MERKATO_LOGIN_URL, timeout=30000, wait_until="domcontentloaded")
+            page.wait_for_selector("input[type='password']", timeout=20000)
+            field_info = page.eval_on_selector_all(
+                "input",
+                "els => els.map(e => ({type: e.type, name: e.name, id: e.id, placeholder: e.placeholder}))"
+            )
+            print(f"🔎 Login page input fields detected: {field_info}", flush=True)
+            email_field = page.locator(
+                "input[type='email'], input[name*='email' i], input[name*='user' i], "
+                "input[id*='email' i], input[id*='user' i], input[placeholder*='email' i], "
+                "input#emailOrMobile"
+            ).first
+            pass_field = page.locator("input[type='password']").first
+            if email_field.count() > 0 and pass_field.count() > 0:
+                email_field.fill(MERKATO_USER)
+                pass_field.fill(MERKATO_PASS)
+                submit_btn = page.locator(
+                    "button[type='submit'], button:has-text('Login'), button:has-text('Sign in'), "
+                    "button:has-text('Log in'), input[type='submit']"
+                ).first
+                submit_btn.click()
+                page.wait_for_timeout(4000)
+                print(f"✅ Submitted login, current URL: {page.url}", flush=True)
+            else:
+                print(f"⚠️ Could not confidently identify email/username field among: {field_info}", flush=True)
+            try:
+                cookies = context.cookies()
+            except Exception:
+                cookies = []
+            browser.close()
+            browser = None
+    except Exception as e:
+        print(f"⚠️ 2merkato login failed, continuing logged-out: {e}", flush=True)
+    finally:
+        _log_mem("chromium-closed")
+        if browser is not None:
+            try:
+                browser.close()
+            except Exception:
+                pass
+    print(f"🍪 2merkato session cookies: {len(cookies)}", flush=True)
+    return cookies
+
+
+def scrape_2merkato(candidates: list):
+    print(f"[{datetime.now()}] 🔍 Running 2merkato Engine (login, then HTTP)...", flush=True)
+    _log_mem("before-chromium")
     found = 0
-    for link in links:
-        try:
-            title_text = link.inner_text().strip()
-            href = link.get_attribute("href")
-            if not title_text or not href:
-                continue
+    pending = []
+    try:
+        from urllib.parse import quote
 
-            full_link = href if href.startswith("http") else f"{MERKATO_BASE}{href}"
+        cookies = _merkato_login_cookies()
+        session = _merkato_session(cookies)
+        seen = set()
+        warned_sub = False
 
-            if full_link in seen_this_scan:
-                continue
-            seen_this_scan.add(full_link)
-
-            if is_relevant_tender(title_text):
-                tender_id = f"merkato_{full_link.rstrip('/').split('/')[-1]}"
-                if not is_already_notified(tender_id):
-                    status = _get_merkato_card_status(link)
-                    if status == "closed":
-                        print(f"⏭️ Skipping closed 2merkato tender (Bidding: Closed): {title_text}", flush=True)
+        for term in MERKATO_SEARCH_TERMS:
+            if len(pending) >= MERKATO_MAX_DETAILS:
+                print(
+                    f"⏸️ MERKATO_MAX_DETAILS={MERKATO_MAX_DETAILS} reached — "
+                    "remaining 2merkato terms wait for the next scan",
+                    flush=True,
+                )
+                break
+            for page_num in range(1, MERKATO_MAX_PAGES_PER_TERM + 1):
+                if len(pending) >= MERKATO_MAX_DETAILS:
+                    break
+                url = (
+                    f"{MERKATO_TENDERS_URL}?categories=&page={page_num}"
+                    f"&q={quote(term)}&regions=&sources="
+                )
+                data = _merkato_load_inertia(session, url)
+                rows = (((data or {}).get("props") or {}).get("tenders") or {}).get("data") or []
+                print(
+                    f"➡️ 2merkato search '{term}' page {page_num}: {len(rows)} tenders  {url}",
+                    flush=True,
+                )
+                if not rows:
+                    break
+                if (
+                    not warned_sub
+                    and str((rows[0] or {}).get("bid_closing_date_text") or "").strip().lower()
+                    == "subscription required"
+                ):
+                    warned_sub = True
+                    print(
+                        "⚠️ 2merkato still says 'Subscription required' — login cookie was not accepted. Titles only.",
+                        flush=True,
+                    )
+                for item in rows:
+                    if len(pending) >= MERKATO_MAX_DETAILS:
+                        break
+                    title_text = (item.get("title") or "").strip()
+                    raw_id = str(item.get("id") or "").strip()
+                    if not title_text or not raw_id:
+                        continue
+                    full_link = f"{MERKATO_BASE}/tenders/{raw_id}"
+                    if full_link in seen:
+                        continue
+                    seen.add(full_link)
+                    if not is_relevant_tender(title_text):
+                        continue
+                    tender_id = f"merkato_{raw_id}"
+                    if is_already_notified(tender_id):
+                        continue
+                    if item.get("is_open") is False:
+                        print(f"⏭️ Skipping closed 2merkato tender: {title_text}", flush=True)
                         mark_as_notified(tender_id)
                         continue
-
-                    # NOTE: do NOT mark_as_notified() here — same reasoning as
-                    # the eGP engine. This candidate hasn't been AI-reviewed or
-                    # sent yet; marking it now would permanently bury it if the
-                    # AI batch fails or genuinely (but wrongly) rejects it.
-                    found += 1
-
-                    detail_text = ""
-                    detail_page = None
-                    try:
-                        detail_page = context.new_page()
-                        detail_page.goto(full_link, timeout=20000, wait_until="domcontentloaded")
-                        try:
-                            detail_page.wait_for_load_state("networkidle", timeout=10000)
-                        except Exception:
-                            pass
-                        for poll_attempt in range(5):
-                            detail_page.wait_for_timeout(1000)
-                            try:
-                                candidate_text = detail_page.locator("body").inner_text(timeout=5000)
-                            except Exception:
-                                candidate_text = ""
-                            if len(candidate_text) > 300:
-                                detail_text = candidate_text
-                                break
-                            detail_text = candidate_text
-                        detail_text = detail_text[:6000]
-                        print(f"📄 Captured {len(detail_text)} chars from 2merkato detail page", flush=True)
-                    except Exception as e:
-                        print(f"⚠️ Could not read 2merkato detail page text: {e}", flush=True)
-                    finally:
-                        if detail_page is not None:
-                            try:
-                                detail_page.close()
-                            except Exception:
-                                pass
-
-                    candidates.append({
+                    closing = (item.get("bid_closing_date_text") or "").strip()
+                    if closing.lower() == "subscription required":
+                        closing = ""
+                    company = ((item.get("company") or {}).get("name_en") or "").strip()
+                    pending.append({
                         "id": tender_id,
                         "source": "2merkato",
                         "title": title_text,
                         "ref_no": "",
-                        "detail_text": detail_text,
+                        "detail_text": "",
                         "link": full_link,
+                        "deadline": closing,
+                        "_company": company,
                     })
-        except Exception:
-            continue
-    return found
+                    found += 1
+                if len(rows) < 15:
+                    break
 
+        for cand in pending:
+            data = _merkato_load_inertia(session, cand["link"])
+            detail = _merkato_text_from_props((data or {}).get("props") or {})
+            if not detail:
+                bits = [cand["title"]]
+                if cand.get("deadline"):
+                    bits.append("Closing date: " + cand["deadline"])
+                if cand.get("_company"):
+                    bits.append("Procuring entity: " + cand["_company"])
+                detail = "\n".join(bits)
+            cand["detail_text"] = detail[:6000]
+            cand.pop("_company", None)
+            print(f"📄 Captured {len(cand['detail_text'])} chars from 2merkato detail", flush=True)
+            time.sleep(0.2)
+
+        candidates.extend(pending)
+        pending.clear()
+        print(f"2merkato engine complete. Collected {found} candidate matches for AI review.", flush=True)
+        return found
+    except Exception as e:
+        print(f"❌ 2merkato extraction engine down: {e}", flush=True)
+        print(traceback.format_exc(), flush=True)
+        if pending:
+            for cand in pending:
+                cand.pop("_company", None)
+            print(f"⚠️ Keeping {len(pending)} 2merkato candidates collected before the error", flush=True)
+            candidates.extend(pending)
+        return found
+
+
+def _get_merkato_card_status(link) -> str:
+    try:
+        container = link.locator("xpath=ancestor::*[contains(., 'Bidding')][1]").first
+        if container.count() == 0:
+            return "unknown"
+        card_text = container.inner_text(timeout=3000)
+    except Exception:
+        return "unknown"
+    return _merkato_card_status(card_text)
 
 
 def _egp_api_get(path_and_query: str, timeout: int = 30):
@@ -1557,6 +1611,130 @@ def _format_tender_notification(t: dict) -> str:
     return "\n".join(lines)
 
 
+def review_and_notify(candidates, whatsapp_state):
+    """AI-review one source, save PENDING_APPROVAL, WhatsApp up to the shared cap.
+
+    whatsapp_state keys: sent, overflow, max. Returns how many were queued.
+    Sending happens here, per source, so an eGP batch is delivered even if the
+    2merkato browser later kills the process.
+    """
+    if not candidates:
+        return 0
+
+    queued = 0
+    notify_items = []
+    batch_results = batch_analyze_tenders(candidates)
+
+    for i, c in enumerate(candidates):
+        result = batch_results.get(i) if batch_results is not None else None
+
+        if batch_results is None:
+            is_relevant = True
+            match_score = "?"
+            reason = "AI batch analysis unavailable — keyword match only"
+            procurement_object = ""
+            constraints = "Unknown — AI unavailable"
+            closing_date = (c.get("deadline") or "").strip() or "Unknown — AI unavailable"
+            ai_verified = False
+        elif result is None:
+            is_relevant = True
+            match_score = "?"
+            reason = "Missing from AI batch response — keyword match only"
+            procurement_object = ""
+            constraints = "Unknown — AI unavailable"
+            closing_date = (c.get("deadline") or "").strip() or "Unknown — AI unavailable"
+            ai_verified = False
+        else:
+            is_relevant = bool(result.get("relevant", True))
+            match_score = result.get("match_score", "?")
+            reason = result.get("reason", "")
+            procurement_object = result.get("procurement_object", "")
+            constraints = result.get("constraints") or "Not stated in provided text"
+            closing_date = result.get("closing_date") or "Not stated in provided text"
+            ai_verified = True
+
+        api_deadline = (c.get("deadline") or "").strip()
+        if api_deadline and (
+            not closing_date
+            or closing_date in (
+                "Unknown — AI unavailable",
+                "Not stated in provided text",
+                "?",
+            )
+        ):
+            closing_date = api_deadline
+
+        if not is_relevant:
+            print(
+                f"🤖 AI rejected as not relevant, skipping alert: {c['title']} — "
+                f"reason: {reason or '(no reason returned)'}",
+                flush=True,
+            )
+            mark_as_notified(c["id"])
+            continue
+
+        skip_all_unverified = os.environ.get("SKIP_UNVERIFIED_ALERTS", "0").strip().lower() in ("1", "true", "yes")
+        if not ai_verified:
+            title_l = c["title"].lower()
+            strong_hit = any(
+                k in title_l
+                for k in (
+                    "dialysis", "hemodialysis", "hemodial", "bbraun", "b braun",
+                    "dialog+", "ultrasound", "x-ray", "xray", "ct scan",
+                    "steriliz", "autoclave", "cssd", "reverse osmosis", "ro system",
+                    "water treatment", "biomedical", "medical imaging",
+                    "maintenance and repair", "calibration",
+                )
+            )
+            if skip_all_unverified or not strong_hit:
+                print(f"⏭️ Skipping unverified candidate: {c['title'][:60]}", flush=True)
+                continue
+            print(f"⚠️ AI unavailable but strong keyword match — queue for approval: {c['title'][:60]}", flush=True)
+
+        try:
+            score_val = match_score if str(match_score).replace(".", "").isdigit() else 0
+            detail_blob = (c.get("detail_text") or c.get("detail") or c.get("description") or reason or "")[:2000]
+            upsert_tender_record(
+                tender_id=str(c.get("id") or ""),
+                title=(c.get("title") or "")[:500],
+                description=detail_blob,
+                source=(c.get("source") or "")[:120],
+                deadline=str(closing_date or c.get("deadline") or "")[:80],
+                relevance_score=score_val,
+                budget=str(c.get("budget") or "")[:120],
+                url=(c.get("link") or c.get("url") or "")[:500],
+                status="PENDING_APPROVAL",
+                ai_reason=str(reason or "")[:500],
+                procurement_object=str(procurement_object or "")[:500],
+                constraints_text=str(constraints or "")[:1000],
+                force_status=True,
+            )
+            mark_as_notified(c["id"])
+            queued += 1
+            notify_items.append({
+                "title": c.get("title") or "",
+                "source": c.get("source") or "",
+                "deadline": str(closing_date or c.get("deadline") or ""),
+                "score": score_val,
+                "object": str(procurement_object or ""),
+                "reason": str(reason or ""),
+                "url": c.get("link") or c.get("url") or "",
+                "ai_verified": bool(ai_verified),
+            })
+            print(f"📋 Queued for approval: {c['title'][:70]} (score={match_score})", flush=True)
+        except Exception as _up_err:
+            print(f"⚠️ upsert PENDING_APPROVAL failed: {_up_err}", flush=True)
+
+    for item in notify_items:
+        if whatsapp_state["sent"] >= whatsapp_state["max"]:
+            whatsapp_state["overflow"] += 1
+            continue
+        send_whatsapp(_format_tender_notification(item))
+        whatsapp_state["sent"] += 1
+        time.sleep(1.0)
+    return queued
+
+
 def check_for_tenders(force: bool = False):
     """Run eGP + 2merkato scrape → AI → queue PENDING_APPROVAL.
 
@@ -1612,26 +1790,49 @@ def check_for_tenders(force: bool = False):
     total_sent = 0
     try:
         print("=================== STARTING SCAN CYCLE ===================", flush=True)
-        print("📌 Order: eGP (API, fast) first → 2merkato (Playwright, slow) second → AI review", flush=True)
+        print(
+            "📌 Order: eGP (API) → AI + WhatsApp → 2merkato (browser) → AI + WhatsApp",
+            flush=True,
+        )
+        print(
+            "   eGP is saved and messaged BEFORE Chromium starts, so a browser "
+            "restart cannot drop those tenders.",
+            flush=True,
+        )
 
-        candidates = []  # populated by both scrapers; analyzed in ONE batch AI call below
-
-        # eGP FIRST: pure HTTP API, finishes in ~1–3 min. On Render Free the
-        # instance often restarts mid-2merkato; if eGP ran second it never ran.
         try:
-            print("—— Phase 1/3: eGP API scan ——", flush=True)
-            egp_found = scrape_egp(candidates)
-            print(f"✅ Phase 1 done: {egp_found} eGP candidates so far (total list={len(candidates)})", flush=True)
+            wa_max = int(os.environ.get("NOTIFY_MAX_PER_SCAN", "10"))
+        except ValueError:
+            wa_max = 10
+        whatsapp_state = {"sent": 0, "overflow": 0, "max": max(wa_max, 0)}
+
+        # eGP FIRST: pure HTTP, finishes in about a minute. Review and notify
+        # it before Playwright — on Render Free the instance was being killed
+        # mid-2merkato, and every eGP match lived only in memory.
+        egp_candidates = []
+        try:
+            print("—— Phase 1/4: eGP API scan ——", flush=True)
+            egp_found = scrape_egp(egp_candidates)
+            print(f"✅ Phase 1 done: {egp_found} eGP candidates", flush=True)
             _persist_scan_state(egp_candidates=egp_found, two_merkato_candidates=0)
         except Exception:
             print("❌ eGP engine crashed with an unhandled exception:", flush=True)
             print(traceback.format_exc(), flush=True)
             egp_found = 0
 
+        print(
+            f"—— Phase 2/4: AI review + WhatsApp for {len(egp_candidates)} eGP candidates ——",
+            flush=True,
+        )
+        total_sent += review_and_notify(egp_candidates, whatsapp_state)
+        egp_candidates.clear()
+        _log_mem("after-egp-review")
+
+        merkato_candidates = []
         try:
-            print("—— Phase 2/3: 2merkato Playwright scan ——", flush=True)
-            merkato_found = scrape_2merkato(candidates)
-            print(f"✅ Phase 2 done: {merkato_found} 2merkato candidates (total list={len(candidates)})", flush=True)
+            print("—— Phase 3/4: 2merkato scan (login, then HTTP) ——", flush=True)
+            merkato_found = scrape_2merkato(merkato_candidates)
+            print(f"✅ Phase 3 done: {merkato_found} 2merkato candidates", flush=True)
             _persist_scan_state(egp_candidates=egp_found, two_merkato_candidates=merkato_found)
         except Exception:
             print("❌ 2merkato engine crashed with an unhandled exception:", flush=True)
@@ -1639,155 +1840,23 @@ def check_for_tenders(force: bool = False):
             merkato_found = 0
 
         print(
-            f"🧮 Phase 3/3: AI review — {len(candidates)} candidates "
-            f"({merkato_found} 2merkato, {egp_found} eGP)",
+            f"—— Phase 4/4: AI review + WhatsApp for {len(merkato_candidates)} 2merkato candidates ——",
+            flush=True,
+        )
+        total_sent += review_and_notify(merkato_candidates, whatsapp_state)
+
+        print(
+            f"=================== SCAN COMPLETE: {total_sent} tenders queued for approval "
+            f"({egp_found} eGP + {merkato_found} 2merkato candidates) ===================",
             flush=True,
         )
 
-        total_sent = 0
-        notify_items = []  # tenders to announce on WhatsApp after the loop
-        if candidates:
-            # ONE (or a handful of) Groq call(s) for the entire scan cycle, covering
-            # every candidate from both engines — instead of the old per-tender
-            # approach that could burn a day's free-tier quota in a single scan.
-            # NOTE: this only batches the AI ANALYSIS step, not the WhatsApp
-            # notifications — each tender still gets sent as its own message
-            # below, since that's easier to read/forward than one long combined
-            # message.
-            batch_results = batch_analyze_tenders(candidates)
-
-            for i, c in enumerate(candidates):
-                result = batch_results.get(i) if batch_results is not None else None
-
-                if batch_results is None:
-                    # The whole batch call failed even after retries (e.g. quota
-                    # exhausted). Fall back to sending everything that passed the
-                    # keyword filter, clearly flagged as unverified, rather than
-                    # silently dropping legitimate tenders.
-                    is_relevant = True
-                    match_score = "?"
-                    reason = "AI batch analysis unavailable — keyword match only"
-                    procurement_object = ""
-                    constraints = "Unknown — AI unavailable"
-                    closing_date = (c.get("deadline") or "").strip() or "Unknown — AI unavailable"
-                    ai_verified = False
-                elif result is None:
-                    # Batch call succeeded but this particular index was missing
-                    # from the response — same fallback, just for one item
-                    is_relevant = True
-                    match_score = "?"
-                    reason = "Missing from AI batch response — keyword match only"
-                    procurement_object = ""
-                    constraints = "Unknown — AI unavailable"
-                    closing_date = (c.get("deadline") or "").strip() or "Unknown — AI unavailable"
-                    ai_verified = False
-                else:
-                    is_relevant = bool(result.get("relevant", True))
-                    match_score = result.get("match_score", "?")
-                    reason = result.get("reason", "")
-                    procurement_object = result.get("procurement_object", "")
-                    # "Not stated in provided text" (not "None identified") is the
-                    # correct fallback here — the AI was only shown an excerpt of
-                    # the page, so an empty result means "not found in what we
-                    # sent it", not "confirmed there are none".
-                    constraints = result.get("constraints") or "Not stated in provided text"
-                    closing_date = result.get("closing_date") or "Not stated in provided text"
-                    ai_verified = True
-
-                # Prefer real API deadline when AI left it unknown / not stated
-                api_deadline = (c.get("deadline") or "").strip()
-                if api_deadline and (
-                    not closing_date
-                    or closing_date in (
-                        "Unknown — AI unavailable",
-                        "Not stated in provided text",
-                        "?",
-                    )
-                ):
-                    closing_date = api_deadline
-
-                if not is_relevant:
-                    # Log the AI's actual reasoning, not just the title — makes
-                    # it possible to sanity-check a borderline rejection (e.g. a
-                    # title that LOOKED relevant) without digging through the
-                    # WhatsApp thread for context that was never sent there
-                    print(f"🤖 AI rejected as not relevant, skipping alert: {c['title']} — reason: {reason or '(no reason returned)'}", flush=True)
-                    # This is a genuine, AI-verified rejection (not a transient
-                    # failure — those keep is_relevant forced True above), so it's
-                    # safe to permanently mark it and never re-surface it.
-                    mark_as_notified(c["id"])
-                    continue
-
-                # When AI fails for an item, still surface if the title has a STRONG
-                # keyword. Set SKIP_UNVERIFIED_ALERTS=1 to suppress all unverified.
-                skip_all_unverified = os.environ.get("SKIP_UNVERIFIED_ALERTS", "0").strip().lower() in ("1", "true", "yes")
-                if not ai_verified:
-                    title_l = c["title"].lower()
-                    strong_hit = any(
-                        k in title_l
-                        for k in (
-                            "dialysis", "hemodialysis", "hemodial", "bbraun", "b braun",
-                            "dialog+", "ultrasound", "x-ray", "xray", "ct scan",
-                            "steriliz", "autoclave", "cssd", "reverse osmosis", "ro system",
-                            "water treatment", "biomedical", "medical imaging",
-                            "maintenance and repair", "calibration",
-                        )
-                    )
-                    if skip_all_unverified or not strong_hit:
-                        print(f"⏭️ Skipping unverified candidate: {c['title'][:60]}", flush=True)
-                        continue
-                    print(f"⚠️ AI unavailable but strong keyword match — queue for approval: {c['title'][:60]}", flush=True)
-
-                # Human-in-the-loop: save as PENDING_APPROVAL for the mobile app.
-                # Do NOT send the full tender details on WhatsApp anymore.
-                try:
-                    score_val = match_score if str(match_score).replace(".", "").isdigit() else 0
-                    detail_blob = (c.get("detail_text") or c.get("detail") or c.get("description") or reason or "")[:2000]
-                    upsert_tender_record(
-                        tender_id=str(c.get("id") or ""),
-                        title=(c.get("title") or "")[:500],
-                        description=detail_blob,
-                        source=(c.get("source") or "")[:120],
-                        deadline=str(closing_date or c.get("deadline") or "")[:80],
-                        relevance_score=score_val,
-                        budget=str(c.get("budget") or "")[:120],
-                        url=(c.get("link") or c.get("url") or "")[:500],
-                        status="PENDING_APPROVAL",
-                        ai_reason=str(reason or "")[:500],
-                        procurement_object=str(procurement_object or "")[:500],
-                        constraints_text=str(constraints or "")[:1000],
-                        force_status=True,  # first time we see it as relevant
-                    )
-                    mark_as_notified(c["id"])
-                    total_sent += 1
-                    notify_items.append({
-                        "title": c.get("title") or "",
-                        "source": c.get("source") or "",
-                        "deadline": str(closing_date or c.get("deadline") or ""),
-                        "score": score_val,
-                        "object": str(procurement_object or ""),
-                        "reason": str(reason or ""),
-                        "url": c.get("link") or c.get("url") or "",
-                        "ai_verified": bool(ai_verified),
-                    })
-                    print(f"📋 Queued for approval: {c['title'][:70]} (score={match_score})", flush=True)
-                except Exception as _up_err:
-                    print(f"⚠️ upsert PENDING_APPROVAL failed: {_up_err}", flush=True)
-
-        total = total_sent
-        print(f"=================== SCAN COMPLETE: {total} tenders queued for approval ({len(candidates)} candidates reviewed) ===================", flush=True)
-
-        # WhatsApp: one message per new tender (AI-reviewed), then it is also in the
-        # mobile app (Tenders → Approve / Reject). Capped so a big scan can't flood.
-        if total > 0:
-            max_msgs = int(os.environ.get("NOTIFY_MAX_PER_SCAN", "10"))
-            for item in notify_items[:max_msgs]:
-                send_whatsapp(_format_tender_notification(item))
-                time.sleep(1.0)  # gentle pacing so WhatsApp doesn't throttle a burst
-            extra = len(notify_items) - max_msgs
-            if extra > 0:
-                send_whatsapp(f"…and {extra} more new tender(s). Open the medMETRIC app → Tenders.")
-        elif os.environ.get("NOTIFY_EMPTY_SCANS", "0").strip().lower() in ("1", "true", "yes"):
+        if whatsapp_state["overflow"] > 0:
+            send_whatsapp(
+                f"…and {whatsapp_state['overflow']} more new tender(s). "
+                "Open the medMETRIC app → Tenders."
+            )
+        elif total_sent == 0 and os.environ.get("NOTIFY_EMPTY_SCANS", "0").strip().lower() in ("1", "true", "yes"):
             send_whatsapp("🔍 Tender scan completed. No new matches.")
 
     except Exception as scan_err:
@@ -2212,8 +2281,8 @@ def _ensure_monitor_started():
         if _monitor_started:
             return
         _monitor_started = True
-        threading.Thread(target=monitoring_loop, daemon=True).start()
         _reset_stale_scan_on_boot()
+        threading.Thread(target=monitoring_loop, daemon=True).start()
         print("📡 Background tender monitor started (eGP + 2merkato)", flush=True)
 
 _ensure_monitor_started()
