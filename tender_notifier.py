@@ -1,4 +1,5 @@
 import os
+import re
 import time
 import json
 import requests
@@ -605,6 +606,15 @@ def init_db():
                 cur.execute(f"ALTER TABLE tenders ADD COLUMN IF NOT EXISTS {col} {typ}")
             except Exception:
                 pass
+        # Short numeric code per tender so a WhatsApp reply like "approve 12"
+        # can identify the tender (real tender ids are long and unwieldy).
+        try:
+            cur.execute("ALTER TABLE tenders ADD COLUMN IF NOT EXISTS approval_code INTEGER")
+            cur.execute("CREATE SEQUENCE IF NOT EXISTS tender_approval_seq START 1")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_tenders_approval_code ON tenders (approval_code)")
+        except Exception as _e:
+            print(f"⚠️ approval_code migration skipped: {_e}", flush=True)
+            conn.rollback()
         # Shared scan state across gunicorn workers (in-memory alone is per-process)
         cur.execute("""
             CREATE TABLE IF NOT EXISTS scan_status (
@@ -1546,6 +1556,7 @@ def check_for_tenders(force: bool = False):
         )
 
         total_sent = 0
+        queued_items = []  # tenders queued this scan, for WhatsApp approval questions
         if candidates:
             # ONE (or a handful of) Groq call(s) for the entire scan cycle, covering
             # every candidate from both engines — instead of the old per-tender
@@ -1660,6 +1671,7 @@ def check_for_tenders(force: bool = False):
                     )
                     mark_as_notified(c["id"])
                     total_sent += 1
+                    queued_items.append(str(c.get("id") or ""))
                     print(f"📋 Queued for approval: {c['title'][:70]} (score={match_score})", flush=True)
                 except Exception as _up_err:
                     print(f"⚠️ upsert PENDING_APPROVAL failed: {_up_err}", flush=True)
@@ -1667,12 +1679,17 @@ def check_for_tenders(force: bool = False):
         total = total_sent
         print(f"=================== SCAN COMPLETE: {total} tenders queued for approval ({len(candidates)} candidates reviewed) ===================", flush=True)
 
-        # Short WhatsApp only — full details live in the mobile app for approval
+        # Ask for approval over WhatsApp (Evolution API): one message per
+        # tender with a short code; the user replies "approve 12" / "reject 12".
+        # The mobile app still works too — both read/write the same Postgres rows.
         if total > 0:
-            send_whatsapp(
-                f"🔔 *{total} new tender(s)* waiting for your approval in the medMETRIC app.\n"
-                f"Open Tenders → review → Approve or Reject."
-            )
+            sent_q = send_approval_questions(queued_items)
+            if not sent_q:
+                # Fallback so a failure of the detailed questions never means silence
+                send_whatsapp(
+                    f"🔔 *{total} new tender(s)* waiting for your approval.\n"
+                    f"Reply *PENDING* to list them."
+                )
         else:
             # Optional: quiet scans can skip the "nothing found" message
             if os.environ.get("NOTIFY_EMPTY_SCANS", "0").strip().lower() in ("1", "true", "yes"):
@@ -2083,6 +2100,372 @@ def api_reject_tender(tender_id):
         return jsonify({"error": str(e)}), 500
 
 
+# ==================== WHATSAPP APPROVAL (Evolution API) ====================
+# Flow: scan queues PENDING_APPROVAL tenders -> one WhatsApp question per tender
+# (with a short code) -> user replies "approve 12" / "reject 12" -> Evolution API
+# POSTs the incoming message to /webhook/evolution -> status updated in Postgres.
+# The mobile app keeps working; both use the same `tenders` table.
+
+APPROVAL_MAX_QUESTIONS_PER_SCAN = int(os.environ.get("APPROVAL_MAX_QUESTIONS_PER_SCAN", "10"))
+WEBHOOK_TOKEN = os.environ.get("WEBHOOK_TOKEN") or os.environ.get("TEST_CHECK_TOKEN") or ""
+
+
+def _digits(value) -> str:
+    return "".join(ch for ch in str(value or "") if ch.isdigit())
+
+
+def _approval_db():
+    """Dedicated short-lived connection — the webhook runs in a request thread,
+    so it must not share the scanner's long-lived global connection."""
+    return psycopg2.connect(DATABASE_URL, sslmode="require", connect_timeout=10)
+
+
+def send_whatsapp_to(number: str, message: str) -> bool:
+    """Send one WhatsApp text through Evolution API to a single number."""
+    if not GLOBAL_API_KEY or not number:
+        return False
+    url = f"{EVOLUTION_BASE}/message/sendText/{INSTANCE_NAME}"
+    headers = {"Content-Type": "application/json", "apikey": GLOBAL_API_KEY}
+    try:
+        r = requests.post(url, json={"number": number, "text": message}, headers=headers, timeout=15)
+        masked = number[:5] + "***" + number[-2:] if len(number) > 7 else "***"
+        print(f"✅ WhatsApp Status ({masked}): {r.status_code}", flush=True)
+        return r.status_code < 300
+    except Exception as e:
+        print(f"❌ Send error: {e}", flush=True)
+        return False
+
+
+def assign_approval_code(tender_id: str):
+    """Give a tender a short numeric code (stable once assigned)."""
+    if not DATABASE_URL:
+        return None
+    try:
+        conn = _approval_db()
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                "UPDATE tenders SET approval_code = COALESCE(approval_code, nextval('tender_approval_seq')) "
+                "WHERE id = %s RETURNING approval_code",
+                (str(tender_id),),
+            )
+            row = cur.fetchone()
+            conn.commit()
+            cur.close()
+            return row[0] if row else None
+        finally:
+            conn.close()
+    except Exception as e:
+        print(f"⚠️ assign_approval_code failed for {tender_id}: {e}", flush=True)
+        return None
+
+
+def _format_approval_question(code, t: dict) -> str:
+    def clip(v, n):
+        v = (v or "").strip().replace("\r", "")
+        return v if len(v) <= n else v[: n - 1] + "…"
+
+    lines = [f"📋 *Tender #{code} — approval needed*", "", f"*{clip(t.get('title'), 220)}*"]
+    meta = []
+    if t.get("source"):
+        meta.append(f"Source: {t['source']}")
+    if t.get("deadline"):
+        meta.append(f"Closes: {clip(t['deadline'], 40)}")
+    if t.get("relevance_score"):
+        meta.append(f"Match: {t['relevance_score']}%")
+    if meta:
+        lines.append(" | ".join(meta))
+    if t.get("procurement_object"):
+        lines.append(f"Object: {clip(t['procurement_object'], 200)}")
+    if t.get("constraints_text"):
+        lines.append(f"Constraints: {clip(t['constraints_text'], 250)}")
+    if t.get("ai_reason"):
+        lines.append(f"Why: {clip(t['ai_reason'], 200)}")
+    if t.get("url"):
+        lines.append(f"Link: {t['url']}")
+    lines += [
+        "",
+        f"Proceed with this tender?",
+        f"Reply *APPROVE {code}* or *REJECT {code}*",
+    ]
+    return "\n".join(lines)
+
+
+def send_approval_questions(tender_ids) -> bool:
+    """Send one approval question per newly queued tender. Returns True if at
+    least one question went out (so the caller can skip the generic fallback)."""
+    if not DATABASE_URL or not tender_ids or not WHATSAPP_NUMBERS or not GLOBAL_API_KEY:
+        return False
+    if os.environ.get("WHATSAPP_APPROVAL", "1").strip().lower() in ("0", "false", "no"):
+        return False
+
+    ids = [i for i in dict.fromkeys(tender_ids) if i]
+    to_send, overflow = ids[:APPROVAL_MAX_QUESTIONS_PER_SCAN], ids[APPROVAL_MAX_QUESTIONS_PER_SCAN:]
+    any_sent = False
+    for tid in to_send:
+        try:
+            code = assign_approval_code(tid)
+            conn = _approval_db()
+            try:
+                cur = conn.cursor()
+                cur.execute(
+                    "SELECT title, source, deadline, relevance_score, procurement_object, "
+                    "constraints_text, ai_reason, url FROM tenders WHERE id = %s",
+                    (str(tid),),
+                )
+                r = cur.fetchone()
+                cur.close()
+            finally:
+                conn.close()
+            if not r or code is None:
+                continue
+            t = dict(zip(
+                ["title", "source", "deadline", "relevance_score", "procurement_object",
+                 "constraints_text", "ai_reason", "url"], r))
+            if send_whatsapp_to_all(_format_approval_question(code, t)):
+                any_sent = True
+            time.sleep(1.0)  # gentle pacing so WhatsApp doesn't throttle a burst
+        except Exception as e:
+            print(f"⚠️ approval question failed for {tid}: {e}", flush=True)
+
+    if overflow:
+        send_whatsapp_to_all(
+            f"…and {len(overflow)} more tender(s) waiting. Reply *PENDING* to list them."
+        )
+    return any_sent
+
+
+def send_whatsapp_to_all(message: str) -> bool:
+    ok = False
+    for n in WHATSAPP_NUMBERS:
+        if send_whatsapp_to(n, message):
+            ok = True
+    return ok
+
+
+# ---- incoming command handling ----
+_CMD_RE = re.compile(
+    r"^\s*(?P<cmd>approve|accept|yes|y|reject|decline|no|n|skip|status|info|details)\s*#?\s*(?P<code>\d+)?\s*[.!]*\s*$",
+    re.IGNORECASE,
+)
+_APPROVE_WORDS = {"approve", "accept", "yes", "y"}
+_REJECT_WORDS = {"reject", "decline", "no", "n", "skip"}
+
+
+def _pending_rows(limit=10):
+    conn = _approval_db()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT approval_code, title, deadline FROM tenders "
+            "WHERE status = 'PENDING_APPROVAL' AND approval_code IS NOT NULL "
+            "ORDER BY approval_code DESC LIMIT %s",
+            (limit,),
+        )
+        rows = cur.fetchall()
+        cur.close()
+        return rows
+    finally:
+        conn.close()
+
+
+def _decide(code: int, new_status: str) -> str:
+    conn = _approval_db()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT id, title, status FROM tenders WHERE approval_code = %s", (code,))
+        row = cur.fetchone()
+        if not row:
+            cur.close()
+            return f"❓ No tender with code #{code}. Reply *PENDING* to see the open ones."
+        tid, title, status = row
+        short = (title or tid)[:90]
+        if status != "PENDING_APPROVAL":
+            cur.close()
+            return f"ℹ️ Tender #{code} is already *{status}* — no change made.\n{short}"
+        cur.execute(
+            "UPDATE tenders SET status = %s, updated_at = NOW() "
+            "WHERE id = %s AND status = 'PENDING_APPROVAL'",
+            (new_status, tid),
+        )
+        conn.commit()
+        cur.close()
+    finally:
+        conn.close()
+    if new_status == "APPROVED":
+        return (f"✅ *Approved* tender #{code}\n{short}\n"
+                f"Status is now APPROVED — document preparation is the next step.")
+    return f"🚫 *Rejected* tender #{code}\n{short}"
+
+
+def handle_whatsapp_command(text: str) -> str:
+    """Pure text->reply logic. Returns the reply to send, or '' to stay silent
+    (anything that isn't a recognised command is ignored — never answer chatter)."""
+    t = (text or "").strip()
+    low = t.lower()
+
+    if low in ("pending", "list", "tenders", "help", "?"):
+        rows = _pending_rows()
+        if not rows:
+            return "✅ No tenders waiting for approval."
+        out = [f"📋 *{len(rows)} waiting for approval:*"]
+        for code, title, deadline in rows:
+            out.append(f"#{code} — {(title or '')[:80]}" + (f" (closes {deadline})" if deadline else ""))
+        out.append("\nReply *APPROVE <number>* or *REJECT <number>*")
+        return "\n".join(out)
+
+    m = _CMD_RE.match(t)
+    if not m:
+        return ""
+    cmd = m.group("cmd").lower()
+    code = m.group("code")
+
+    if code is None:
+        # Bare "yes"/"no" is only safe when exactly one tender is open
+        rows = _pending_rows(limit=2)
+        if len(rows) == 1:
+            code = rows[0][0]
+        elif len(rows) == 0:
+            return "✅ No tenders waiting for approval."
+        else:
+            return "Which tender? Reply like *APPROVE 12* or *REJECT 12* (send *PENDING* to list)."
+    code = int(code)
+
+    if cmd in _APPROVE_WORDS:
+        return _decide(code, "APPROVED")
+    if cmd in _REJECT_WORDS:
+        return _decide(code, "REJECTED")
+    # status / info / details
+    conn = _approval_db()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT title, status, deadline, url FROM tenders WHERE approval_code = %s", (code,))
+        r = cur.fetchone()
+        cur.close()
+    finally:
+        conn.close()
+    if not r:
+        return f"❓ No tender with code #{code}."
+    return f"#{code} — {r[1]}\n{(r[0] or '')[:200]}\nCloses: {r[2] or '?'}\n{r[3] or ''}"
+
+
+def _extract_incoming(payload: dict):
+    """Normalise Evolution API webhook payloads (v1/v2, single or list) into
+    (sender_digits_candidates, text, from_me) tuples."""
+    out = []
+    data = payload.get("data")
+    items = data if isinstance(data, list) else [data] if isinstance(data, dict) else []
+    # some versions nest the list under data.messages
+    expanded = []
+    for it in items:
+        if isinstance(it, dict) and isinstance(it.get("messages"), list):
+            expanded.extend(x for x in it["messages"] if isinstance(x, dict))
+        else:
+            expanded.append(it)
+    for it in expanded:
+        if not isinstance(it, dict):
+            continue
+        key = it.get("key") or {}
+        msg = it.get("message") or {}
+        text = (
+            msg.get("conversation")
+            or (msg.get("extendedTextMessage") or {}).get("text")
+            or (msg.get("buttonsResponseMessage") or {}).get("selectedButtonId")
+            or (msg.get("listResponseMessage") or {}).get("title")
+            or ""
+        )
+        if not text:
+            continue
+        jids = [key.get("remoteJid"), key.get("remoteJidAlt"), key.get("participant"),
+                key.get("participantAlt"), it.get("senderPn"), it.get("sender")]
+        cands = {_digits(j) for j in jids if j and "@g.us" not in str(j)}
+        if "@g.us" in str(key.get("remoteJid") or ""):
+            continue  # ignore groups entirely
+        cands.discard("")
+        out.append((cands, text, bool(key.get("fromMe"))))
+    return out
+
+
+def _authorised_number(cands) -> str:
+    """Return the matching WHATSAPP_NUMBERS entry, or '' if the sender isn't allowed."""
+    for n in WHATSAPP_NUMBERS:
+        nd = _digits(n)
+        if not nd:
+            continue
+        for c in cands:
+            # compare on the last 9 digits so +251…/0… formatting differences still match
+            if c == nd or (len(c) >= 9 and len(nd) >= 9 and c[-9:] == nd[-9:]):
+                return n
+    return ""
+
+
+@app.route("/webhook/evolution", methods=["POST"])
+def evolution_webhook():
+    supplied = request.args.get("token") or request.headers.get("X-Webhook-Token") or ""
+    if not WEBHOOK_TOKEN or not supplied or not hmac.compare_digest(supplied, WEBHOOK_TOKEN):
+        return jsonify({"error": "Unauthorized"}), 401
+    payload = request.get_json(silent=True) or {}
+    event = str(payload.get("event") or "").lower().replace("_", ".")
+    if event and event != "messages.upsert":
+        return jsonify({"ok": True, "ignored": event})
+    if not DATABASE_URL:
+        return jsonify({"ok": True, "ignored": "no database"})
+
+    for cands, text, from_me in _extract_incoming(payload):
+        sender = _authorised_number(cands)
+        if not sender:
+            continue  # not one of the configured approvers — ignore silently
+        try:
+            reply = handle_whatsapp_command(text)
+        except Exception as e:
+            print(f"❌ handle_whatsapp_command failed: {e}", flush=True)
+            reply = "⚠️ Sorry, something went wrong processing that. Try again or use the app."
+        if reply:
+            send_whatsapp_to(sender, reply)
+    return jsonify({"ok": True})
+
+
+def register_evolution_webhook() -> dict:
+    """Point Evolution API's MESSAGES_UPSERT webhook at this service.
+    Uses RENDER_EXTERNAL_URL (set automatically by Render) — no new env var."""
+    base = (os.environ.get("PUBLIC_BASE_URL") or os.environ.get("RENDER_EXTERNAL_URL") or "").rstrip("/")
+    if not (base and GLOBAL_API_KEY and WEBHOOK_TOKEN):
+        msg = "skipped (need RENDER_EXTERNAL_URL/PUBLIC_BASE_URL, GLOBAL_API_KEY and TEST_CHECK_TOKEN/WEBHOOK_TOKEN)"
+        print(f"ℹ️ Evolution webhook registration {msg}", flush=True)
+        return {"ok": False, "detail": msg}
+    from urllib.parse import quote
+    hook_url = f"{base}/webhook/evolution?token={quote(WEBHOOK_TOKEN)}"
+    endpoint = f"{EVOLUTION_BASE}/webhook/set/{quote(INSTANCE_NAME, safe='')}"
+    headers = {"Content-Type": "application/json", "apikey": GLOBAL_API_KEY}
+    bodies = [
+        # Evolution API v2
+        {"webhook": {"enabled": True, "url": hook_url, "webhookByEvents": False,
+                     "webhookBase64": False, "events": ["MESSAGES_UPSERT"]}},
+        # Evolution API v1 / flat variant
+        {"enabled": True, "url": hook_url, "webhook_by_events": False,
+         "webhook_base64": False, "events": ["MESSAGES_UPSERT"]},
+    ]
+    last = ""
+    for body in bodies:
+        try:
+            r = requests.post(endpoint, json=body, headers=headers, timeout=20)
+            last = f"{r.status_code} {r.text[:150]}"
+            if r.status_code < 300:
+                print(f"✅ Evolution webhook registered -> {base}/webhook/evolution", flush=True)
+                return {"ok": True, "detail": last}
+        except Exception as e:
+            last = str(e)
+    print(f"⚠️ Evolution webhook registration failed: {last}", flush=True)
+    return {"ok": False, "detail": last}
+
+
+@app.route("/api/whatsapp/webhook/register", methods=["POST", "GET"])
+def api_register_webhook():
+    if not _mobile_api_authorized():
+        return jsonify({"error": "Unauthorized"}), 401
+    return jsonify(register_evolution_webhook())
+
+
 # Ensure the dedup table exists as soon as the module loads (covers both
 # `python app.py` local runs and gunicorn/production imports)
 init_db()
@@ -2103,6 +2486,9 @@ def _ensure_monitor_started():
         threading.Thread(target=monitoring_loop, daemon=True).start()
         _reset_stale_scan_on_boot()
         print("📡 Background tender monitor started (eGP + 2merkato)", flush=True)
+        # Best-effort: (re)point Evolution API's incoming-message webhook at this
+        # service so WhatsApp "approve 12" replies reach /webhook/evolution.
+        threading.Thread(target=register_evolution_webhook, daemon=True).start()
 
 _ensure_monitor_started()
 
