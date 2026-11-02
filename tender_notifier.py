@@ -1003,6 +1003,75 @@ def send_whatsapp(message):
             print(f"❌ Send error: {e}", flush=True)
 
 
+def send_whatsapp_tender(t: dict):
+    """Send a tender alert. Prefer a URL button labeled with the reference number
+    so tapping the ref opens the tender page (matches the approved mock). Falls
+    back to plain text if Evolution rejects buttons on this instance.
+    """
+    from urllib.parse import quote
+
+    missing = [n for n, v in (("EVOLUTION_BASE", EVOLUTION_BASE), ("INSTANCE_NAME", INSTANCE_NAME),
+                              ("GLOBAL_API_KEY", GLOBAL_API_KEY), ("WHATSAPP_NUMBERS", WHATSAPP_NUMBERS)) if not v]
+    if missing:
+        print(f"❌ Cannot send WhatsApp message: missing env var(s): {', '.join(missing)}", flush=True)
+        return
+
+    body = _format_tender_notification(t)
+    tender_url = (t.get("url") or "").strip()
+    ref = (t.get("ref_no") or "").strip()
+    # Button label: formal ref when we have one, otherwise a short open label
+    btn_label = (ref[:60] if ref else "Open tender")
+    headers = {"Content-Type": "application/json", "apikey": GLOBAL_API_KEY}
+    session = _get_evolution_session()
+    instance = quote(INSTANCE_NAME, safe="")
+
+    if tender_url:
+        buttons_url = f"{EVOLUTION_BASE}/message/sendButtons/{instance}"
+        for number in WHATSAPP_NUMBERS:
+            payload = {
+                "number": number,
+                "title": "🔔 New tender",
+                "description": body,
+                "footer": "medMETRIC",
+                "buttons": [
+                    {
+                        "type": "url",
+                        "displayText": btn_label,
+                        "url": tender_url,
+                    }
+                ],
+            }
+            try:
+                r = session.post(buttons_url, json=payload, headers=headers, timeout=(10, 45))
+                masked = number[:5] + "***" + number[-2:] if len(number) > 7 else "***"
+                if r.status_code < 300:
+                    print(f"✅ WhatsApp button ({masked}): {r.status_code} ref={btn_label[:40]}", flush=True)
+                    continue
+                print(
+                    f"⚠️ WhatsApp buttons unavailable ({r.status_code}) — plain text fallback ({masked})",
+                    flush=True,
+                )
+            except Exception as e:
+                print(f"⚠️ WhatsApp buttons failed: {e} — plain text fallback", flush=True)
+            # Fallback: compact body + bare URL (always tappable)
+            fallback = body if tender_url in body else (body + "\n" + tender_url)
+            try:
+                text_url = f"{EVOLUTION_BASE}/message/sendText/{instance}"
+                r = session.post(
+                    text_url,
+                    json={"number": number, "text": fallback},
+                    headers=headers,
+                    timeout=(10, 45),
+                )
+                masked = number[:5] + "***" + number[-2:] if len(number) > 7 else "***"
+                print(f"✅ WhatsApp Status ({masked}): {r.status_code}", flush=True)
+            except Exception as e:
+                print(f"❌ Send error: {e}", flush=True)
+        return
+
+    send_whatsapp(body)
+
+
 
 # ==================== ENGINE: 2MERKATO ====================
 # Chromium is used only to log in (about half a minute), then it is closed.
@@ -1700,11 +1769,10 @@ def _format_tender_notification(t: dict) -> str:
         v = (v or "").strip().replace("\r", "")
         return v if len(v) <= n else v[: n - 1] + "…"
 
+    # Compact spacing to match the live WhatsApp alerts (no extra blank lines
+    # between Source / Object / Why / Ref).
     badge = "✅ AI-checked" if t.get("ai_verified") else "⚠️ keyword match (AI unavailable)"
     lines = [f"🔔 *New tender* — {badge}", "", f"*{clip(t.get('title'), 220)}*"]
-    ref = clip(t.get("ref_no"), 80)
-    if ref:
-        lines.append(f"Ref: {ref}")
     meta = []
     if t.get("source"):
         meta.append(f"Source: {t['source']}")
@@ -1718,8 +1786,14 @@ def _format_tender_notification(t: dict) -> str:
         lines.append(f"Object: {clip(t['object'], 200)}")
     if t.get("reason"):
         lines.append(f"Why: {clip(t['reason'], 200)}")
-    if t.get("url"):
-        lines.append(f"Link: {t['url']}")
+
+    # Layout matches the approved mock: compact fields, Ref line only
+    # (no raw https line). Opening the tender is done by the URL button
+    # labeled with this same reference in send_whatsapp_tender().
+    ref = clip(t.get("ref_no"), 80)
+    if ref:
+        lines.append(f"Ref: {ref}")
+
     lines += ["", "Review it in the medMETRIC app → Tenders."]
     return "\n".join(lines)
 
@@ -1837,6 +1911,7 @@ def review_and_notify(candidates, whatsapp_state):
                 "object": str(procurement_object or ""),
                 "reason": str(reason or ""),
                 "url": c.get("link") or c.get("url") or "",
+                "ref_no": ref_no,
                 "ai_verified": bool(ai_verified),
             })
             print(f"📋 Queued for approval: {c['title'][:70]} (score={match_score})", flush=True)
@@ -1847,7 +1922,7 @@ def review_and_notify(candidates, whatsapp_state):
         if whatsapp_state["sent"] >= whatsapp_state["max"]:
             whatsapp_state["overflow"] += 1
             continue
-        send_whatsapp(_format_tender_notification(item))
+        send_whatsapp_tender(item)
         whatsapp_state["sent"] += 1
         time.sleep(1.0)
     return queued
