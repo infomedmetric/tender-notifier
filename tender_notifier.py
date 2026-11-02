@@ -1030,9 +1030,8 @@ def send_whatsapp_tender(t: dict):
         for number in WHATSAPP_NUMBERS:
             payload = {
                 "number": number,
-                "title": "🔔 New tender",
+                "title": "medMETRIC Notifier",
                 "description": body,
-                "footer": "medMETRIC",
                 "buttons": [
                     {
                         "type": "url",
@@ -1054,7 +1053,8 @@ def send_whatsapp_tender(t: dict):
             except Exception as e:
                 print(f"⚠️ WhatsApp buttons failed: {e} — plain text fallback", flush=True)
             # Fallback: compact body + bare URL (always tappable)
-            fallback = body if tender_url in body else (body + "\n" + tender_url)
+            # Plain-text fallback: link the Ref line itself (WhatsApp auto-links URLs)
+            fallback = body.replace(f"Ref: {ref}", f"Ref: {ref}\n{tender_url}", 1) if ref else (body + "\n" + tender_url)
             try:
                 text_url = f"{EVOLUTION_BASE}/message/sendText/{instance}"
                 r = session.post(
@@ -1769,10 +1769,9 @@ def _format_tender_notification(t: dict) -> str:
         v = (v or "").strip().replace("\r", "")
         return v if len(v) <= n else v[: n - 1] + "…"
 
-    # Compact spacing to match the live WhatsApp alerts (no extra blank lines
-    # between Source / Object / Why / Ref).
+    # Layout matches the approved screenshot exactly: one bubble, compact lines.
     badge = "✅ AI-checked" if t.get("ai_verified") else "⚠️ keyword match (AI unavailable)"
-    lines = [f"🔔 *New tender* — {badge}", "", f"*{clip(t.get('title'), 220)}*"]
+    lines = [f"🔔 New tender — {badge}", "", clip(t.get("title"), 220)]
     meta = []
     if t.get("source"):
         meta.append(f"Source: {t['source']}")
@@ -1786,14 +1785,9 @@ def _format_tender_notification(t: dict) -> str:
         lines.append(f"Object: {clip(t['object'], 200)}")
     if t.get("reason"):
         lines.append(f"Why: {clip(t['reason'], 200)}")
-
-    # Layout matches the approved mock: compact fields, Ref line only
-    # (no raw https line). Opening the tender is done by the URL button
-    # labeled with this same reference in send_whatsapp_tender().
     ref = clip(t.get("ref_no"), 80)
     if ref:
         lines.append(f"Ref: {ref}")
-
     lines += ["", "Review it in the medMETRIC app → Tenders."]
     return "\n".join(lines)
 
