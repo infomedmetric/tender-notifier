@@ -2372,4 +2372,76 @@ def api_update_tender_status(tender_id):
         return jsonify({"id": tender_id, "status": status})
 
     try:
-        row = _set_tender_status(ten
+        row = _set_tender_status(tender_id, status, title_fallback=body.get("title") or "")
+        if not row:
+            return jsonify({"error": "not found"}), 404
+
+        # APPROVED stays APPROVED until explicit prepare_documents_for_tender
+        return jsonify(row)
+    except Exception as e:
+        print(f"❌ api_update_tender_status: {e}", flush=True)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/tenders/<tender_id>/approve", methods=["POST"])
+def api_approve_tender(tender_id):
+    """Convenience endpoint: Approve a tender (same as status=APPROVED)."""
+    if not _mobile_api_authorized():
+        return jsonify({"error": "Unauthorized"}), 401
+    if not DATABASE_URL:
+        return jsonify({"id": tender_id, "status": "APPROVED"})
+    try:
+        row = _set_tender_status(tender_id, "APPROVED")
+        if not row:
+            return jsonify({"error": "not found"}), 404
+        # Stay on APPROVED — document prep is a separate step (app or /prepare-docs)
+        return jsonify(row)
+    except Exception as e:
+        print(f"❌ api_approve_tender: {e}", flush=True)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/tenders/<tender_id>/reject", methods=["POST"])
+def api_reject_tender(tender_id):
+    """Convenience endpoint: Reject a tender."""
+    if not _mobile_api_authorized():
+        return jsonify({"error": "Unauthorized"}), 401
+    if not DATABASE_URL:
+        return jsonify({"id": tender_id, "status": "REJECTED"})
+    try:
+        row = _set_tender_status(tender_id, "REJECTED")
+        if not row:
+            return jsonify({"error": "not found"}), 404
+        return jsonify(row)
+    except Exception as e:
+        print(f"❌ api_reject_tender: {e}", flush=True)
+        return jsonify({"error": str(e)}), 500
+
+
+# Ensure the dedup table exists as soon as the module loads (covers both
+# `python app.py` local runs and gunicorn/production imports)
+init_db()
+
+# Under gunicorn __name__ is not "__main__", so the scanner never started.
+# Start the background eGP/2merkato loop on import (safe with workers=1).
+_monitor_started = False
+_monitor_lock = threading.Lock()
+
+def _ensure_monitor_started():
+    global _monitor_started
+    if os.environ.get("DISABLE_MONITOR", "").strip().lower() in ("1", "true", "yes"):
+        return
+    with _monitor_lock:
+        if _monitor_started:
+            return
+        _monitor_started = True
+        _reset_stale_scan_on_boot()
+        threading.Thread(target=monitoring_loop, daemon=True).start()
+        print("📡 Background tender monitor started (eGP + 2merkato)", flush=True)
+
+_ensure_monitor_started()
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
+
