@@ -1456,18 +1456,52 @@ def _get_merkato_card_status(link) -> str:
     return _merkato_card_status(card_text)
 
 
+_EGP_SESSION = None
+
+
+def _egp_session():
+    """Shared session with browser-like headers and retries. The eGP gateway
+    drops connections from default python-requests clients (RemoteDisconnected),
+    so we present a normal browser profile and retry transient failures."""
+    global _EGP_SESSION
+    if _EGP_SESSION is None:
+        from requests.adapters import HTTPAdapter
+        from urllib3.util.retry import Retry
+        sess = requests.Session()
+        sess.headers.update({
+            "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                           "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"),
+            "Accept": "application/json, text/plain, */*",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer": f"{EGP_BASE}/",
+            "Origin": EGP_BASE,
+        })
+        retry = Retry(total=3, backoff_factor=2, status_forcelist=(429, 500, 502, 503, 504),
+                      allowed_methods=("GET",), raise_on_status=False)
+        sess.mount("https://", HTTPAdapter(max_retries=retry))
+        sess.mount("http://", HTTPAdapter(max_retries=retry))
+        _EGP_SESSION = sess
+    return _EGP_SESSION
+
+
 def _egp_api_get(path_and_query: str, timeout: int = 30):
     """GET from the public eGP gateway (/po-gw/...). Returns parsed JSON or None."""
     url = f"{EGP_BASE}/po-gw{path_and_query}" if path_and_query.startswith("/") else f"{EGP_BASE}/po-gw/{path_and_query}"
-    try:
-        r = requests.get(url, timeout=timeout, verify=False)
-        if r.status_code != 200:
-            print(f"⚠️ eGP API {r.status_code} for {path_and_query[:80]}", flush=True)
-            return None
-        return r.json()
-    except Exception as e:
-        print(f"⚠️ eGP API error for {path_and_query[:60]}: {e}", flush=True)
-        return None
+    last_err = None
+    for attempt in range(1, 4):
+        try:
+            r = _egp_session().get(url, timeout=timeout, verify=False)
+            if r.status_code != 200:
+                print(f"⚠️ eGP API {r.status_code} (attempt {attempt}) for {path_and_query[:80]}", flush=True)
+                last_err = f"HTTP {r.status_code}"
+            else:
+                return r.json()
+        except Exception as e:
+            last_err = e
+            print(f"⚠️ eGP API error (attempt {attempt}) for {path_and_query[:60]}: {e}", flush=True)
+        time.sleep(3 * attempt)
+    print(f"❌ eGP API gave up after 3 attempts: {last_err}", flush=True)
+    return None
 
 
 def _egp_build_detail_text(item: dict) -> str:
