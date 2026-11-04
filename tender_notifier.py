@@ -1465,8 +1465,6 @@ def _egp_session():
     so we present a normal browser profile and retry transient failures."""
     global _EGP_SESSION
     if _EGP_SESSION is None:
-        from requests.adapters import HTTPAdapter
-        from urllib3.util.retry import Retry
         sess = requests.Session()
         sess.headers.update({
             "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -1476,19 +1474,16 @@ def _egp_session():
             "Referer": f"{EGP_BASE}/",
             "Origin": EGP_BASE,
         })
-        retry = Retry(total=3, backoff_factor=2, status_forcelist=(429, 500, 502, 503, 504),
-                      allowed_methods=("GET",), raise_on_status=False)
-        sess.mount("https://", HTTPAdapter(max_retries=retry))
-        sess.mount("http://", HTTPAdapter(max_retries=retry))
+        # Retries are handled by _egp_api_get (one place, bounded), not urllib3.
         _EGP_SESSION = sess
     return _EGP_SESSION
 
 
-def _egp_api_get(path_and_query: str, timeout: int = 30):
+def _egp_api_get(path_and_query: str, timeout: int = 15):
     """GET from the public eGP gateway (/po-gw/...). Returns parsed JSON or None."""
     url = f"{EGP_BASE}/po-gw{path_and_query}" if path_and_query.startswith("/") else f"{EGP_BASE}/po-gw/{path_and_query}"
     last_err = None
-    for attempt in range(1, 4):
+    for attempt in range(1, 3):
         try:
             r = _egp_session().get(url, timeout=timeout, verify=False)
             if r.status_code != 200:
@@ -1499,8 +1494,8 @@ def _egp_api_get(path_and_query: str, timeout: int = 30):
         except Exception as e:
             last_err = e
             print(f"⚠️ eGP API error (attempt {attempt}) for {path_and_query[:60]}: {e}", flush=True)
-        time.sleep(3 * attempt)
-    print(f"❌ eGP API gave up after 3 attempts: {last_err}", flush=True)
+        time.sleep(2)
+    print(f"❌ eGP API gave up after 2 attempts: {last_err}", flush=True)
     return None
 
 
@@ -1603,7 +1598,11 @@ def scrape_egp(candidates: list):
     TOP_PER_TERM = int(os.environ.get("EGP_TOP_PER_TERM", "25"))
 
     try:
+        consecutive_fail = 0
         for term in EGP_SEARCH_TERMS:
+            if consecutive_fail >= 3:
+                print("⛔ eGP unreachable (3 failed searches in a row) — skipping rest of eGP so 2merkato still runs.", flush=True)
+                break
             try:
                 from urllib.parse import quote
                 q = quote(term)
@@ -1619,8 +1618,10 @@ def scrape_egp(candidates: list):
                 )
                 data = _egp_api_get(url)
                 if not data or "items" not in data:
+                    consecutive_fail += 1
                     print(f"eGP search '{term}': no data", flush=True)
                     continue
+                consecutive_fail = 0
 
                 packages = data.get("items") or []
                 total = data.get("total", len(packages))
